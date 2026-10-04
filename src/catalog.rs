@@ -40,6 +40,19 @@ fn run_list() -> Result<String, String> {
         .envs(crate::setup::child_env())
         .spawn()
         .map_err(|e| format!("devin models list: {e}"))?;
+    // The listing is ~175KB — bigger than the pipe buffer. Drain stdout on
+    // a reader thread while waiting: wait-then-read deadlocks the child on
+    // a full pipe and always hits the deadline.
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "devin models list stdout unavailable".to_string())?;
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut s = String::new();
+        let _ = stdout.read_to_string(&mut s);
+        s
+    });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         match child.try_wait() {
@@ -50,17 +63,13 @@ fn run_list() -> Result<String, String> {
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = reader.join();
                 return Err("devin models list timed out".into());
             }
             Err(e) => return Err(format!("devin models list: {e}")),
         }
     }
-    let mut out = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        use std::io::Read;
-        let _ = stdout.read_to_string(&mut out);
-    }
-    Ok(out)
+    Ok(reader.join().unwrap_or_default())
 }
 
 /// Parse `devin models list` text into routable entries.
