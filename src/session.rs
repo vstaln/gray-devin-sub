@@ -10,11 +10,15 @@
 //! `devin acp` + `session/new`.
 //!
 //! Pool rules: at most `MAX_LIVE` live children; a session leaves the pool
-//! for the duration of its turn (exclusive use) and returns on success.
-//! Errors, timeouts and client disconnects close it instead — a session
-//! is never pooled in a state the next turn can't trust. Sessions idle
-//! past `IDLE_TTL` or whose child exited are reaped on every pool access
-//! and by a 60s background sweep; [`shutdown`] closes everything.
+//! for the duration of its turn (exclusive use) and returns on success —
+//! including a client-disconnected turn whose prompt still settled: the
+//! reply was never delivered (the relay buffers a whole turn), so the
+//! session records an empty echo and the next request continues it with
+//! only its own tail. Errors, timeouts and disconnects that fail to
+//! settle close it instead — a session is never pooled in a state the
+//! next turn can't trust. Sessions idle past `IDLE_TTL` or whose child
+//! exited are reaped on every pool access and by a 60s background sweep;
+//! [`shutdown`] closes everything.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
@@ -442,7 +446,7 @@ impl LiveSession {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<TurnResult, String> {
-        let result = self.prompt_result(id, deadline, cancel)?;
+        let (result, unseen) = self.prompt_result(id, deadline, cancel)?;
         // `result.usage` wins when present and non-zero; a cancelled turn
         // carries none, so the last usage_update snapshot stands in.
         if let Some(u) = result.get("usage").and_then(usage_from) {
@@ -455,16 +459,29 @@ impl LiveSession {
         if stop_reason == "refusal" {
             return Err("Devin refused this request under its usage policy".to_string());
         }
-        Ok(self.finish(stop_reason))
+        let mut r = self.finish(stop_reason);
+        r.unseen = unseen;
+        Ok(r)
     }
 
     /// Record what this session just answered so the next request can be
-    /// recognized as its strict continuation.
+    /// recognized as its strict continuation. An unseen answer (the relay
+    /// client was already gone when the turn settled) records an empty
+    /// echo: gray's history carries no assistant items for it, so the next
+    /// request's echo zone is empty too.
     pub(crate) fn absorb(&mut self, turn: &PreparedTurn, r: &TurnResult) {
         self.system = turn.system.clone();
         self.absorbed = turn.input.clone();
-        self.reply_call_ids = r.calls.iter().map(|(id, _, _)| id.clone()).collect();
-        self.reply_text = r.text.trim().to_string();
+        self.reply_call_ids = if r.unseen {
+            Vec::new()
+        } else {
+            r.calls.iter().map(|(id, _, _)| id.clone()).collect()
+        };
+        self.reply_text = if r.unseen {
+            String::new()
+        } else {
+            r.text.trim().to_string()
+        };
         self.last_used = Instant::now();
     }
 
@@ -628,15 +645,18 @@ impl LiveSession {
         }
     }
 
-    /// Drain notifications until the `session/prompt` result arrives. On
-    /// client disconnect: `session/cancel` once, ≤10s for the prompt
-    /// result to settle, then error — the caller closes the session.
+    /// Drain notifications until the `session/prompt` result arrives,
+    /// plus an `unseen` flag. On client disconnect: `session/cancel` once,
+    /// then ≤10s for the prompt result to settle. A settled result returns
+    /// `unseen: true` — the session state is then known (the turn is over
+    /// and its reply never reached the client), so the caller can pool
+    /// it; only a grace timeout errors and costs the session.
     fn prompt_result(
         &mut self,
         id: u64,
         deadline: Instant,
         cancel: &AtomicBool,
-    ) -> Result<Value, String> {
+    ) -> Result<(Value, bool), String> {
         loop {
             let line = match self.recv_response(Duration::from_secs(600), deadline, cancel) {
                 Ok(line) => line,
@@ -649,7 +669,15 @@ impl LiveSession {
                         let never = AtomicBool::new(false);
                         while Instant::now() < grace {
                             match self.recv_response(Duration::from_secs(10), grace, &never) {
-                                Ok(line) if line.get("id") == Some(&json!(id)) => break,
+                                Ok(line) if line.get("id") == Some(&json!(id)) => {
+                                    if let Some(err) = line.get("error") {
+                                        return Err(map_rpc_error(err, &self.stderr_tail));
+                                    }
+                                    return Ok((
+                                        line.get("result").cloned().unwrap_or(Value::Null),
+                                        true,
+                                    ));
+                                }
                                 Ok(_) => {}
                                 Err(_) => break,
                             }
@@ -662,7 +690,7 @@ impl LiveSession {
                 if let Some(err) = line.get("error") {
                     return Err(map_rpc_error(err, &self.stderr_tail));
                 }
-                return Ok(line.get("result").cloned().unwrap_or(Value::Null));
+                return Ok((line.get("result").cloned().unwrap_or(Value::Null), false));
             }
         }
     }
@@ -699,6 +727,7 @@ impl LiveSession {
             calls,
             usage: self.usage.clone(),
             stop,
+            unseen: false,
         }
     }
 }
@@ -710,16 +739,19 @@ fn map_rpc_error(err: &Value, stderr: &Arc<Mutex<VecDeque<String>>>) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    if let Ok(tail) = stderr.lock() {
-        let tail = tail.iter().cloned().collect::<Vec<_>>().join("; ");
-        if !tail.is_empty() {
-            detail = format!("{detail} {tail}");
-        }
+    if detail.trim().is_empty()
+        && let Ok(tail) = stderr.lock()
+        && let Some(last) = tail.iter().rev().find(|line| !line.trim().is_empty())
+    {
+        detail = last.clone();
     }
     let detail = redact(&detail);
     let low = detail.to_lowercase();
-    if low.contains("429") || low.contains("rate limit") || low.contains("quota") {
-        return format!("Devin quota exhausted (native: {detail})");
+    if low.contains("quota") || low.contains("reached free model rate limit") {
+        return format!("Devin usage limit reached: {detail}");
+    }
+    if low.contains("429") || low.contains("rate limit") {
+        return format!("Devin rate limited: {detail}");
     }
     if low.contains("not logged in") || low.contains("authenticate") || low.contains("unauthorized")
     {
@@ -755,3 +787,7 @@ fn redact(s: &str) -> String {
     }
     out.trim_end().to_string()
 }
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod tests;

@@ -183,11 +183,14 @@ fn fold_emits_complete_function_call_items() {
             input_tokens: 10,
             output_tokens: 5,
             cached_tokens: 3,
+            cache_write_tokens: 4,
         },
         stop: "tool_use".to_string(),
+        unseen: false,
     };
     let sse = String::from_utf8(fold_result(&r, &["bash".to_string()]).unwrap()).unwrap();
     assert!(sse.contains("response.output_item.added"));
+    assert!(sse.contains("\"cache_creation_tokens\":4"));
     assert!(sse.contains("response.function_call_arguments.done"));
     assert!(sse.contains("response.output_item.done"));
     assert!(sse.contains("response.completed"));
@@ -202,6 +205,7 @@ fn fold_rejects_tool_outside_inventory() {
         calls: vec![("call_1_1".into(), "hack".into(), "{}".into())],
         usage: Usage::default(),
         stop: "tool_use".to_string(),
+        unseen: false,
     };
     assert!(fold_result(&r, &["bash".to_string()]).is_err());
 }
@@ -219,6 +223,7 @@ fn fold_marks_max_tokens_incomplete() {
         calls: Vec::new(),
         usage: Usage::default(),
         stop: "incomplete:max_output_tokens".to_string(),
+        unseen: false,
     };
     let sse = String::from_utf8(fold_result(&r, &[]).unwrap()).unwrap();
     assert!(sse.contains("\"status\":\"incomplete\""));
@@ -344,6 +349,18 @@ fn continuation_text_only_reply_echo() {
 }
 
 #[test]
+fn continuation_unseen_reply_echoes_nothing() {
+    // A turn that settled after the relay client was gone records an
+    // empty reply (LiveSession::absorb, r.unseen): gray's history carries
+    // no assistant items for it, so the echo zone is empty and the new
+    // tail alone is the delta.
+    let mut input = absorbed();
+    input.push(json!({"role": "user", "content": "retry that"}));
+    let delta = continuation(&absorbed(), &[], "", &input).unwrap();
+    assert_eq!(delta, "[User]\nretry that");
+}
+
+#[test]
 fn usage_from_flat_cognition_meta() {
     let u = usage_from(&json!({"sessionUpdate": "usage_update",
         "_meta": {"cognition.ai/inputTokens": 36304,
@@ -353,6 +370,20 @@ fn usage_from_flat_cognition_meta() {
     assert_eq!(u.input_tokens, 36304);
     assert_eq!(u.output_tokens, 27);
     assert_eq!(u.cached_tokens, 36224);
+}
+
+#[test]
+fn usage_from_reads_cache_writes() {
+    // Real first-turn update: no cached read, only a cache write.
+    let u = usage_from(&json!({"sessionUpdate": "usage_update",
+        "_meta": {"cognition.ai/inputTokens": 5620,
+            "cognition.ai/outputTokens": 25,
+            "cognition.ai/cachedWriteTokens": 5617}}))
+    .unwrap();
+    assert_eq!(u.cached_tokens, 0);
+    assert_eq!(u.cache_write_tokens, 5617);
+    let u = usage_from(&json!({"cachedWriteTokens": 7})).expect("write-only usage is usage");
+    assert_eq!(u.cache_write_tokens, 7);
 }
 
 #[test]

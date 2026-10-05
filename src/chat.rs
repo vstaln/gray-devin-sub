@@ -247,12 +247,20 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
         system_parts.push(instructions.to_string());
     }
     system_parts.push(funnel_contract(&tool_specs));
+    // Responses `reasoning.effort` is the host's /thinking pick; the model
+    // id family + tier name resolve to the real native id (the catalog
+    // collapses `swe-2-high|medium|max` into one `swe-2` row, so the effort
+    // is how a tier actually gets chosen).
+    let effort = body
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .and_then(Value::as_str);
     Ok(PreparedTurn {
         system: system_parts.join("\n\n"),
         content_line,
         input,
         names,
-        native_model: crate::catalog::native_model(model),
+        native_model: crate::catalog::native_model(model, effort),
     })
 }
 
@@ -433,8 +441,13 @@ pub fn usage_from(v: &Value) -> Option<Usage> {
         input_tokens: get("inputTokens"),
         output_tokens: get("outputTokens"),
         cached_tokens: get("cachedReadTokens"),
+        cache_write_tokens: get("cachedWriteTokens"),
     };
-    if usage.input_tokens == 0 && usage.output_tokens == 0 && usage.cached_tokens == 0 {
+    if usage.input_tokens == 0
+        && usage.output_tokens == 0
+        && usage.cached_tokens == 0
+        && usage.cache_write_tokens == 0
+    {
         None
     } else {
         Some(usage)
@@ -450,6 +463,10 @@ pub struct TurnResult {
     pub calls: Vec<(String, String, String)>,
     pub usage: Usage,
     pub stop: String,
+    /// The relay client was already gone when this turn settled: the
+    /// reply was produced but never delivered, so the session records an
+    /// empty echo for it (see `LiveSession::absorb`).
+    pub unseen: bool,
 }
 
 #[derive(Default, Clone)]
@@ -457,6 +474,9 @@ pub struct Usage {
     pub input_tokens: usize,
     pub output_tokens: usize,
     pub cached_tokens: usize,
+    /// Prompt tokens written to the cache (`cachedWriteTokens`); like
+    /// `cached_tokens`, already counted inside `input_tokens`.
+    pub cache_write_tokens: usize,
 }
 
 /// Run one turn: prompt a pooled continuation session with only the delta
@@ -667,7 +687,8 @@ pub fn fold_result(r: &TurnResult, names: &[String]) -> Result<Vec<u8>, String> 
     let usage_val = json!({"input_tokens": r.usage.input_tokens,
         "output_tokens": r.usage.output_tokens,
         "total_tokens": r.usage.input_tokens + r.usage.output_tokens,
-        "input_tokens_details": {"cached_tokens": r.usage.cached_tokens}});
+        "input_tokens_details": {"cached_tokens": r.usage.cached_tokens,
+            "cache_creation_tokens": r.usage.cache_write_tokens}});
     let (status, incomplete) = match r.stop.as_str() {
         "incomplete:max_output_tokens" => ("incomplete", json!({"reason": "max_output_tokens"})),
         s => (s, Value::Null),
