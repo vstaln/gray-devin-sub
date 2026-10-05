@@ -441,8 +441,13 @@ pub fn usage_from(v: &Value) -> Option<Usage> {
         input_tokens: get("inputTokens"),
         output_tokens: get("outputTokens"),
         cached_tokens: get("cachedReadTokens"),
+        cache_write_tokens: get("cachedWriteTokens"),
     };
-    if usage.input_tokens == 0 && usage.output_tokens == 0 && usage.cached_tokens == 0 {
+    if usage.input_tokens == 0
+        && usage.output_tokens == 0
+        && usage.cached_tokens == 0
+        && usage.cache_write_tokens == 0
+    {
         None
     } else {
         Some(usage)
@@ -469,6 +474,9 @@ pub struct Usage {
     pub input_tokens: usize,
     pub output_tokens: usize,
     pub cached_tokens: usize,
+    /// Prompt tokens written to the cache (`cachedWriteTokens`); like
+    /// `cached_tokens`, already counted inside `input_tokens`.
+    pub cache_write_tokens: usize,
 }
 
 /// Run one turn: prompt a pooled continuation session with only the delta
@@ -679,7 +687,8 @@ pub fn fold_result(r: &TurnResult, names: &[String]) -> Result<Vec<u8>, String> 
     let usage_val = json!({"input_tokens": r.usage.input_tokens,
         "output_tokens": r.usage.output_tokens,
         "total_tokens": r.usage.input_tokens + r.usage.output_tokens,
-        "input_tokens_details": {"cached_tokens": r.usage.cached_tokens}});
+        "input_tokens_details": {"cached_tokens": r.usage.cached_tokens,
+            "cache_creation_tokens": r.usage.cache_write_tokens}});
     let (status, incomplete) = match r.stop.as_str() {
         "incomplete:max_output_tokens" => ("incomplete", json!({"reason": "max_output_tokens"})),
         s => (s, Value::Null),

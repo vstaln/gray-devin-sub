@@ -183,12 +183,14 @@ fn fold_emits_complete_function_call_items() {
             input_tokens: 10,
             output_tokens: 5,
             cached_tokens: 3,
+            cache_write_tokens: 4,
         },
         stop: "tool_use".to_string(),
         unseen: false,
     };
     let sse = String::from_utf8(fold_result(&r, &["bash".to_string()]).unwrap()).unwrap();
     assert!(sse.contains("response.output_item.added"));
+    assert!(sse.contains("\"cache_creation_tokens\":4"));
     assert!(sse.contains("response.function_call_arguments.done"));
     assert!(sse.contains("response.output_item.done"));
     assert!(sse.contains("response.completed"));
@@ -368,6 +370,20 @@ fn usage_from_flat_cognition_meta() {
     assert_eq!(u.input_tokens, 36304);
     assert_eq!(u.output_tokens, 27);
     assert_eq!(u.cached_tokens, 36224);
+}
+
+#[test]
+fn usage_from_reads_cache_writes() {
+    // Real first-turn update: no cached read, only a cache write.
+    let u = usage_from(&json!({"sessionUpdate": "usage_update",
+        "_meta": {"cognition.ai/inputTokens": 5620,
+            "cognition.ai/outputTokens": 25,
+            "cognition.ai/cachedWriteTokens": 5617}}))
+    .unwrap();
+    assert_eq!(u.cached_tokens, 0);
+    assert_eq!(u.cache_write_tokens, 5617);
+    let u = usage_from(&json!({"cachedWriteTokens": 7})).expect("write-only usage is usage");
+    assert_eq!(u.cache_write_tokens, 7);
 }
 
 #[test]
