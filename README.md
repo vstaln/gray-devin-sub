@@ -20,19 +20,35 @@ files, never captures tokens, and refuses to run when a conflicting
    one-shot bearer URL. The relay admits exactly one POST — the
    "one upstream request per chat turn" budget is enforced by a
    consumed-token admission guard, not by trust.
-2. The admitted OpenAI Responses body becomes ONE `devin acp` session
-   (`initialize → session/new → session/prompt → session/delete`) in a
-   scratch cwd whose `.devin/config.json` denies every native tool, and
-   under a generated user config with subagents/MCP/auto-update off.
+2. The admitted OpenAI Responses body is answered by a **pooled**
+   `devin acp` session (`initialize → session/new`, then one
+   `session/prompt` per turn). Children run in a shared scratch cwd whose
+   `.devin/config.json` denies every native tool, under a generated user
+   config with subagents/MCP/auto-update off. Devin's prompt cache is
+   per-session: when the request's history strictly continues what a
+   pooled session last answered — same model, same prepared system text,
+   same prefix, and the host's replay of the last answer byte-identical —
+   that session gets prompted with only the delta (`[Tool result]` /
+   `[User]` blocks) and ~the whole transcript is already upstream.
+   Anything else spawns a fresh `devin acp`. Sessions idle 15 min (or
+   dead) are reaped; the pool caps at 4 children.
 3. Gray's tools ride in as a text funnel contract (`​```gray_calls`
    fenced block); models that ignore it and reach for a native `exec` /
    `read` are caught by `tool_call` notifications and redirected onto the
-   host's `bash` tool, then the session is cancelled.
+   host's `bash` tool, then the prompt is cancelled.
 4. The reply (text, thought summary, calls, usage) is folded back into
-   the Responses SSE stream the host already understands.
+   the Responses SSE stream the host already understands. Turns that run
+   past 20s answer as a close-delimited stream with `: keepalive`
+   comments every 15s — the host's HTTP client times out idle reads — and
+   a client disconnect sends `session/cancel` upstream instead of letting
+   an abandoned turn bill.
 
 `session/request_permission` is always answered `cancelled` — a harness
 turn never waits on an interactive prompt.
+
+Set `DEVIN_SUB_DEBUG=1` to append one line per turn (reuse/fresh reason,
+ACP session id, prompt chars, usage) to
+`$TMPDIR/devin-sub-<pid>.log` — no prompt content.
 
 ## Build & install
 

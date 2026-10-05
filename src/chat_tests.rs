@@ -224,3 +224,157 @@ fn fold_marks_max_tokens_incomplete() {
     assert!(sse.contains("\"status\":\"incomplete\""));
     assert!(sse.contains("\"reason\":\"max_output_tokens\""));
 }
+
+fn absorbed() -> Vec<Value> {
+    vec![
+        json!({"role": "user", "content": "run ls"}),
+        json!({"role": "assistant", "content": "sure"}),
+    ]
+}
+
+/// The host's replay of an answer of `text` + one `call_1` bash call.
+fn echo(text: &str, call_id: &str) -> Vec<Value> {
+    vec![
+        json!({"role": "assistant", "content": text}),
+        json!({"type": "function_call", "call_id": call_id,
+            "name": "bash", "arguments": "{\"command\":\"ls\"}"}),
+    ]
+}
+
+#[test]
+fn continuation_match_returns_delta() {
+    let mut input = absorbed();
+    input.extend(echo("on it", "call_1"));
+    input.push(json!({"type": "function_call_output", "call_id": "call_1",
+        "output": "file.txt"}));
+    input.push(json!({"role": "user", "content": "now grep it"}));
+    let delta = continuation(&absorbed(), &["call_1".to_string()], "on it", &input)
+        .expect("strict continuation must match");
+    assert!(delta.contains("[Tool result id=call_1]"), "{delta}");
+    assert!(delta.contains("[User]\nnow grep it"), "{delta}");
+    assert!(!delta.contains("run ls"), "delta must not repeat history");
+}
+
+#[test]
+fn continuation_prefix_changed() {
+    let mut input = absorbed();
+    input[0]["content"] = json!("run pwd");
+    input.extend(echo("on it", "call_1"));
+    input.push(json!({"type": "function_call_output", "call_id": "call_1",
+        "output": "x"}));
+    assert_eq!(
+        continuation(&absorbed(), &["call_1".to_string()], "on it", &input).unwrap_err(),
+        "prefix"
+    );
+}
+
+#[test]
+fn continuation_echo_call_id_mismatch() {
+    let mut input = absorbed();
+    input.extend(echo("on it", "call_OTHER"));
+    input.push(
+        json!({"type": "function_call_output", "call_id": "call_OTHER",
+        "output": "x"}),
+    );
+    assert_eq!(
+        continuation(&absorbed(), &["call_1".to_string()], "on it", &input).unwrap_err(),
+        "echo"
+    );
+}
+
+#[test]
+fn continuation_echo_text_mismatch() {
+    let mut input = absorbed();
+    input.extend(echo("different words", "call_1"));
+    input.push(json!({"type": "function_call_output", "call_id": "call_1",
+        "output": "x"}));
+    assert_eq!(
+        continuation(&absorbed(), &["call_1".to_string()], "on it", &input).unwrap_err(),
+        "echo"
+    );
+}
+
+#[test]
+fn continuation_assistant_item_in_new_tail() {
+    // A second assistant message after the tool result means the history
+    // mid-edited a turn — not a strict continuation.
+    let mut input = absorbed();
+    input.extend(echo("on it", "call_1"));
+    input.push(json!({"type": "function_call_output", "call_id": "call_1",
+        "output": "x"}));
+    input.push(json!({"role": "assistant", "content": "sneaky"}));
+    input.push(json!({"role": "user", "content": "go on"}));
+    assert_eq!(
+        continuation(&absorbed(), &["call_1".to_string()], "on it", &input).unwrap_err(),
+        "empty_delta"
+    );
+}
+
+#[test]
+fn continuation_empty_tail() {
+    // Echo of our answer and nothing else: nothing new to ask.
+    let mut input = absorbed();
+    input.extend(echo("on it", "call_1"));
+    assert_eq!(
+        continuation(&absorbed(), &["call_1".to_string()], "on it", &input).unwrap_err(),
+        "empty_delta"
+    );
+}
+
+#[test]
+fn continuation_input_not_longer() {
+    assert_eq!(
+        continuation(&absorbed(), &[], "", &absorbed()).unwrap_err(),
+        "prefix"
+    );
+    assert_eq!(
+        continuation(&absorbed(), &[], "", &absorbed()[..1]).unwrap_err(),
+        "prefix"
+    );
+}
+
+#[test]
+fn continuation_text_only_reply_echo() {
+    // A calls-free reply is echoed as the assistant message alone.
+    let mut input = absorbed();
+    input.push(json!({"role": "assistant", "content": "done"}));
+    input.push(json!({"role": "user", "content": "next"}));
+    let delta = continuation(&absorbed(), &[], "done", &input).unwrap();
+    assert_eq!(delta, "[User]\nnext");
+}
+
+#[test]
+fn usage_from_flat_cognition_meta() {
+    let u = usage_from(&json!({"sessionUpdate": "usage_update",
+        "_meta": {"cognition.ai/inputTokens": 36304,
+            "cognition.ai/outputTokens": 27,
+            "cognition.ai/cachedReadTokens": 36224}}))
+    .expect("flat cognition.ai keys must parse");
+    assert_eq!(u.input_tokens, 36304);
+    assert_eq!(u.output_tokens, 27);
+    assert_eq!(u.cached_tokens, 36224);
+}
+
+#[test]
+fn usage_from_nested_cognition_meta() {
+    let u = usage_from(&json!({"_meta": {"cognition.ai": {
+        "inputTokens": 10, "outputTokens": 2, "cachedReadTokens": 8}}}))
+    .unwrap();
+    assert_eq!(u.input_tokens, 10);
+    assert_eq!(u.cached_tokens, 8);
+}
+
+#[test]
+fn usage_from_plain_keys() {
+    let u = usage_from(&json!({"totalTokens": 36331, "inputTokens": 36304,
+        "outputTokens": 27, "cachedReadTokens": 36224}))
+    .unwrap();
+    assert_eq!(u.input_tokens, 36304);
+    assert_eq!(u.cached_tokens, 36224);
+}
+
+#[test]
+fn usage_from_absent_or_zero_is_none() {
+    assert!(usage_from(&json!({"sessionUpdate": "usage_update"})).is_none());
+    assert!(usage_from(&json!({"inputTokens": 0, "outputTokens": 0})).is_none());
+}

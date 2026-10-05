@@ -31,7 +31,8 @@ pub fn entries() -> Result<Vec<ModelEntry>, String> {
 }
 
 fn run_list() -> Result<String, String> {
-    let binary = crate::setup::resolve_command().ok_or_else(|| crate::setup::INSTALL_HINT.to_string())?;
+    let binary =
+        crate::setup::resolve_command().ok_or_else(|| crate::setup::INSTALL_HINT.to_string())?;
     let mut child = std::process::Command::new(binary)
         .args(["models", "list"])
         .stdin(std::process::Stdio::null())
@@ -115,7 +116,11 @@ pub fn parse_list(text: &str) -> Vec<ModelEntry> {
         if seen.insert(id.to_string()) {
             out.push(ModelEntry {
                 id: id.to_string(),
-                display: if display.is_empty() { id.to_string() } else { display },
+                display: if display.is_empty() {
+                    id.to_string()
+                } else {
+                    display
+                },
                 context: extra.and_then(context_of),
             });
         }

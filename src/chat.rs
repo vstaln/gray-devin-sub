@@ -1,11 +1,14 @@
-//! One-shot chat turn over the loopback relay: the OpenAI Responses body the
-//! host POSTs becomes ONE `devin acp` session (initialize → session/new →
-//! session/prompt → session/delete) whose native tools are fully denied.
+//! Chat turn over the loopback relay: the OpenAI Responses body the host
+//! POSTs is answered by a pooled `devin acp` session (see [`crate::session`])
+//! whose native tools are fully denied.
 //!
 //! The funnel contract (verified against `devin acp` behaviour):
 //! * ACP has no system role and no assistant replay: the funnel system text
-//!   (contract + tool manifest + host instructions) leads the single prompt
-//!   text block, then the labeled transcript. One upstream request per turn.
+//!   (contract + tool manifest + host instructions) leads the first prompt,
+//!   then the labeled transcript. Devin's prompt cache is per-session, so a
+//!   request whose history strictly extends what a pooled session last
+//!   answered prompts that session with only the delta — the transcript is
+//!   already upstream. One upstream request per turn either way.
 //! * gray tools are NOT native tools. They are described in the system text
 //!   and the model answers with a fenced ```gray_calls block; models that
 //!   ignore the text funnel and reach for a native tool anyway are caught by
@@ -19,33 +22,24 @@
 //!   per-turn relay URL and the host POSTs its standard body with the
 //!   per-turn bearer.
 
-use std::io::{BufRead, BufReader, Write};
-use std::sync::{Arc, Mutex};
+use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::setup;
+use crate::session;
 
 /// Relay rejection when native retries past the single admitted request.
 pub const ADMISSION_CONSUMED: &str = "DEVIN_MODEL_ADMISSION_CONSUMED";
-
-/// Deny list written into both the project config and the user config the
-/// child sees: every native capability Devin exposes.
-const DENY_RULES: &[&str] = &[
-    "read",
-    "edit",
-    "grep",
-    "glob",
-    "exec",
-    "Fetch(domain:*)",
-    "mcp__*",
-];
 
 /// One translated turn: funnel system text, transcript, host tool names.
 pub struct PreparedTurn {
     pub system: String,
     pub content_line: String,
+    /// The request's raw `input` array: continuation matching keys off it.
+    pub input: Vec<Value>,
     pub names: Vec<String>,
     pub native_model: String,
 }
@@ -116,8 +110,8 @@ fn item_kind(item: &Value) -> &str {
 
 /// Render one Responses `input` item to transcript text. Tool calls and
 /// results render as explicit records so the model can reference them;
-/// reasoning carriers restore nothing (one fresh session per turn) but
-/// their text still carries the prior answer.
+/// reasoning carriers restore nothing on a fresh session but their text
+/// still carries the prior answer.
 fn render_item(item: &Value) -> Option<String> {
     let kind = item_kind(item);
     match kind {
@@ -174,6 +168,15 @@ fn render_item(item: &Value) -> Option<String> {
     }
 }
 
+/// Render a Responses `input` array to transcript text.
+fn render_items(items: &[Value]) -> String {
+    items
+        .iter()
+        .filter_map(render_item)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 /// Translate an OpenAI Responses body into one funnel turn.
 pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     let instructions = body
@@ -213,19 +216,17 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     // user/assistant message, a tool call, or a tool result. A trailing
     // reasoning item alone answers nothing.
     let last_kind = input.last().map(item_kind).unwrap_or("");
-    if !matches!(last_kind, "message" | "function_call" | "function_call_output") {
+    if !matches!(
+        last_kind,
+        "message" | "function_call" | "function_call_output"
+    ) {
         return Err(
             "history must end in a nonempty user/tool-result message; assistant prefill is unsupported"
                 .into(),
         );
     }
-    let mut parts: Vec<String> = Vec::new();
-    for item in &input {
-        if let Some(text) = render_item(item) {
-            parts.push(text);
-        }
-    }
-    if parts.is_empty() {
+    let content_line = render_items(&input);
+    if content_line.is_empty() {
         return Err("history must end in a nonempty user/tool-result message".into());
     }
     // Assistant prefill (trailing assistant message, no tool result after
@@ -248,7 +249,8 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     system_parts.push(funnel_contract(&tool_specs));
     Ok(PreparedTurn {
         system: system_parts.join("\n\n"),
-        content_line: parts.join("\n\n"),
+        content_line,
+        input,
         names,
         native_model: crate::catalog::native_model(model),
     })
@@ -264,7 +266,9 @@ fn funnel_contract(tool_specs: &[String]) -> String {
         exactly one fenced block:\n\n```gray_calls\n\
         [{\"name\": \"<tool name>\", \"arguments\": { ... }}]\n```\n\n\
         The array may hold several calls. Do not write anything after the block. \
-        If no tool is needed, answer normally with no block.",
+        If no tool is needed, answer normally with no block. \
+        Later messages in this conversation come from the harness: tool results \
+        arrive as `[Tool result id=…]` blocks and new user input as `[User]` blocks.",
     );
     s.push_str("\n\nHarness tools:\n");
     if tool_specs.is_empty() {
@@ -322,7 +326,7 @@ fn json_array_prefix(s: &str) -> Option<Vec<Value>> {
 /// Redirect a native `tool_call` notification onto `bash`, when the host
 /// tools include it. Verified shapes: `{"kind":"execute","rawInput":
 /// {"command": "..."}}` and `{"kind":"read","rawInput":{"file_path":"..."}}`.
-fn redirect_call(update: &Value, has_bash: bool) -> Option<String> {
+pub(crate) fn redirect_call(update: &Value, has_bash: bool) -> Option<String> {
     if !has_bash {
         return None;
     }
@@ -346,6 +350,97 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// An input item the assistant side produced: the replayed echo of a
+/// session's own answer (assistant message, its calls, reasoning carriers).
+fn assistant_side(item: &Value) -> bool {
+    match item_kind(item) {
+        "function_call" | "reasoning" => true,
+        "message" => item.get("role").and_then(Value::as_str) == Some("assistant"),
+        _ => false,
+    }
+}
+
+/// Strict-continuation check: `input` is `absorbed` plus the echo of the
+/// session's own last answer plus a non-assistant tail. Returns the tail
+/// rendered to transcript text — the only thing the session still needs
+/// to see. Miss reasons feed the DEVIN_SUB_DEBUG trace: `prefix` (history
+/// diverged), `echo` (the replayed answer isn't what this session sent),
+/// `empty_delta` (nothing new to ask, or an assistant item sits in the
+/// new tail, which means the history mid-edited a turn).
+///
+/// The host echoes our answer as `{"role":"assistant","content":<text>}`
+/// (only when the text is non-empty) then one `{"type":"function_call",...}`
+/// item per call; reasoning items may interleave and carry nothing here.
+pub(crate) fn continuation(
+    absorbed: &[Value],
+    reply_call_ids: &[String],
+    reply_text: &str,
+    input: &[Value],
+) -> Result<String, &'static str> {
+    if input.len() <= absorbed.len() || !input.starts_with(absorbed) {
+        return Err("prefix");
+    }
+    let rest = &input[absorbed.len()..];
+    let mut i = 0;
+    let mut call_ids: Vec<String> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    while i < rest.len() && assistant_side(&rest[i]) {
+        let item = &rest[i];
+        match item_kind(item) {
+            "function_call" => call_ids.push(
+                item.get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            "message" => texts.push(text_of(item.get("content").unwrap_or(&Value::Null))),
+            _ => {}
+        }
+        i += 1;
+    }
+    if call_ids.as_slice() != reply_call_ids || texts.join("\n").trim() != reply_text.trim() {
+        return Err("echo");
+    }
+    let tail = &rest[i..];
+    if tail.is_empty() || tail.iter().any(assistant_side) {
+        return Err("empty_delta");
+    }
+    let delta = render_items(tail);
+    if delta.trim().is_empty() {
+        return Err("empty_delta");
+    }
+    Ok(delta)
+}
+
+/// Usage snapshot from a `usage_update` notification's `update` object or
+/// a prompt result's `usage` value: plain key first, then Cognition's flat
+/// `_meta["cognition.ai/<key>"]`, then the nested `_meta["cognition.ai"]
+/// [<key>]` object. `None` when every count is zero or absent.
+pub fn usage_from(v: &Value) -> Option<Usage> {
+    let get = |k: &str| {
+        let flat = format!("cognition.ai/{k}");
+        v.get(k)
+            .or_else(|| v.get("_meta").and_then(|m| m.get(flat.as_str())))
+            .or_else(|| {
+                v.get("_meta")
+                    .and_then(|m| m.get("cognition.ai"))
+                    .and_then(|c| c.get(k))
+            })
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize
+    };
+    let usage = Usage {
+        input_tokens: get("inputTokens"),
+        output_tokens: get("outputTokens"),
+        cached_tokens: get("cachedReadTokens"),
+    };
+    if usage.input_tokens == 0 && usage.output_tokens == 0 && usage.cached_tokens == 0 {
+        None
+    } else {
+        Some(usage)
+    }
+}
+
 /// What one `devin acp` session produced.
 pub struct TurnResult {
     pub text: String,
@@ -364,464 +459,143 @@ pub struct Usage {
     pub cached_tokens: usize,
 }
 
-/// Run one turn: spawn `devin acp`, drive the ACP handshake, prompt, fold.
-/// `timeout` is the whole-turn budget.
-pub fn spawn_turn(turn: &PreparedTurn, timeout: Duration) -> Result<TurnResult, String> {
-    let binary = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
-    let stage = AcpStage::stage()?;
+/// Run one turn: prompt a pooled continuation session with only the delta
+/// when this request's history strictly extends what it last answered,
+/// else spawn `devin acp`, drive the ACP handshake and prompt with
+/// `system` + the whole transcript. `timeout` is the whole-turn budget;
+/// `cancel` is set when the relay client went away mid-turn.
+pub fn run_turn(
+    turn: &PreparedTurn,
+    cancel: &Arc<AtomicBool>,
+    timeout: Duration,
+) -> Result<TurnResult, String> {
+    let deadline = Instant::now() + timeout;
     let prompt_text = if turn.system.is_empty() {
         turn.content_line.clone()
     } else {
         format!("{}\n\n{}", turn.system, turn.content_line)
     };
-    let mut child = std::process::Command::new(&binary)
-        .args([
-            "--config",
-            &stage.cfg.join("config.json").to_string_lossy(),
-            "acp",
-            "--model",
-            &turn.native_model,
-        ])
-        .current_dir(&stage.work)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .envs(setup::child_env())
-        // A turn must never pop a browser out of a stale login.
-        .env("BROWSER", "/bin/true")
-        .env("DISPLAY", "")
-        .env("WAYLAND_DISPLAY", "")
-        .spawn()
-        .map_err(|_| setup::INSTALL_HINT.to_string())?;
-
-    // stderr → last ~20 lines, redacted, for error detail only.
-    let stderr_tail: Arc<Mutex<std::collections::VecDeque<String>>> =
-        Arc::new(Mutex::new(std::collections::VecDeque::new()));
-    if let Some(err) = child.stderr.take() {
-        let tail = stderr_tail.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(err).lines() {
-                let Ok(line) = line else { break };
-                if let Ok(mut t) = tail.lock() {
-                    if t.len() >= 20 {
-                        t.pop_front();
-                    }
-                    t.push_back(redact(&line));
-                }
-            }
-        });
-    }
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "native stdout unavailable".to_string())?;
-    let (tx, rx) = std::sync::mpsc::channel::<Value>();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else { break };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Ok(v) = serde_json::from_str::<Value>(line)
-                && tx.send(v).is_err()
-            {
-                break;
-            }
-        }
-    });
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "native stdin unavailable".to_string())?;
-
-    let deadline = Instant::now() + timeout;
-    let mut rpc = Acp {
-        stdin: &mut stdin,
-        rx: &rx,
-        next_id: 0,
-        session_id: String::new(),
-        text: String::new(),
-        thought: String::new(),
-        redirected: Vec::new(),
-        usage: Usage::default(),
-        names: turn.names.clone(),
-        stderr_tail: &stderr_tail,
-    };
-
-    let outcome = drive(&mut rpc, &stage.work, &prompt_text, deadline);
-
-    // Always: session/delete best effort, close stdin, brief wait, kill.
-    if !rpc.session_id.is_empty() {
-        rpc.send_request(
-            "session/delete",
-            json!({"sessionId": rpc.session_id.clone()}),
-        )
-        .ok();
-        let _ = rpc.recv_response(Duration::from_secs(10), deadline);
-    }
-    drop(child.stdin.take());
-    // Give the child up to 2s to exit after stdin closes, then kill.
-    let wait_deadline = Instant::now() + Duration::from_secs(2);
-    while child.try_wait().ok().flatten().is_none() && Instant::now() < wait_deadline {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    outcome
-}
-
-struct AcpStage {
-    work: std::path::PathBuf,
-    cfg: std::path::PathBuf,
-    _work_dir: tempfile::TempDir,
-    _cfg_dir: tempfile::TempDir,
-}
-
-impl AcpStage {
-    fn stage() -> Result<Self, String> {
-        let work_dir = tempfile::Builder::new()
-            .prefix("devin-sub-work-")
-            .tempdir()
-            .map_err(|e| format!("staging dir: {e}"))?;
-        let cfg_dir = tempfile::Builder::new()
-            .prefix("devin-sub-cfg-")
-            .tempdir()
-            .map_err(|e| format!("staging dir: {e}"))?;
-        let work = work_dir.path().to_path_buf();
-        let cfg = cfg_dir.path().to_path_buf();
-        // Project-level deny: verified to actually block native read/exec
-        // (the user-config deny alone does not).
-        let proj = work.join(".devin");
-        std::fs::create_dir_all(&proj).map_err(|e| format!("staging dir: {e}"))?;
-        std::fs::write(
-            proj.join("config.json"),
-            json!({"permissions": {"deny": DENY_RULES}}).to_string(),
-        )
-        .map_err(|e| format!("staging config: {e}"))?;
-        // User config: no MCP servers, rules, skills, subagents, auto-update
-        // or notifications — but credentials still load.
-        std::fs::write(
-            cfg.join("config.json"),
-            json!({
-                "version": 1,
-                "subagents_enabled": false,
-                "auto_update": false,
-                "notify": "never",
-                "read_config_from": {
-                    "agents_standard": false, "cursor": false, "windsurf": false,
-                    "claude": false, "copilot": false, "opencode": false, "zed": false,
-                },
-                "permissions": {"deny": DENY_RULES, "allow": [], "ask": []},
-            })
-            .to_string(),
-        )
-        .map_err(|e| format!("staging config: {e}"))?;
-        Ok(Self {
-            work,
-            cfg,
-            _work_dir: work_dir,
-            _cfg_dir: cfg_dir,
-        })
-    }
-}
-
-/// Per-turn ACP connection state.
-struct Acp<'a> {
-    stdin: &'a mut std::process::ChildStdin,
-    rx: &'a std::sync::mpsc::Receiver<Value>,
-    next_id: u64,
-    session_id: String,
-    text: String,
-    thought: String,
-    /// Native tool_call notifications redirected onto bash (name, args-json).
-    redirected: Vec<(String, String)>,
-    usage: Usage,
-    names: Vec<String>,
-    stderr_tail: &'a Arc<Mutex<std::collections::VecDeque<String>>>,
-}
-
-impl Acp<'_> {
-    fn send(&mut self, v: &Value) -> Result<(), String> {
-        let line = serde_json::to_string(v).map_err(|e| format!("frame encode: {e}"))? + "\n";
-        self.stdin
-            .write_all(line.as_bytes())
-            .and_then(|_| self.stdin.flush())
-            .map_err(|_| "native stdin closed".to_string())
-    }
-
-    fn send_request(&mut self, method: &str, params: Value) -> Result<u64, String> {
-        self.next_id += 1;
-        let id = self.next_id;
-        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
-        Ok(id)
-    }
-
-    fn answer_request(&mut self, id: &Value, result: Value) -> Result<(), String> {
-        self.send(&json!({"jsonrpc": "2.0", "id": id, "result": result}))
-    }
-
-    fn refuse_request(&mut self, id: &Value) -> Result<(), String> {
-        self.send(&json!({"jsonrpc": "2.0", "id": id,
-            "error": {"code": -32601, "message": "method not found"}}))
-    }
-
-    /// One server→client request: permissions always cancel, anything else
-    /// is a JSON-RPC method-not-found (never a hang).
-    fn on_request(&mut self, line: &Value) -> Result<(), String> {
-        let id = line.get("id").cloned().unwrap_or(Value::Null);
-        match line.get("method").and_then(Value::as_str) {
-            Some("session/request_permission") => {
-                self.answer_request(&id, json!({"outcome": {"outcome": "cancelled"}}))
-            }
-            _ => self.refuse_request(&id),
-        }
-    }
-
-    fn on_notification(&mut self, line: &Value) {
-        if line.get("method").and_then(Value::as_str) != Some("session/update") {
-            return;
-        }
-        let update = &line["params"]["update"];
-        match update.get("sessionUpdate").and_then(Value::as_str) {
-            Some("agent_message_chunk") => {
-                if let Some(t) = update.pointer("/content/text").and_then(Value::as_str) {
-                    self.text.push_str(t);
-                }
-            }
-            Some("agent_thought_chunk") => {
-                if let Some(t) = update.pointer("/content/text").and_then(Value::as_str) {
-                    self.thought.push_str(t);
-                }
-            }
-            Some("tool_call") => {
-                // First eligible redirect wins and ends the turn: the model
-                // reached for a native tool instead of the text funnel.
-                if self.redirected.is_empty()
-                    && let Some(args) =
-                        redirect_call(update, self.names.iter().any(|n| n == "bash"))
-                {
-                    self.redirected.push(("bash".to_string(), args));
-                    let _ = self.send(&json!({"jsonrpc": "2.0",
-                        "method": "session/cancel",
-                        "params": {"sessionId": self.session_id}}));
-                }
-            }
-            Some("usage_update") => {
-                let meta = &update["_meta"];
-                let get = |k: &str| {
-                    meta.get("cognition.ai")
-                        .and_then(|c| c.get(k))
-                        .or_else(|| meta.get(k))
-                        .or_else(|| update.get(k))
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as usize
-                };
-                self.usage.input_tokens = self.usage.input_tokens.max(get("inputTokens"));
-                self.usage.output_tokens = self.usage.output_tokens.max(get("outputTokens"));
-            }
-            _ => {}
-        }
-    }
-
-    /// Wait for the response to `want`: dispatching notifications and
-    /// server requests as they arrive. `want == 0` waits for the prompt
-    /// result specifically by method shape (any response while prompting).
-    fn recv_response(&mut self, window: Duration, deadline: Instant) -> Result<Value, String> {
-        let until = (Instant::now() + window).min(deadline);
-        loop {
-            let left = until.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err("Devin request timed out".into());
-            }
-            match self.rx.recv_timeout(left) {
-                Ok(line) => {
-                    if line.get("method").is_some() && line.get("id").is_some() {
-                        self.on_request(&line)?;
-                    } else if line.get("method").is_some() {
-                        self.on_notification(&line);
-                    } else if line.get("id").is_some() {
-                        return Ok(line);
-                    }
-                }
-                Err(_) => return Err("Devin request timed out".into()),
-            }
-        }
-    }
-
-    /// Read until the response to request `id` arrives (or a hard error).
-    fn call(&mut self, method: &str, params: Value, window: Duration, deadline: Instant) -> Result<Value, String> {
-        let id = self.send_request(method, params)?;
-        loop {
-            let line = self.recv_response(window, deadline)?;
-            if line.get("id") == Some(&json!(id)) {
-                if let Some(err) = line.get("error") {
-                    return Err(map_rpc_error(err, self.stderr_tail));
-                }
-                return Ok(line.get("result").cloned().unwrap_or(Value::Null));
-            }
-            // A response to another in-flight request: we send one at a
-            // time, so anything else is protocol noise — keep waiting.
-        }
-    }
-
-    /// Drain notifications until the `session/prompt` result arrives.
-    fn prompt_result(&mut self, id: u64, deadline: Instant) -> Result<Value, String> {
-        loop {
-            let line = self.recv_response(Duration::from_secs(600), deadline)?;
-            if line.get("id") == Some(&json!(id)) {
-                if let Some(err) = line.get("error") {
-                    return Err(map_rpc_error(err, self.stderr_tail));
-                }
-                return Ok(line.get("result").cloned().unwrap_or(Value::Null));
-            }
-        }
-    }
-}
-
-fn drive(
-    rpc: &mut Acp,
-    work: &std::path::Path,
-    prompt_text: &str,
-    deadline: Instant,
-) -> Result<TurnResult, String> {
-    rpc.call(
-        "initialize",
-        json!({"protocolVersion": 1,
-            "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false},
-                "terminal": false}}),
-        Duration::from_secs(60),
-        deadline,
-    )?;
-    let new = rpc.call(
-        "session/new",
-        json!({"cwd": work.to_string_lossy(), "mcpServers": []}),
-        Duration::from_secs(60),
-        deadline,
-    )?;
-    let session_id = new
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    rpc.session_id = session_id.clone();
-    let prompt_id = rpc.send_request(
-        "session/prompt",
-        json!({"sessionId": session_id,
-            "prompt": [{"type": "text", "text": prompt_text}]}),
-    )?;
-    let result = rpc.prompt_result(prompt_id, deadline)?;
-    let stop_reason = result
-        .get("stopReason")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if let Some(u) = result.get("usage") {
-        let get = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0) as usize;
-        // inputTokens already includes cached tokens (verified: total =
-        // input + output, cachedRead is a subset).
-        rpc.usage.input_tokens = rpc.usage.input_tokens.max(get("inputTokens"));
-        rpc.usage.output_tokens = rpc.usage.output_tokens.max(get("outputTokens"));
-        rpc.usage.cached_tokens = get("cachedReadTokens");
-    }
-    match stop_reason {
-        "refusal" => {
-            return Err("Devin refused this request under its usage policy".to_string());
-        }
-        "end_turn" | "cancelled" | "max_tokens" | "max_turn_requests" | "" => {}
-        other => {
-            let _ = other;
-        }
-    }
-    finish(rpc, stop_reason)
-}
-
-fn finish(rpc: &mut Acp, stop_reason: &str) -> Result<TurnResult, String> {
-    let turn_id = rand_hex(8);
-    // Redirected native calls never mix with funnel calls: redirect wins.
-    let mut text = rpc.text.trim().to_string();
-    let calls: Vec<(String, String)> = if !rpc.redirected.is_empty() {
-        rpc.redirected.clone()
-    } else {
-        match parse_calls_block(&rpc.text, &rpc.names) {
-            Some((before, calls)) => {
-                text = before.trim().to_string();
-                calls
-            }
-            None => Vec::new(),
+    let chars = prompt_text.chars().count();
+    let (claimed, mut reason) = session::take(turn);
+    let spawn_fresh = |reason: &str| match session::spawn(turn, deadline, cancel) {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            trace_turn(&format!("fresh:{reason}"), "-", chars, None, Some(&e));
+            Err(e)
         }
     };
-    let calls: Vec<(String, String, String)> = calls
-        .into_iter()
-        .enumerate()
-        .map(|(i, (name, args))| (format!("call_{turn_id}_{}", i + 1), name, args))
-        .collect();
-    let stop = match stop_reason {
-        "max_tokens" => "incomplete:max_output_tokens".to_string(),
-        _ if !calls.is_empty() => "tool_use".to_string(),
-        _ => "completed".to_string(),
+    let mut s = match claimed {
+        Some((mut s, delta)) => {
+            match s.send_prompt(&delta, &turn.names) {
+                Ok(id) => {
+                    return match s.await_prompt(id, deadline, cancel) {
+                        Ok(r) => {
+                            s.absorb(turn, &r);
+                            trace_turn(
+                                "reuse",
+                                &s.session_id,
+                                delta.chars().count(),
+                                Some(&r),
+                                None,
+                            );
+                            session::give_back(s);
+                            Ok(r)
+                        }
+                        Err(e) => {
+                            trace_turn(
+                                "reuse",
+                                &s.session_id,
+                                delta.chars().count(),
+                                None,
+                                Some(&e),
+                            );
+                            s.close();
+                            Err(e)
+                        }
+                    };
+                }
+                Err(_) => {
+                    // The prompt never reached the child (dead pipe): close
+                    // it and replay the whole transcript on a fresh session
+                    // — the request is still answerable.
+                    s.close();
+                    reason = "send_failed";
+                    spawn_fresh(reason)?
+                }
+            }
+        }
+        None => spawn_fresh(reason)?,
     };
-    Ok(TurnResult {
-        text,
-        thought: rpc.thought.trim().to_string(),
-        calls,
-        usage: rpc.usage.clone(),
-        stop,
-    })
-}
-
-/// Map a JSON-RPC/CLI failure onto the host-facing error classes.
-fn map_rpc_error(err: &Value, stderr: &Arc<Mutex<std::collections::VecDeque<String>>>) -> String {
-    let mut detail = err
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    if let Ok(tail) = stderr.lock() {
-        let tail = tail.iter().cloned().collect::<Vec<_>>().join("; ");
-        if !tail.is_empty() {
-            detail = format!("{detail} {tail}");
+    let mode = format!("fresh:{reason}");
+    match s
+        .send_prompt(&prompt_text, &turn.names)
+        .and_then(|id| s.await_prompt(id, deadline, cancel))
+    {
+        Ok(r) => {
+            s.absorb(turn, &r);
+            trace_turn(&mode, &s.session_id, chars, Some(&r), None);
+            session::give_back(s);
+            Ok(r)
         }
-    }
-    let detail = redact(&detail);
-    let low = detail.to_lowercase();
-    if low.contains("429") || low.contains("rate limit") || low.contains("quota") {
-        return format!("Devin quota exhausted (native: {detail})");
-    }
-    if low.contains("not logged in") || low.contains("authenticate") || low.contains("unauthorized") {
-        return setup::LOGIN_HINT.to_string();
-    }
-    if detail.trim().is_empty() {
-        "native request failed".to_string()
-    } else {
-        format!("native request failed: {detail}")
+        Err(e) => {
+            trace_turn(&mode, &s.session_id, chars, None, Some(&e));
+            s.close();
+            Err(e)
+        }
     }
 }
 
-/// Redact token|secret|key|password-looking values from a detail string.
-fn redact(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for word in s.split_whitespace() {
-        let low = word.to_lowercase();
-        let secretish = ["token", "secret", "key", "password"]
-            .iter()
-            .any(|k| low.contains(k) && (low.contains('=') || low.ends_with(':')));
-        if secretish {
-            let mut it = word.splitn(2, ['=', ':']);
-            out.push_str(it.next().unwrap_or(word));
-            out.push_str(if word.contains('=') { "=<redacted>" } else { ": <redacted>" });
-        } else {
-            out.push_str(word);
-        }
-        out.push(' ');
+/// One line per turn when `DEVIN_SUB_DEBUG` is set: mode, session, prompt
+/// size and usage — never prompt content. Appends (mode 0600) to
+/// `<tempdir>/devin-sub-<pid>.log`.
+fn trace_turn(
+    mode: &str,
+    session_id: &str,
+    prompt_chars: usize,
+    r: Option<&TurnResult>,
+    err: Option<&str>,
+) {
+    if std::env::var_os("DEVIN_SUB_DEBUG").is_none() {
+        return;
     }
-    out.trim_end().to_string()
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| format!("{}.{:03}", d.as_secs(), d.subsec_millis()))
+        .unwrap_or_default();
+    let (usage, stop) = match r {
+        Some(r) => (
+            format!(
+                "{}/{}/{}",
+                r.usage.input_tokens, r.usage.cached_tokens, r.usage.output_tokens
+            ),
+            r.stop.clone(),
+        ),
+        None => (
+            "0/0/0".to_string(),
+            match err {
+                Some(e) => format!("error:{}", e.chars().take(120).collect::<String>()),
+                None => "error".to_string(),
+            },
+        ),
+    };
+    let line = format!(
+        "{ts}\t{mode}\tsession={session_id}\tprompt_chars={prompt_chars}\tusage={usage}\tstop={stop}\n"
+    );
+    let path = std::env::temp_dir().join(format!("devin-sub-{}.log", std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut f) = opts.open(path) {
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 /// Fold a completed turn into a Responses SSE stream.
-pub fn fold_result(
-    r: &TurnResult,
-    names: &[String],
-) -> Result<Vec<u8>, String> {
+pub fn fold_result(r: &TurnResult, names: &[String]) -> Result<Vec<u8>, String> {
     for (_, name, _) in &r.calls {
         if !names.iter().any(|n| n == name) {
             return Err(format!(
@@ -895,10 +669,7 @@ pub fn fold_result(
         "total_tokens": r.usage.input_tokens + r.usage.output_tokens,
         "input_tokens_details": {"cached_tokens": r.usage.cached_tokens}});
     let (status, incomplete) = match r.stop.as_str() {
-        "incomplete:max_output_tokens" => (
-            "incomplete",
-            json!({"reason": "max_output_tokens"}),
-        ),
+        "incomplete:max_output_tokens" => ("incomplete", json!({"reason": "max_output_tokens"})),
         s => (s, Value::Null),
     };
     emit(
@@ -911,7 +682,7 @@ pub fn fold_result(
     Ok(sse)
 }
 
-fn rand_hex(n: usize) -> String {
+pub(crate) fn rand_hex(n: usize) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)

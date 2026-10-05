@@ -15,7 +15,7 @@
 //! - `plugin/shutdown` → clean exit. Unknown methods are protocol errors
 //!   (provider sidecars must fail loudly, never hang a turn).
 
-use devin_sub::{catalog, manifest, models, relay, setup};
+use devin_sub::{catalog, manifest, models, relay, session, setup};
 
 use gray_plugin::{ProviderRefreshRequest, ProviderRevokeRequest, ProviderRpcError};
 use serde::{Deserialize, Serialize};
@@ -82,9 +82,13 @@ async fn main() -> anyhow::Result<()> {
         let _ = writeln!(stdout, "{frame}");
         stdout.flush()?;
         if request.method == "plugin/shutdown" {
+            session::shutdown();
             return Ok(());
         }
     }
+    // The host's stdin went away: close pooled sessions and the shared
+    // stage before exiting.
+    session::shutdown();
     Ok(())
 }
 
