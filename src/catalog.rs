@@ -31,7 +31,8 @@ pub struct ModelEntry {
 
 /// `devin models list`, cached per process.
 pub fn entries() -> Result<Vec<ModelEntry>, String> {
-    static CACHE: OnceLock<Mutex<Option<Result<Vec<ModelEntry>, String>>>> = OnceLock::new();
+    type CatalogResult = Result<Vec<ModelEntry>, String>;
+    static CACHE: OnceLock<Mutex<Option<CatalogResult>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     if let Some(hit) = cache.lock().ok().and_then(|c| c.clone()) {
         return hit;
@@ -123,7 +124,7 @@ pub fn parse_list(text: &str) -> Vec<ModelEntry> {
         let body = line.trim_end();
         if body.trim_start().starts_with("aliases:") {
             // Extra routable ids Devin resolves itself; window unknown.
-            for a in body.trim_start()["aliases:".len()..].split(|c: char| c == ',' || c == ' ') {
+            for a in body.trim_start()["aliases:".len()..].split([',', ' ']) {
                 let a = a.trim();
                 if !a.is_empty() && seen.insert(a.to_string()) {
                     out.push(ModelEntry {
