@@ -172,6 +172,21 @@ async fn chat_turn(relays: &Relays, params: Value) -> Result<Value, ProviderRpcE
     if setup::resolve_command().is_none() {
         return Err(ProviderRpcError::Unavailable(setup::INSTALL_HINT.into()));
     }
+    // No login, no relay: `/connect` shows the hint instead of a turn that
+    // dies later. A confirmed login is remembered for this sidecar's life;
+    // an inconclusive probe never blocks a turn.
+    static LOGGED_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED_IN.load(std::sync::atomic::Ordering::Relaxed) {
+        match setup::probe_login() {
+            setup::LoginState::LoggedOut => {
+                return Err(ProviderRpcError::Unavailable(setup::LOGIN_HINT.into()));
+            }
+            setup::LoginState::LoggedIn => {
+                LOGGED_IN.store(true, std::sync::atomic::Ordering::Relaxed)
+            }
+            setup::LoginState::Unknown => {}
+        }
+    }
     let bearer = format!("devin-sub-{}", hex_id());
     let intent = relay::RelayIntent {
         model: model.clone(),
