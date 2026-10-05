@@ -279,16 +279,21 @@ fn funnel_contract(tool_specs: &[String]) -> String {
 /// Valid = a JSON array of objects with `name` in the host tool set and
 /// object `arguments`. Anything malformed/foreign → `None` (the caller
 /// treats the whole reply as plain text, never invented calls).
-pub fn parse_calls_block(
-    text: &str,
-    names: &[String],
-) -> Option<(String, Vec<(String, String)>)> {
+///
+/// The closing fence is optional: SWE models often terminate the call
+/// list with their native pipe-delimited tool markup instead of ``` — or
+/// emit no close at all. In both cases the JSON array still leads the
+/// tail, so a prefix parse recovers it and the markup is dropped.
+pub fn parse_calls_block(text: &str, names: &[String]) -> Option<(String, Vec<(String, String)>)> {
     const FENCE: &str = "```gray_calls";
     let start = text.rfind(FENCE)?;
     let after = &text[start + FENCE.len()..];
-    let close = after.find("```")?;
-    let block = after[..close].trim();
-    let arr: Vec<Value> = serde_json::from_str(block).ok()?;
+    let candidate = match after.find("```") {
+        Some(close) => &after[..close],
+        None => after,
+    }
+    .trim();
+    let arr = json_array_prefix(candidate)?;
     let mut calls: Vec<(String, String)> = Vec::new();
     for c in &arr {
         let name = c.get("name").and_then(Value::as_str)?;
@@ -302,6 +307,16 @@ pub fn parse_calls_block(
         calls.push((name.to_string(), serde_json::to_string(args).ok()?));
     }
     Some((text[..start].trim_end().to_string(), calls))
+}
+
+/// A leading self-delimiting JSON array, ignoring whatever follows: the
+/// model may append native tool markup or hallucinated transcript turns
+/// after the array, and both are noise to drop, not parse failures.
+fn json_array_prefix(s: &str) -> Option<Vec<Value>> {
+    serde_json::Deserializer::from_str(s)
+        .into_iter::<Vec<Value>>()
+        .next()?
+        .ok()
 }
 
 /// Redirect a native `tool_call` notification onto `bash`, when the host

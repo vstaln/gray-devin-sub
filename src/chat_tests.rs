@@ -82,6 +82,60 @@ fn funnel_parse_non_object_args_is_none() {
 }
 
 #[test]
+fn funnel_parse_markup_terminated_block() {
+    // SWE models end the call list with native pipe-delimited tool markup
+    // instead of the ``` fence (and may hallucinate transcript turns after
+    // it). The array still parses; everything from the fence on is dropped.
+    let markup = concat!(
+        "<",
+        "|close",
+        "|>argument<",
+        "|sep",
+        "|><",
+        "|close",
+        "|>call<",
+        "|sep",
+        "|><",
+        "|close",
+        "|>tools<",
+        "|sep",
+        "|>"
+    );
+    let text = format!(
+        "checking the file\n```gray_calls\n[{{\"name\": \"bash\", \"arguments\": {{\"command\": \"sed -n '1,5p' x\"}}}}]{markup}\n\n[User]\nContinue.\n\n[Assistant]\nRetrying."
+    );
+    let (before, calls) = parse_calls_block(&text, &["bash".to_string()])
+        .expect("markup-terminated block must parse");
+    assert_eq!(before, "checking the file");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "bash");
+    assert!(calls[0].1.contains("sed -n"));
+}
+
+#[test]
+fn funnel_parse_unclosed_block_at_eof() {
+    let text = "reading it now\n```gray_calls\n[{\"name\": \"bash\", \"arguments\": {\"command\": \"cat f\"}}]";
+    let (before, calls) =
+        parse_calls_block(text, &["bash".to_string()]).expect("unclosed block must parse");
+    assert_eq!(before, "reading it now");
+    assert_eq!(calls[0].0, "bash");
+}
+
+#[test]
+fn funnel_parse_junk_after_array_inside_fence() {
+    let text = "```gray_calls\n[{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}] stray words\n```";
+    let (_, calls) =
+        parse_calls_block(text, &["bash".to_string()]).expect("trailing junk in block is dropped");
+    assert_eq!(calls[0].0, "bash");
+}
+
+#[test]
+fn funnel_parse_unclosed_garbage_is_none() {
+    let text = "thinking out loud\n```gray_calls\n[{not json";
+    assert!(parse_calls_block(text, &["bash".to_string()]).is_none());
+}
+
+#[test]
 fn funnel_parse_uses_last_block() {
     let text = "```gray_calls\n[{\"name\": \"bash\", \"arguments\": {\"command\": \"first\"}}]\n```\n\
                 wait\n```gray_calls\n[{\"name\": \"bash\", \"arguments\": {\"command\": \"last\"}}]\n```";
