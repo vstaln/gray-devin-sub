@@ -39,4 +39,7 @@ fn manifest_ids_and_protocol() {
     assert_eq!(h["name"], "session-id");
     assert_eq!(h["source"]["kind"], "session_id");
     assert_eq!(h["required"], true);
+    provider()
+        .validate()
+        .expect("subscription declaration validates");
 }
