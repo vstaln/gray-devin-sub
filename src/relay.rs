@@ -1,11 +1,18 @@
-//! Loopback admission relay: the single-request gate in front of `agy`.
+//! Loopback admission relay: the single-request gate in front of
+//! `devin acp`.
 //!
 //! Per chat turn the sidecar opens a loopback HTTP server and hands the
 //! host a per-turn relay URL + bearer. The host POSTs its standard
 //! Responses body there; the relay admits exactly ONE request (anything
 //! past it gets 400 `ADMISSION_CONSUMED`), translates it to one funnel
-//! turn, spawns `agy` (which makes exactly one upstream request on its
-//! own), folds the native transcript to Responses SSE and streams it back.
+//! turn, drives a pooled `devin acp` session (which makes exactly one
+//! upstream request on its own), folds the native transcript to Responses
+//! SSE and streams it back.
+//!
+//! A turn can outlive the host's per-read timeout: past `HEADER_GRACE`
+//! the response becomes a close-delimited SSE stream kept alive with
+//! `: keepalive` comments every `KEEPALIVE`. If the client goes away the
+//! in-flight native turn is cancelled.
 //!
 //! Credentials are forwarded, never persisted: the bearer is a per-turn
 //! token minted by the sidecar, never the user's OAuth token.
@@ -14,9 +21,17 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
+
+/// How long the relay may hold the response headers before committing to
+/// the close-delimited keepalive path (the host's per-read timeout).
+const HEADER_GRACE: Duration = Duration::from_secs(20);
+/// SSE comment cadence once the response is streaming.
+const KEEPALIVE: Duration = Duration::from_secs(15);
 
 /// What `provider/chat` parked for one turn: the relay fills the body in.
 pub struct RelayIntent {
@@ -56,7 +71,7 @@ fn handle_conn(
     bearer: &str,
     used: &Arc<AtomicBool>,
 ) {
-    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(330)));
+    let _ = s.set_read_timeout(Some(Duration::from_secs(330)));
     let mut buf = vec![0u8; 65536];
     let mut head = Vec::new();
     loop {
@@ -123,9 +138,21 @@ fn handle_conn(
         write_resp(s, 400, body.to_string().as_bytes());
         return;
     }
-    // Admitted: the one request. Translate, spawn, fold, stream.
-    match run_turn(intents, bearer, &body) {
-        Ok(sse) => {
+    // Admitted: the one request. The turn runs on a worker thread so the
+    // connection can answer within HEADER_GRACE — or commit to a
+    // close-delimited stream and keep it alive until the turn ends.
+    let (tx, rx) = mpsc::channel::<Result<Vec<u8>, String>>();
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let intents = intents.clone();
+        let bearer = bearer.to_string();
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_turn(&intents, &bearer, &body, &cancel));
+        });
+    }
+    match rx.recv_timeout(HEADER_GRACE) {
+        Ok(Ok(sse)) => {
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 sse.len()
@@ -134,16 +161,69 @@ fn handle_conn(
             let _ = s.write_all(&sse);
             let _ = s.flush();
         }
-        Err(detail) => {
+        Ok(Err(detail)) => {
             let body = json!({"type": "error", "error": {
                 "type": "server_error", "message": detail,
             }});
             write_resp(s, 500, body.to_string().as_bytes());
         }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let body = json!({"type": "error", "error": {
+                "type": "server_error", "message": "turn worker died",
+            }});
+            write_resp(s, 500, body.to_string().as_bytes());
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Slow turn: no Content-Length, the stream ends at close.
+            // eventsource-stream ignores `:` comment lines.
+            if s
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                )
+                .and_then(|_| s.flush())
+                .is_err()
+            {
+                cancel.store(true, Ordering::SeqCst);
+                return;
+            }
+            loop {
+                match rx.recv_timeout(KEEPALIVE) {
+                    Ok(Ok(sse)) => {
+                        let _ = s.write_all(&sse);
+                        let _ = s.flush();
+                        return;
+                    }
+                    Ok(Err(detail)) => {
+                        let failed = json!({"type": "response.failed",
+                            "response": {"status": "failed",
+                                "error": {"code": "server_error", "message": detail}}});
+                        let _ =
+                            s.write_all(format!("data: {failed}\n\ndata: [DONE]\n\n").as_bytes());
+                        let _ = s.flush();
+                        return;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if s.write_all(b": keepalive\n\n")
+                            .and_then(|_| s.flush())
+                            .is_err()
+                        {
+                            cancel.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+        }
     }
 }
 
-fn run_turn(intents: &Intents, bearer: &str, raw: &[u8]) -> Result<Vec<u8>, String> {
+fn run_turn(
+    intents: &Intents,
+    bearer: &str,
+    raw: &[u8],
+    cancel: &Arc<AtomicBool>,
+) -> Result<Vec<u8>, String> {
     let intent = intents
         .lock()
         .map(|mut m| m.remove(bearer))
@@ -162,9 +242,9 @@ fn run_turn(intents: &Intents, bearer: &str, raw: &[u8]) -> Result<Vec<u8>, Stri
         .iter()
         .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
         .collect();
-    // One `devin acp` session per turn: native makes exactly one upstream
-    // request on its own.
-    let result = crate::chat::spawn_turn(&turn, std::time::Duration::from_secs(600))?;
+    // A pooled session when this history continues one, else a fresh
+    // spawn — either way native makes exactly one upstream request.
+    let result = crate::chat::run_turn(&turn, cancel, Duration::from_secs(600))?;
     crate::chat::fold_result(&result, &names)
 }
 

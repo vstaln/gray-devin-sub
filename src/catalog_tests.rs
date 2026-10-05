@@ -8,7 +8,10 @@ fn parses_model_rows() {
     let get = |id: &str| rows.iter().find(|r| r.id == id);
     assert!(get("swe-2-high").is_some());
     assert_eq!(get("swe-2-high").unwrap().context, Some(262_000));
-    assert_eq!(get("claude-opus-5-5-medium").unwrap().context, Some(1_000_000));
+    assert_eq!(
+        get("claude-opus-5-5-medium").unwrap().context,
+        Some(1_000_000)
+    );
     assert_eq!(
         get("claude-opus-5-5-medium").unwrap().display,
         "Claude Opus 5.5 Medium"
