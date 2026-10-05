@@ -739,16 +739,19 @@ fn map_rpc_error(err: &Value, stderr: &Arc<Mutex<VecDeque<String>>>) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    if let Ok(tail) = stderr.lock() {
-        let tail = tail.iter().cloned().collect::<Vec<_>>().join("; ");
-        if !tail.is_empty() {
-            detail = format!("{detail} {tail}");
-        }
+    if detail.trim().is_empty()
+        && let Ok(tail) = stderr.lock()
+        && let Some(last) = tail.iter().rev().find(|line| !line.trim().is_empty())
+    {
+        detail = last.clone();
     }
     let detail = redact(&detail);
     let low = detail.to_lowercase();
-    if low.contains("429") || low.contains("rate limit") || low.contains("quota") {
-        return format!("Devin quota exhausted (native: {detail})");
+    if low.contains("quota") || low.contains("reached free model rate limit") {
+        return format!("Devin usage limit reached: {detail}");
+    }
+    if low.contains("429") || low.contains("rate limit") {
+        return format!("Devin rate limited: {detail}");
     }
     if low.contains("not logged in") || low.contains("authenticate") || low.contains("unauthorized")
     {
@@ -784,3 +787,7 @@ fn redact(s: &str) -> String {
     }
     out.trim_end().to_string()
 }
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod tests;

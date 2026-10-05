@@ -333,8 +333,7 @@ pub fn native_model(model: &str, effort: Option<&str>) -> String {
     if entries.iter().any(|e| e.id == model) {
         return model.to_string();
     }
-    let ids: std::collections::HashSet<&str> =
-        entries.iter().map(|e| e.id.as_str()).collect();
+    let ids: std::collections::HashSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
     for fam in families(&entries) {
         if fam.base == model && family_efforts(&fam, &ids).is_some() {
             if let Some(tier) = effort
