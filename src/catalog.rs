@@ -8,12 +8,25 @@
 
 use std::sync::{Mutex, OnceLock};
 
-/// One routable model: id, display name, declared context window.
+/// The family a row was listed under — parsed from its section header
+/// `Display Name (slug)`. The slug is a routable fuzzy name the
+/// `--model` matcher accepts.
+#[derive(Debug, Clone, Default)]
+pub struct Family {
+    pub slug: String,
+    pub name: String,
+}
+
+/// One routable model: id, display name, declared context window, its
+/// listing family, and whether it came from an `aliases:` line (extra
+/// routable ids, not real members).
 #[derive(Debug, Clone)]
 pub struct ModelEntry {
     pub id: String,
     pub display: String,
     pub context: Option<u32>,
+    pub family: Family,
+    pub alias: bool,
 }
 
 /// `devin models list`, cached per process.
@@ -73,12 +86,38 @@ fn run_list() -> Result<String, String> {
     Ok(reader.join().unwrap_or_default())
 }
 
-/// Parse `devin models list` text into routable entries.
+/// Parse `devin models list` text into routable entries. Unindented lines
+/// are family headers (`SWE-2 (swe-2)`); the parenthesized slug is the
+/// routable family name the `--model` fuzzy matcher accepts.
 pub fn parse_list(text: &str) -> Vec<ModelEntry> {
     let mut out: Vec<ModelEntry> = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut family = Family::default();
     for line in text.lines() {
         if !line.starts_with("  ") {
+            let h = line.trim();
+            // Blank separators don't end a family — rows after them still
+            // belong to the last header.
+            if h.is_empty() {
+                continue;
+            }
+            // Header: `Display Name (slug)`. Anything unindented that
+            // doesn't parse resets the family — its rows don't belong to
+            // the previous section.
+            family = Family::default();
+            if let Some((name, slug)) = h.rsplit_once('(')
+                && let Some(slug) = slug.strip_suffix(')')
+                && slug
+                    .trim()
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                && !slug.trim().is_empty()
+            {
+                family = Family {
+                    slug: slug.trim().to_string(),
+                    name: name.trim().to_string(),
+                };
+            }
             continue;
         }
         let body = line.trim_end();
@@ -91,6 +130,8 @@ pub fn parse_list(text: &str) -> Vec<ModelEntry> {
                         id: a.to_string(),
                         display: format!("{a} (alias)"),
                         context: None,
+                        family: family.clone(),
+                        alias: true,
                     });
                 }
             }
@@ -122,6 +163,8 @@ pub fn parse_list(text: &str) -> Vec<ModelEntry> {
                     display
                 },
                 context: extra.and_then(context_of),
+                family: family.clone(),
+                alias: false,
             });
         }
     }
@@ -150,9 +193,158 @@ fn context_of(bracketed: &str) -> Option<u32> {
     None
 }
 
-/// Native `--model` selection: ids pass through verbatim — the variant
-/// (thought level, speed) lives in the id itself.
-pub fn native_model(model: &str) -> String {
+/// Variant words that name a thinking tier — the picker's vocabulary
+/// minus `off` (`off` never crosses the wire, and a `-none` row is a
+/// separate non-reasoning product). Any other variant — `fast`,
+/// `priority`, `turbo`, a sidekick id — is a product trait and keeps its
+/// own row.
+pub const EFFORT_VARIANTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Rows under one listing header, expressed as `<base>-<variant>`:
+/// `base` is the members' shared id prefix, and each member's variant is
+/// what follows it.
+pub struct FamilyMembers<'a> {
+    /// Header slug — the routable family name.
+    pub slug: &'a str,
+    /// Header display text.
+    pub name: &'a str,
+    /// Longest common member-id prefix clipped at a `-` boundary.
+    pub base: String,
+    /// (row, variant) in listing order; an empty variant means the row
+    /// IS the base — a bare routable member.
+    pub members: Vec<(&'a ModelEntry, &'a str)>,
+}
+
+/// Group non-alias rows by listing family and compute each family's
+/// `<base>-<variant>` shape. Rows listed before any header are ignored.
+pub fn families(entries: &[ModelEntry]) -> Vec<FamilyMembers<'_>> {
+    let mut order: Vec<&str> = Vec::new();
+    let mut grouped: Vec<Vec<&ModelEntry>> = Vec::new();
+    for e in entries
+        .iter()
+        .filter(|e| !e.alias && !e.family.slug.is_empty())
+    {
+        match order.iter().position(|s| *s == e.family.slug) {
+            Some(i) => grouped[i].push(e),
+            None => {
+                order.push(e.family.slug.as_str());
+                grouped.push(vec![e]);
+            }
+        }
+    }
+    order
+        .into_iter()
+        .zip(grouped)
+        .map(|(slug, members)| {
+            let base = common_base(&members);
+            FamilyMembers {
+                slug,
+                name: members
+                    .first()
+                    .map(|m| m.family.name.as_str())
+                    .unwrap_or_default(),
+                members: members
+                    .iter()
+                    .map(|m| (*m, variant_of(&m.id, &base)))
+                    .collect(),
+                base,
+            }
+        })
+        .collect()
+}
+
+/// Longest common member-id prefix. A member that IS the prefix is kept
+/// whole (it's the family's bare row); otherwise clip at the last `-`.
+fn common_base(members: &[&ModelEntry]) -> String {
+    let mut p = members.first().map(|m| m.id.clone()).unwrap_or_default();
+    for m in &members[1..] {
+        let n = p
+            .bytes()
+            .zip(m.id.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        p.truncate(n);
+    }
+    if members.iter().any(|m| m.id == p) {
+        // A member ending in a tier word is itself a variant row, not the
+        // base: solo `claude-opus-5-5-medium` still yields
+        // `claude-opus-5-5`. Bare rows (`swe-1-7-lightning`) keep whole.
+        if let Some((head, tail)) = p.rsplit_once('-')
+            && EFFORT_VARIANTS.contains(&tail)
+            && !head.is_empty()
+        {
+            return head.to_string();
+        }
+        return p;
+    }
+    match p.rfind('-') {
+        Some(i) => p.truncate(i),
+        None => p.clear(),
+    }
+    p
+}
+
+fn variant_of<'a>(id: &'a str, base: &str) -> &'a str {
+    if id == base {
+        return "";
+    }
+    id.strip_prefix(base)
+        .and_then(|s| s.strip_prefix('-'))
+        .unwrap_or(id)
+}
+
+/// A family folds into one picker row when it has tier variants, no bare
+/// base row, and `base` isn't a routable id elsewhere in the catalog.
+/// Returns the declared efforts in picker order, or `None` when the
+/// family must stay as individual rows.
+pub fn family_efforts(
+    fam: &FamilyMembers<'_>,
+    ids: &std::collections::HashSet<&str>,
+) -> Option<Vec<String>> {
+    if fam.base.is_empty()
+        // `SWE-2 (swe-2)` owns `swe-2-*` tier rows; `Fusion (fusion)`
+        // heads pairings — `...-sol-high`'s tail is the sidekick's tier
+        // baked into a product id, not a knob on one row.
+        || fam.slug.replace('.', "-") != fam.base
+        || ids.contains(fam.base.as_str())
+        || fam.members.iter().any(|(_, v)| v.is_empty())
+    {
+        return None;
+    }
+    let tiers: Vec<String> = EFFORT_VARIANTS
+        .iter()
+        .filter(|t| fam.members.iter().any(|(_, v)| *v == **t))
+        .map(|t| t.to_string())
+        .collect();
+    if tiers.is_empty() { None } else { Some(tiers) }
+}
+
+/// Native `--model` selection. A real catalog id passes through verbatim:
+/// the variant (tier, speed) lives in the id itself, so a stale
+/// `swe-2-max` pick stays `swe-2-max` whatever the request's effort says.
+/// A collapsed family id (`swe-2`) resolves to its `<base>-<effort>`
+/// member when the request asks for a tier the family has; otherwise it
+/// falls back to the header slug — the documented routable family name —
+/// which lets Devin pick the family's default tier.
+pub fn native_model(model: &str, effort: Option<&str>) -> String {
+    let Ok(entries) = entries() else {
+        return model.to_string();
+    };
+    if entries.iter().any(|e| e.id == model) {
+        return model.to_string();
+    }
+    let ids: std::collections::HashSet<&str> =
+        entries.iter().map(|e| e.id.as_str()).collect();
+    for fam in families(&entries) {
+        if fam.base == model && family_efforts(&fam, &ids).is_some() {
+            if let Some(tier) = effort
+                && let Some((m, _)) = fam.members.iter().find(|(_, v)| *v == tier)
+            {
+                return m.id.clone();
+            }
+            return fam.slug.to_string();
+        }
+    }
     model.to_string()
 }
 

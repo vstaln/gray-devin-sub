@@ -48,9 +48,17 @@ type Relays = relay::Intents;
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     // `gray install plugin` registers sidecars by running `<bin> manifest`.
-    if std::env::args().nth(1).as_deref() == Some("manifest") {
-        println!("{}", serde_json::to_string(&manifest::manifest())?);
-        return Ok(());
+    match std::env::args().nth(1).as_deref() {
+        Some("manifest") => {
+            println!("{}", serde_json::to_string(&manifest::manifest())?);
+            return Ok(());
+        }
+        Some("models") => {
+            let catalog = models::catalog().map_err(anyhow::Error::msg)?;
+            println!("{}", serde_json::to_string_pretty(&catalog)?);
+            return Ok(());
+        }
+        _ => {}
     }
     let relays: Relays = Arc::new(Mutex::new(HashMap::new()));
     let mut lines =
@@ -209,7 +217,7 @@ async fn chat_turn(relays: &Relays, params: Value) -> Result<Value, ProviderRpcE
     Ok(json!({
         "relay_url": format!("http://127.0.0.1:{port}/relay/{bearer}/responses"),
         "relay_token": bearer,
-        "native_model": catalog::native_model(&model),
+        "native_model": catalog::native_model(&model, None),
     }))
 }
 

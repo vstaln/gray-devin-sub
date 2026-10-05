@@ -185,6 +185,7 @@ fn fold_emits_complete_function_call_items() {
             cached_tokens: 3,
         },
         stop: "tool_use".to_string(),
+        unseen: false,
     };
     let sse = String::from_utf8(fold_result(&r, &["bash".to_string()]).unwrap()).unwrap();
     assert!(sse.contains("response.output_item.added"));
@@ -202,6 +203,7 @@ fn fold_rejects_tool_outside_inventory() {
         calls: vec![("call_1_1".into(), "hack".into(), "{}".into())],
         usage: Usage::default(),
         stop: "tool_use".to_string(),
+        unseen: false,
     };
     assert!(fold_result(&r, &["bash".to_string()]).is_err());
 }
@@ -219,6 +221,7 @@ fn fold_marks_max_tokens_incomplete() {
         calls: Vec::new(),
         usage: Usage::default(),
         stop: "incomplete:max_output_tokens".to_string(),
+        unseen: false,
     };
     let sse = String::from_utf8(fold_result(&r, &[]).unwrap()).unwrap();
     assert!(sse.contains("\"status\":\"incomplete\""));
@@ -341,6 +344,18 @@ fn continuation_text_only_reply_echo() {
     input.push(json!({"role": "user", "content": "next"}));
     let delta = continuation(&absorbed(), &[], "done", &input).unwrap();
     assert_eq!(delta, "[User]\nnext");
+}
+
+#[test]
+fn continuation_unseen_reply_echoes_nothing() {
+    // A turn that settled after the relay client was gone records an
+    // empty reply (LiveSession::absorb, r.unseen): gray's history carries
+    // no assistant items for it, so the echo zone is empty and the new
+    // tail alone is the delta.
+    let mut input = absorbed();
+    input.push(json!({"role": "user", "content": "retry that"}));
+    let delta = continuation(&absorbed(), &[], "", &input).unwrap();
+    assert_eq!(delta, "[User]\nretry that");
 }
 
 #[test]

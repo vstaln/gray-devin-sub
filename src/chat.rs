@@ -247,12 +247,20 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
         system_parts.push(instructions.to_string());
     }
     system_parts.push(funnel_contract(&tool_specs));
+    // Responses `reasoning.effort` is the host's /thinking pick; the model
+    // id family + tier name resolve to the real native id (the catalog
+    // collapses `swe-2-high|medium|max` into one `swe-2` row, so the effort
+    // is how a tier actually gets chosen).
+    let effort = body
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .and_then(Value::as_str);
     Ok(PreparedTurn {
         system: system_parts.join("\n\n"),
         content_line,
         input,
         names,
-        native_model: crate::catalog::native_model(model),
+        native_model: crate::catalog::native_model(model, effort),
     })
 }
 
@@ -450,6 +458,10 @@ pub struct TurnResult {
     pub calls: Vec<(String, String, String)>,
     pub usage: Usage,
     pub stop: String,
+    /// The relay client was already gone when this turn settled: the
+    /// reply was produced but never delivered, so the session records an
+    /// empty echo for it (see `LiveSession::absorb`).
+    pub unseen: bool,
 }
 
 #[derive(Default, Clone)]
