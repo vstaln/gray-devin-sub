@@ -42,29 +42,108 @@ fn skips_headers_and_blank() {
 }
 
 #[test]
-fn families_share_a_tier_base() {
+fn plain_groups_share_a_tier_base() {
     let rows = parse_list(SAMPLE);
-    let fams = families(&rows);
-    let swe = fams.iter().find(|f| f.slug == "swe-2").unwrap();
-    assert_eq!(swe.base, "swe-2");
-    let variants: Vec<&str> = swe.members.iter().map(|(_, v)| *v).collect();
-    assert_eq!(variants, vec!["high", "max"]);
-    // The family base comes from member ids (dashed), not the header slug
+    let groups = plain_groups(&rows);
+    let swe = groups.iter().find(|g| g.base == "swe-2").unwrap();
+    let efforts: Vec<Option<&str>> = swe.members.iter().map(|(_, e, _)| e.as_deref()).collect();
+    assert_eq!(efforts, vec![Some("high"), Some("max")]);
+    assert_eq!(swe.slug(), Some("swe-2"));
+    assert_eq!(swe.name(), "SWE-2");
+    // The base comes from member ids (dashed), not the header slug
     // (dotted): `claude-opus-5-5`, not `claude-opus-5.5`.
-    let claude = fams.iter().find(|f| f.slug == "claude-opus-5.5").unwrap();
-    assert_eq!(claude.base, "claude-opus-5-5");
-    // A family whose member IS the base has a bare row → no collapse.
-    let ids: std::collections::HashSet<&str> = rows.iter().map(|e| e.id.as_str()).collect();
-    let adaptive = fams.iter().find(|f| f.slug == "adaptive").unwrap();
-    assert_eq!(adaptive.base, "adaptive");
-    assert!(family_efforts(adaptive, &ids).is_none());
-    let lightning = fams.iter().find(|f| f.slug == "swe-1.7-lightning").unwrap();
-    assert!(family_efforts(lightning, &ids).is_none());
+    assert!(groups.iter().any(|g| g.base == "claude-opus-5-5"));
+    // A bare id whose display names a tier is pinned to it.
+    let lightning = groups
+        .iter()
+        .find(|g| g.base == "swe-1-7-lightning")
+        .unwrap();
+    assert_eq!(lightning.members[0].1.as_deref(), Some("max"));
+    // A lone tier-less id has nothing to fold.
+    assert!(groups.iter().all(|g| g.base != "adaptive"));
     // Declared efforts come back in picker order.
+    assert_eq!(swe.efforts(), vec!["high".to_string(), "max".to_string()]);
+}
+
+#[test]
+fn parse_plain_requires_display_confirmation() {
+    let p = parse_plain("gpt-6-sol-none-priority", "GPT-6 Sol No Thinking Fast").unwrap();
+    assert_eq!(p.base, "gpt-6-sol");
+    assert_eq!(p.effort.as_deref(), Some("off"));
+    assert!(p.fast);
+    let p = parse_plain("claude-opus-5-5-high-fast", "Claude Opus 5.5 High Fast").unwrap();
+    assert_eq!(p.base, "claude-opus-5-5");
+    assert_eq!(p.effort.as_deref(), Some("high"));
+    assert!(p.fast);
+    let p = parse_plain("inkling-xhigh", "Inkling X-High").unwrap();
+    assert_eq!(p.effort.as_deref(), Some("xhigh"));
+    // A tier-looking suffix the display doesn't confirm stays in the base.
+    let p = parse_plain("widget-max", "Widget").unwrap();
+    assert_eq!(p.base, "widget-max");
+    assert_eq!(p.effort, None);
+    let p = parse_plain("widget-fast", "Widget").unwrap();
+    assert_eq!(p.base, "widget-fast");
+    assert!(!p.fast);
+    // Context and thinking products keep their own base.
     assert_eq!(
-        family_efforts(swe, &ids).unwrap(),
-        vec!["high".to_string(), "max".to_string()]
+        parse_plain("glm-5-2-max-1m", "GLM-5.2 Max 1M")
+            .unwrap()
+            .base,
+        "glm-5-2-max-1m"
     );
+    assert_eq!(
+        parse_plain("claude-opus-4-6-thinking", "Claude Opus 4.6 Thinking")
+            .unwrap()
+            .base,
+        "claude-opus-4-6-thinking"
+    );
+    // Legacy and fusion ids are not plain.
+    assert!(parse_plain("MODEL_GPT_5_2_LOW", "GPT-5.2 Low Thinking").is_none());
+    assert!(
+        parse_plain(
+            "fusion-claude-opus-5-5-high-sidekick-swe-2-high",
+            "Fusion (Claude Opus 5.5 High + SWE-2 High)"
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn display_words() {
+    assert_eq!(display_tier("GPT-6 Sol High Thinking Fast"), Some("high"));
+    assert_eq!(display_tier("GPT-5.4 No Thinking"), Some("none"));
+    assert_eq!(display_tier("Nemotron 3 Ultra None"), Some("none"));
+    assert_eq!(display_tier("SWE-1.6 Fast"), None);
+    assert_eq!(base_display("GPT-6 Sol High Thinking Fast"), "GPT-6 Sol");
+    assert_eq!(base_display("GPT-6 Sol No Thinking"), "GPT-6 Sol");
+    assert_eq!(base_display("SWE-1.6 Fast"), "SWE-1.6");
+    assert_eq!(base_display("Claude Fable 5.1 Medium"), "Claude Fable 5.1");
+}
+
+#[test]
+fn legacy_family_ids_resolve_by_effort() {
+    let rows = parse_list(SAMPLE);
+    // Old configs saved the folded family id; effort picks the tier.
+    assert_eq!(resolve_native(&rows, "swe-2", Some("max")), "swe-2-max");
+    assert_eq!(resolve_native(&rows, "swe-2", Some("high")), "swe-2-high");
+    // No matching tier (or none asked) → the routable header slug.
+    assert_eq!(resolve_native(&rows, "swe-2", Some("low")), "swe-2");
+    assert_eq!(
+        resolve_native(&rows, "claude-opus-5-5", None),
+        "claude-opus-5.5"
+    );
+    // Real ids — variant picks — pass through whatever the effort says.
+    assert_eq!(
+        resolve_native(&rows, "swe-2-high", Some("max")),
+        "swe-2-high"
+    );
+    assert_eq!(
+        resolve_native(&rows, "swe-1-7-lightning", Some("medium")),
+        "swe-1-7-lightning"
+    );
+    // Unknown ids (and the Fusion header slug) pass through.
+    assert_eq!(resolve_native(&rows, "fusion", Some("high")), "fusion");
+    assert_eq!(resolve_native(&rows, "nope", None), "nope");
 }
 
 #[test]

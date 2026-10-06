@@ -194,158 +194,271 @@ fn context_of(bracketed: &str) -> Option<u32> {
     None
 }
 
-/// Variant words that name a thinking tier — the picker's vocabulary
-/// minus `off` (`off` never crosses the wire, and a `-none` row is a
-/// separate non-reasoning product). Any other variant — `fast`,
-/// `priority`, `turbo`, a sidekick id — is a product trait and keeps its
-/// own row.
+/// Id-suffix words that name a thinking tier, in picker order. `none`
+/// is listed separately: a `-none` id is the effort-`off` variant.
 pub const EFFORT_VARIANTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
 
-/// Rows under one listing header, expressed as `<base>-<variant>`:
-/// `base` is the members' shared id prefix, and each member's variant is
-/// what follows it.
-pub struct FamilyMembers<'a> {
-    /// Header slug — the routable family name.
-    pub slug: &'a str,
-    /// Header display text.
-    pub name: &'a str,
-    /// Longest common member-id prefix clipped at a `-` boundary.
-    pub base: String,
-    /// (row, variant) in listing order; an empty variant means the row
-    /// IS the base — a bare routable member.
-    pub members: Vec<(&'a ModelEntry, &'a str)>,
+/// Picker order for declared efforts: `off` (a `-none` id) first, then
+/// the tiers.
+pub const EFFORT_ORDER: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Id suffixes that select the fast lane: Anthropic-style `-fast` and
+/// OpenAI-style `-priority` (listed as "... Fast").
+const FAST_SUFFIXES: &[&str] = &["fast", "priority"];
+
+/// Tier word → effort name: `none` is the picker's `off`.
+fn effort_name(tier: &str) -> String {
+    if tier == "none" {
+        "off".to_string()
+    } else {
+        tier.to_string()
+    }
 }
 
-/// Group non-alias rows by listing family and compute each family's
-/// `<base>-<variant>` shape. Rows listed before any header are ignored.
-pub fn families(entries: &[ModelEntry]) -> Vec<FamilyMembers<'_>> {
-    let mut order: Vec<&str> = Vec::new();
-    let mut grouped: Vec<Vec<&ModelEntry>> = Vec::new();
-    for e in entries
-        .iter()
-        .filter(|e| !e.alias && !e.family.slug.is_empty())
+/// The thinking tier a display string names, in id vocabulary
+/// (`none`, `low`, …, `xhigh`, `max`): `GPT-6 Sol High Thinking Fast` →
+/// `high`, `GPT-5.4 No Thinking` / `Inkling None` → `none`,
+/// `Inkling X-High` → `xhigh`. `None` when the display names no tier
+/// (`SWE-1.6`, `Claude Opus 4.6 Thinking`).
+pub fn display_tier(display: &str) -> Option<&'static str> {
+    let mut words: Vec<&str> = display.split_whitespace().collect();
+    if words.last().is_some_and(|w| w.eq_ignore_ascii_case("fast")) {
+        words.pop();
+    }
+    if words.len() >= 2
+        && words[words.len() - 2].eq_ignore_ascii_case("no")
+        && words[words.len() - 1].eq_ignore_ascii_case("thinking")
     {
-        match order.iter().position(|s| *s == e.family.slug) {
-            Some(i) => grouped[i].push(e),
-            None => {
-                order.push(e.family.slug.as_str());
-                grouped.push(vec![e]);
-            }
+        return Some("none");
+    }
+    if words
+        .last()
+        .is_some_and(|w| w.eq_ignore_ascii_case("thinking"))
+    {
+        words.pop();
+    }
+    let last = words.last()?.to_ascii_lowercase().replace('-', "");
+    EFFORT_VARIANTS
+        .iter()
+        .chain(std::iter::once(&"none"))
+        .find(|t| **t == last)
+        .copied()
+}
+
+/// Display text minus its variant words (tier, `Thinking`, `Fast`):
+/// `GPT-6 Sol High Thinking Fast` → `GPT-6 Sol`, `SWE-1.6 Fast` →
+/// `SWE-1.6`.
+pub fn base_display(display: &str) -> String {
+    let mut words: Vec<&str> = display.split_whitespace().collect();
+    if words.last().is_some_and(|w| w.eq_ignore_ascii_case("fast")) {
+        words.pop();
+    }
+    if words
+        .last()
+        .is_some_and(|w| w.eq_ignore_ascii_case("thinking"))
+    {
+        words.pop();
+        if words.last().is_some_and(|w| w.eq_ignore_ascii_case("no")) {
+            words.pop();
         }
     }
-    order
-        .into_iter()
-        .zip(grouped)
-        .map(|(slug, members)| {
-            let base = common_base(&members);
-            FamilyMembers {
-                slug,
-                name: members
-                    .first()
-                    .map(|m| m.family.name.as_str())
-                    .unwrap_or_default(),
-                members: members
-                    .iter()
-                    .map(|m| (*m, variant_of(&m.id, &base)))
-                    .collect(),
-                base,
-            }
-        })
-        .collect()
-}
-
-/// Longest common member-id prefix. A member that IS the prefix is kept
-/// whole (it's the family's bare row); otherwise clip at the last `-`.
-fn common_base(members: &[&ModelEntry]) -> String {
-    let mut p = members.first().map(|m| m.id.clone()).unwrap_or_default();
-    for m in &members[1..] {
-        let n = p
-            .bytes()
-            .zip(m.id.bytes())
-            .take_while(|(a, b)| a == b)
-            .count();
-        p.truncate(n);
-    }
-    if members.iter().any(|m| m.id == p) {
-        // A member ending in a tier word is itself a variant row, not the
-        // base: solo `claude-opus-5-5-medium` still yields
-        // `claude-opus-5-5`. Bare rows (`swe-1-7-lightning`) keep whole.
-        if let Some((head, tail)) = p.rsplit_once('-')
-            && EFFORT_VARIANTS.contains(&tail)
-            && !head.is_empty()
-        {
-            return head.to_string();
+    if words.len() > 1
+        && let Some(last) = words.last()
+    {
+        let l = last.to_ascii_lowercase().replace('-', "");
+        if EFFORT_VARIANTS.contains(&l.as_str()) || l == "none" {
+            words.pop();
         }
-        return p;
     }
-    match p.rfind('-') {
-        Some(i) => p.truncate(i),
-        None => p.clear(),
-    }
-    p
+    words.join(" ")
 }
 
-fn variant_of<'a>(id: &'a str, base: &str) -> &'a str {
-    if id == base {
-        return "";
-    }
-    id.strip_prefix(base)
-        .and_then(|s| s.strip_prefix('-'))
-        .unwrap_or(id)
+fn has_word(display: &str, word: &str) -> bool {
+    display
+        .split_whitespace()
+        .any(|w| w.eq_ignore_ascii_case(word))
 }
 
-/// A family folds into one picker row when it has tier variants, no bare
-/// base row, and `base` isn't a routable id elsewhere in the catalog.
-/// Returns the declared efforts in picker order, or `None` when the
-/// family must stay as individual rows.
-pub fn family_efforts(
-    fam: &FamilyMembers<'_>,
-    ids: &std::collections::HashSet<&str>,
-) -> Option<Vec<String>> {
-    if fam.base.is_empty()
-        // `SWE-2 (swe-2)` owns `swe-2-*` tier rows; `Fusion (fusion)`
-        // heads pairings — `...-sol-high`'s tail is the sidekick's tier
-        // baked into a product id, not a knob on one row.
-        || fam.slug.replace('.', "-") != fam.base
-        || ids.contains(fam.base.as_str())
-        || fam.members.iter().any(|(_, v)| v.is_empty())
+/// One parsed plain id: `<base>[-<tier>][-fast|-priority]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainId {
+    pub base: String,
+    /// Effort the id is pinned to (`off` for `-none`); `None` = no tier
+    /// in the id or its display.
+    pub effort: Option<String>,
+    pub fast: bool,
+}
+
+/// Parse a plain (non-fusion) id. Every stripped suffix must be confirmed
+/// by the display text — `-fast`/`-priority` by a `Fast` word, a tier by
+/// the display's tier word — so a product name that merely ends in a tier
+/// word is never split. A bare id whose display names a tier
+/// (`swe-1-7-lightning` = "SWE-1.7 Lightning Max") is pinned to it.
+/// `None` for ids outside the lowercase `a-z0-9-` shape (`MODEL_*`
+/// legacy ids) and for `fusion-*` pairings.
+pub fn parse_plain(id: &str, display: &str) -> Option<PlainId> {
+    if id.is_empty()
+        || id.starts_with("fusion-")
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
         return None;
     }
-    let tiers: Vec<String> = EFFORT_VARIANTS
-        .iter()
-        .filter(|t| fam.members.iter().any(|(_, v)| *v == **t))
-        .map(|t| t.to_string())
-        .collect();
-    if tiers.is_empty() { None } else { Some(tiers) }
+    let mut rest = id;
+    let mut fast = false;
+    if let Some((head, tail)) = rest.rsplit_once('-')
+        && FAST_SUFFIXES.contains(&tail)
+        && !head.is_empty()
+        && has_word(display, "fast")
+    {
+        rest = head;
+        fast = true;
+    }
+    let shown = display_tier(display);
+    let mut effort = None;
+    if let Some((head, tail)) = rest.rsplit_once('-')
+        && !head.is_empty()
+        && (EFFORT_VARIANTS.contains(&tail) || tail == "none")
+        && shown == Some(tail)
+    {
+        rest = head;
+        effort = Some(effort_name(tail));
+    } else if let Some(t) = shown {
+        effort = Some(effort_name(t));
+    }
+    Some(PlainId {
+        base: rest.to_string(),
+        effort,
+        fast,
+    })
+}
+
+/// Plain ids sharing one parsed base, across listing families
+/// (`swe-1-6` + `swe-1-6-fast` are one model with a fast lane).
+pub struct PlainGroup<'a> {
+    pub base: String,
+    /// (row, effort, fast) in listing order.
+    pub members: Vec<(&'a ModelEntry, Option<String>, bool)>,
+}
+
+impl PlainGroup<'_> {
+    /// Picker name: the listing header whose slug is this base
+    /// (`Claude Opus 5.5`), else the first member's display minus its
+    /// variant words.
+    pub fn name(&self) -> String {
+        if let Some((m, _, _)) = self
+            .members
+            .iter()
+            .find(|(m, _, _)| !m.family.name.is_empty() && self.slug_matches(&m.family))
+        {
+            return m.family.name.clone();
+        }
+        self.members
+            .first()
+            .map(|(m, _, _)| base_display(&m.display))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| self.base.clone())
+    }
+
+    /// The routable family slug Devin resolves to its default tier: the
+    /// header slug matching this base, else the first member's header.
+    pub fn slug(&self) -> Option<&str> {
+        self.members
+            .iter()
+            .find(|(m, _, _)| self.slug_matches(&m.family))
+            .or_else(|| self.members.first())
+            .map(|(m, _, _)| m.family.slug.as_str())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn slug_matches(&self, family: &Family) -> bool {
+        !family.slug.is_empty() && family.slug.replace('.', "-") == self.base
+    }
+
+    /// The efforts members declare, in picker order.
+    pub fn efforts(&self) -> Vec<String> {
+        EFFORT_ORDER
+            .iter()
+            .filter(|t| {
+                self.members
+                    .iter()
+                    .any(|(_, e, _)| e.as_deref() == Some(**t))
+            })
+            .map(|t| t.to_string())
+            .collect()
+    }
+}
+
+/// Group the routable plain ids by parsed base and keep the groups that
+/// fold into one picker row: members carry a variant (an effort or the
+/// fast lane), each (effort, fast) pair names exactly one id, and the
+/// base isn't some other routable id. Aliases and unparseable ids
+/// (`MODEL_*`, `fusion-*`) never group.
+pub fn plain_groups(entries: &[ModelEntry]) -> Vec<PlainGroup<'_>> {
+    let ids: std::collections::HashSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+    let mut groups: Vec<PlainGroup<'_>> = Vec::new();
+    for e in entries.iter().filter(|e| !e.alias) {
+        let Some(p) = parse_plain(&e.id, &e.display) else {
+            continue;
+        };
+        match groups.iter_mut().find(|g| g.base == p.base) {
+            Some(g) => g.members.push((e, p.effort, p.fast)),
+            None => groups.push(PlainGroup {
+                base: p.base,
+                members: vec![(e, p.effort, p.fast)],
+            }),
+        }
+    }
+    groups.retain(|g| {
+        let varied = g.members.len() > 1 || g.members.iter().any(|(_, e, f)| e.is_some() || *f);
+        let mut keys = std::collections::HashSet::new();
+        let unique = g
+            .members
+            .iter()
+            .all(|(_, e, f)| keys.insert((e.clone(), *f)));
+        let base_free =
+            !ids.contains(g.base.as_str()) || g.members.iter().any(|(m, _, _)| m.id == g.base);
+        varied && unique && base_free
+    });
+    groups
 }
 
 /// Native `--model` selection. A real catalog id passes through verbatim:
-/// the variant (tier, speed) lives in the id itself, so a stale
-/// `swe-2-max` pick stays `swe-2-max` whatever the request's effort says.
-/// A collapsed family id (`swe-2`) resolves to its `<base>-<effort>`
-/// member when the request asks for a tier the family has; otherwise it
-/// falls back to the header slug — the documented routable family name —
-/// which lets Devin pick the family's default tier.
+/// the variant (tier, speed) lives in the id itself, so a variant id the
+/// picker resolved — or a stale `swe-2-max` pick — stays as sent whatever
+/// the request's effort says. A folded row id that isn't itself routable
+/// (`swe-2`, from older configs or hosts that don't read `variants`)
+/// resolves to its non-fast member pinned to the request's effort
+/// (`swe-2` + `max` → `swe-2-max`, `gpt-6-sol` + `off` → `gpt-6-sol-none`);
+/// otherwise it falls back to the header slug — the documented routable
+/// family name — which lets Devin pick the family's default tier. `fusion`
+/// with no resolved pairing is the Fusion header slug and passes through.
 pub fn native_model(model: &str, effort: Option<&str>) -> String {
     let Ok(entries) = entries() else {
         return model.to_string();
     };
+    resolve_native(&entries, model, effort)
+}
+
+/// [`native_model`] over an explicit listing.
+pub fn resolve_native(entries: &[ModelEntry], model: &str, effort: Option<&str>) -> String {
     if entries.iter().any(|e| e.id == model) {
         return model.to_string();
     }
-    let ids: std::collections::HashSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
-    for fam in families(&entries) {
-        if fam.base == model && family_efforts(&fam, &ids).is_some() {
-            if let Some(tier) = effort
-                && let Some((m, _)) = fam.members.iter().find(|(_, v)| *v == tier)
-            {
-                return m.id.clone();
-            }
-            return fam.slug.to_string();
-        }
+    let Some(group) = plain_groups(entries).into_iter().find(|g| g.base == model) else {
+        return model.to_string();
+    };
+    let want = effort.map(|t| if t == "none" { "off" } else { t });
+    if let Some(t) = want
+        && let Some((m, _, _)) = group
+            .members
+            .iter()
+            .find(|(_, e, fast)| !fast && e.as_deref() == Some(t))
+    {
+        return m.id.clone();
     }
-    model.to_string()
+    group.slug().unwrap_or(model).to_string()
 }
 
 pub fn context_window(model: &str) -> Option<u32> {

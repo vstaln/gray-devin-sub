@@ -89,13 +89,40 @@ fn text_of(blocks: &Value) -> String {
                 Some("input_text" | "output_text") => {
                     b.get("text").and_then(Value::as_str).map(str::to_string)
                 }
-                Some("input_image" | "image" | "input_file") => Some("[image omitted]".to_string()),
+                // Inline images travel as ACP image blocks after the prompt
+                // text (`images_of`); the transcript keeps a marker.
+                Some("input_image") if image_block(b).is_some() => {
+                    Some("[image attached]".to_string())
+                }
+                Some("input_image" | "image") => Some("[image omitted]".to_string()),
+                Some("input_file" | "input_video") => Some("[file omitted]".to_string()),
                 _ => None,
             })
             .collect::<Vec<_>>()
             .join(""),
         _ => String::new(),
     }
+}
+
+/// ACP image block for a Responses `input_image` part carrying a
+/// `data:<mime>;base64,<data>` URL. Remote URLs aren't fetched.
+fn image_block(part: &Value) -> Option<Value> {
+    let url = part.get("image_url")?;
+    let url = url.as_str().or_else(|| url.get("url")?.as_str())?;
+    let (mime, data) = url.strip_prefix("data:")?.split_once(";base64,")?;
+    Some(json!({"type": "image", "mimeType": mime, "data": data}))
+}
+
+/// ACP image blocks for every inline image in `items`' messages, in order.
+pub(crate) fn images_of(items: &[Value]) -> Vec<Value> {
+    items
+        .iter()
+        .filter(|i| item_kind(i) == "message")
+        .filter_map(|i| i.get("content")?.as_array())
+        .flatten()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("input_image"))
+        .filter_map(image_block)
+        .collect()
 }
 
 /// Kind of a Responses input item: the `type` field, or "message" for the
@@ -275,6 +302,9 @@ fn funnel_contract(tool_specs: &[String]) -> String {
         [{\"name\": \"<tool name>\", \"arguments\": { ... }}]\n```\n\n\
         The array may hold several calls. Do not write anything after the block. \
         If no tool is needed, answer normally with no block. \
+        Never call a tool just to wait, poll or pass a round (`true`, `:`, `sleep`, `echo`): \
+        to wait for a background job use its tool's own wait (bash `action: \"output\"` with \
+        `job_id` and `wait_ms`), otherwise reply with no block. \
         Later messages in this conversation come from the harness: tool results \
         arrive as `[Tool result id=…]` blocks and new user input as `[User]` blocks.",
     );
@@ -288,9 +318,12 @@ fn funnel_contract(tool_specs: &[String]) -> String {
 }
 
 /// Parse the funnel: the LAST ```gray_calls fenced block in `text`.
-/// Valid = a JSON array of objects with `name` in the host tool set and
-/// object `arguments`. Anything malformed/foreign → `None` (the caller
-/// treats the whole reply as plain text, never invented calls).
+/// No block → `None` (plain answer). A block is always the model asking
+/// for tools, so it is never dumped as text (that ends the turn on raw
+/// JSON): unknown names and non-object arguments pass through as-is, and
+/// an unparseable array becomes one call carrying the raw block. The host
+/// validates every call and answers bad ones with an error result without
+/// executing them, so the model sees why and retries.
 ///
 /// The closing fence is optional: SWE models often terminate the call
 /// list with their native pipe-delimited tool markup instead of ``` — or
@@ -305,19 +338,26 @@ pub fn parse_calls_block(text: &str, names: &[String]) -> Option<(String, Vec<(S
         None => after,
     }
     .trim();
-    let arr = json_array_prefix(candidate)?;
-    let mut calls: Vec<(String, String)> = Vec::new();
-    for c in &arr {
-        let name = c.get("name").and_then(Value::as_str)?;
-        if !names.iter().any(|n| n == name) {
-            return None;
-        }
-        let args = c.get("arguments")?;
-        if !args.is_object() {
-            return None;
-        }
-        calls.push((name.to_string(), serde_json::to_string(args).ok()?));
-    }
+    // The tool the model most likely meant, so the host's error names it.
+    let guess = names
+        .iter()
+        .find(|n| {
+            candidate.contains(&format!("\"name\":\"{n}\""))
+                || candidate.contains(&format!("\"name\": \"{n}\""))
+        })
+        .or(names.first())
+        .map_or("gray_calls", String::as_str);
+    let calls: Vec<(String, String)> = match json_array_prefix(candidate) {
+        Some(arr) => arr
+            .iter()
+            .map(|c| {
+                let name = c.get("name").and_then(Value::as_str).unwrap_or(guess);
+                let args = c.get("arguments").unwrap_or(&Value::Null);
+                (name.to_string(), args.to_string())
+            })
+            .collect(),
+        None => vec![(guess.to_string(), candidate.to_string())],
+    };
     Some((text[..start].trim_end().to_string(), calls))
 }
 
@@ -368,6 +408,10 @@ fn assistant_side(item: &Value) -> bool {
     }
 }
 
+/// Prepended to a continuation delta whose previous reply never reached
+/// the host.
+pub(crate) const UNDELIVERED_NOTE: &str = "[Harness note] Your previous reply was interrupted by the user and never delivered; none of its tool calls ran.";
+
 /// Strict-continuation check: `input` is `absorbed` plus the echo of the
 /// session's own last answer plus a non-assistant tail. Returns the tail
 /// rendered to transcript text — the only thing the session still needs
@@ -406,7 +450,14 @@ pub(crate) fn continuation(
         }
         i += 1;
     }
-    if call_ids.as_slice() != reply_call_ids || texts.join("\n").trim() != reply_text.trim() {
+    // An empty echo zone against a non-empty recorded reply: the reply
+    // never reached gray (interrupted turn, client gone before delivery).
+    // The child still holds it, so continue with a note instead of
+    // re-billing the whole prefix on a fresh session.
+    let undelivered = i == 0 && (!reply_call_ids.is_empty() || !reply_text.trim().is_empty());
+    if !undelivered
+        && (call_ids.as_slice() != reply_call_ids || texts.join("\n").trim() != reply_text.trim())
+    {
         return Err("echo");
     }
     let tail = &rest[i..];
@@ -416,6 +467,9 @@ pub(crate) fn continuation(
     let delta = render_items(tail);
     if delta.trim().is_empty() {
         return Err("empty_delta");
+    }
+    if undelivered {
+        return Ok(format!("{UNDELIVERED_NOTE}\n\n{delta}"));
     }
     Ok(delta)
 }
@@ -506,7 +560,8 @@ pub fn run_turn(
     };
     let mut s = match claimed {
         Some((mut s, delta)) => {
-            match s.send_prompt(&delta, &turn.names) {
+            let images = images_of(&turn.input[s.absorbed.len()..]);
+            match s.send_prompt(&delta, &images, &turn.names) {
                 Ok(id) => {
                     return match s.await_prompt(id, deadline, cancel) {
                         Ok(r) => {
@@ -548,7 +603,7 @@ pub fn run_turn(
     };
     let mode = format!("fresh:{reason}");
     match s
-        .send_prompt(&prompt_text, &turn.names)
+        .send_prompt(&prompt_text, &images_of(&turn.input), &turn.names)
         .and_then(|id| s.await_prompt(id, deadline, cancel))
     {
         Ok(r) => {
@@ -616,14 +671,7 @@ pub(crate) fn trace_turn(
 }
 
 /// Fold a completed turn into a Responses SSE stream.
-pub fn fold_result(r: &TurnResult, names: &[String]) -> Result<Vec<u8>, String> {
-    for (_, name, _) in &r.calls {
-        if !names.iter().any(|n| n == name) {
-            return Err(format!(
-                "native requested a tool outside the current host inventory: {name:?}"
-            ));
-        }
-    }
+pub fn fold_result(r: &TurnResult) -> Result<Vec<u8>, String> {
     let mut sse = Vec::new();
     let emit = |sse: &mut Vec<u8>, payload: &Value| {
         sse.extend_from_slice(b"data: ");

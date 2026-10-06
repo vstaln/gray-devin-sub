@@ -9,6 +9,8 @@ pub const PLUGIN_NAME: &str = "devin-sub";
 pub const PLUGIN_VERSION: &str = "0.1.0";
 pub const PROVIDER_ID: &str = "devin-subscription";
 pub const AUTH_METHOD_ID: &str = "devin-login";
+/// Opens the host's `/model` picker focused on the folded Fusion row.
+pub const FUSION_COMMAND: &str = "/fusion";
 
 /// A protocol-1.2 manifest value. Credentials stay with the user's own
 /// `devin` CLI login: the `devin-login` method performs no credential
@@ -18,7 +20,7 @@ pub fn manifest() -> gray_plugin::Manifest {
         name: PLUGIN_NAME.to_string(),
         version: PLUGIN_VERSION.to_string(),
         tools: Vec::new(),
-        commands: vec!["/devin".to_string()],
+        commands: vec!["/devin".to_string(), FUSION_COMMAND.to_string()],
         hooks: Vec::new(),
         protocol: Some("1.2".to_string()),
         subcommands: Vec::new(),
@@ -29,6 +31,19 @@ pub fn manifest() -> gray_plugin::Manifest {
         providers: vec![provider()],
         provider_errors: Vec::new(),
     }
+}
+
+/// `command/run` result for a claimed command, `None` for names this
+/// sidecar doesn't answer. `/fusion` asks the host to open its model
+/// picker on the `fusion` row (`model_picker`); `text` is the fallback a
+/// host without `model_picker` support prints instead.
+pub fn run_command(name: &str) -> Option<serde_json::Value> {
+    (name == FUSION_COMMAND).then(|| {
+        serde_json::json!({
+            "model_picker": crate::models::FUSION_ID,
+            "text": "Open /model and pick Fusion (this gray is too old for /fusion)",
+        })
+    })
 }
 
 /// Devin subscription provider. Requests go to the loopback relay the
@@ -50,6 +65,7 @@ pub fn provider() -> ProviderDecl {
             },
             request: ProviderRequestPolicyDecl {
                 prompt_cache_key: false,
+                warm_replay: false,
                 store: false,
                 include_reasoning_encrypted: true,
                 previous_response_id: false,

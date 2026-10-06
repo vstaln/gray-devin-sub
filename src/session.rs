@@ -179,7 +179,7 @@ pub struct LiveSession {
     /// prepared system is identical.
     system: String,
     /// The exact `input` array of the last request this session answered.
-    absorbed: Vec<Value>,
+    pub(crate) absorbed: Vec<Value>,
     /// Call ids emitted in that answer, in order.
     reply_call_ids: Vec<String>,
     /// The (trimmed) text emitted in that answer.
@@ -518,7 +518,12 @@ impl LiveSession {
     /// not leak into this one: queued server requests are answered
     /// (permissions cancel, the rest refused), stale notifications and
     /// responses are dropped.
-    pub(crate) fn send_prompt(&mut self, text: &str, names: &[String]) -> Result<u64, String> {
+    pub(crate) fn send_prompt(
+        &mut self,
+        text: &str,
+        images: &[Value],
+        names: &[String],
+    ) -> Result<u64, String> {
         while let Ok(v) = self.rx.try_recv() {
             if v.get("method").is_some() && v.get("id").is_some() {
                 self.on_request(&v)?;
@@ -529,10 +534,11 @@ impl LiveSession {
         self.redirected.clear();
         self.usage = Usage::default();
         self.names = names.to_vec();
+        let mut prompt = vec![json!({"type": "text", "text": text})];
+        prompt.extend_from_slice(images);
         self.send_request(
             "session/prompt",
-            json!({"sessionId": self.session_id,
-                "prompt": [{"type": "text", "text": text}]}),
+            json!({"sessionId": self.session_id, "prompt": prompt}),
         )
     }
 
@@ -607,7 +613,7 @@ impl LiveSession {
         let deadline = Instant::now() + KEEPALIVE_WINDOW;
         let next = self.keepalive_turns + 1;
         match self
-            .send_prompt(KEEPALIVE_TEXT, &[])
+            .send_prompt(KEEPALIVE_TEXT, &[], &[])
             .and_then(|id| self.await_prompt(id, deadline, &never))
         {
             Ok(r) => {

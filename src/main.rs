@@ -12,6 +12,8 @@
 //! - `provider/auth/*` → the user's own `devin auth login` owns
 //!   credentials; start/poll report external-login status, refresh/revoke
 //!   are unsupported.
+//! - `command/run` → `/fusion` opens the host's model picker on the
+//!   folded Fusion row (`{"model_picker":"fusion","text":<fallback>}`).
 //! - `plugin/shutdown` → clean exit. Unknown methods are protocol errors
 //!   (provider sidecars must fail loudly, never hang a turn).
 
@@ -158,6 +160,14 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
             Ok(serde_json::to_value(catalog).unwrap())
         }
         "provider/chat" => chat_turn(relays, params).await,
+        "command/run" => {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            manifest::run_command(name)
+                .ok_or_else(|| ProviderRpcError::Protocol("unknown command".into()))
+        }
         "plugin/shutdown" => Ok(json!({})),
         _ => Err(ProviderRpcError::Protocol("unknown provider method".into())),
     }
