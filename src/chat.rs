@@ -567,8 +567,9 @@ pub fn run_turn(
 
 /// One line per turn when `DEVIN_SUB_DEBUG` is set: mode, session, prompt
 /// size and usage — never prompt content. Appends (mode 0600) to
-/// `<tempdir>/devin-sub-<pid>.log`.
-fn trace_turn(
+/// `<tempdir>/devin-sub-<pid>.log`. `pub(crate)` so the session pool's
+/// keepalive can trace under the same convention.
+pub(crate) fn trace_turn(
     mode: &str,
     session_id: &str,
     prompt_chars: usize,
