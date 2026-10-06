@@ -26,8 +26,13 @@
 //! therefore sends one fixed minimal `session/prompt` on any pooled
 //! session whose last upstream contact is older than `KEEPALIVE_AFTER`.
 //! The session leaves the pool for the keepalive (exclusive use, exactly
-//! like a real turn — no prompt can overlap on the same child), and the
-//! injected turn lives only in the child's transcript: matching keys off
+//! like a real turn — no prompt can overlap on the same child), and a
+//! turn that could continue a session out for a keepalive waits for it to
+//! return instead of spawning fresh (a fresh session re-bills the whole
+//! transcript — the very miss the keepalive exists to prevent). ACP offers
+//! no fork or rewind and the cache is per-session, so the injected turn
+//! does land in the child's transcript, worded so the model reads it as an
+//! automated refresh rather than user input. Matching keys off
 //! `absorbed` + the echo of our reply (gray's history), which the
 //! keepalive never touches, so `take` still yields the same delta and the
 //! next real turn simply appends after it. `last_used` (the `IDLE_TTL`
@@ -40,7 +45,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -69,9 +74,11 @@ const KEEPALIVE_IDLE_MAX: Duration = Duration::from_secs(10 * 60);
 /// One keepalive prompt must settle inside this window; a session that
 /// can't is closed as untrusted, the same rule as a failed real turn.
 const KEEPALIVE_WINDOW: Duration = Duration::from_secs(60);
-/// Fixed minimal keepalive marker: refreshes the upstream cache for a
-/// near-zero reply (ACP's `session/prompt` takes no output cap).
-const KEEPALIVE_TEXT: &str = ".";
+/// Fixed minimal keepalive prompt: refreshes the upstream cache for a
+/// near-zero reply (ACP's `session/prompt` takes no output cap). It stays
+/// in the model's context, so it says what it is: a bare "." reads as a
+/// user nudge and invites a full reply.
+const KEEPALIVE_TEXT: &str = "[automated cache refresh, not from the user: reply with only \"ok\"]";
 /// How often an ACP wait wakes to check for a relay client disconnect.
 const CANCEL_POLL: Duration = Duration::from_secs(1);
 /// Internal error when the relay client went away mid-turn.
@@ -207,11 +214,39 @@ pub struct LiveSession {
     names: Vec<String>,
 }
 
-/// The process-wide session pool.
-static POOL: OnceLock<Mutex<Vec<LiveSession>>> = OnceLock::new();
+/// A session out of the pool for a keepalive: enough to tell whether a
+/// turn could continue it.
+struct Warming {
+    session_id: String,
+    native_model: String,
+    system: String,
+}
 
-fn locked_pool() -> MutexGuard<'static, Vec<LiveSession>> {
-    let pool = POOL.get_or_init(|| Mutex::new(Vec::new()));
+#[derive(Default)]
+struct Pool {
+    live: Vec<LiveSession>,
+    warming: Vec<Warming>,
+}
+
+impl Pool {
+    /// Whether a session out for a keepalive could answer `turn`: same
+    /// model and system text, a cheap stand-in for the full continuation
+    /// check. An unrelated conversation sharing both just waits out one
+    /// keepalive (seconds) before spawning fresh.
+    fn warming_for(&self, turn: &PreparedTurn) -> bool {
+        self.warming
+            .iter()
+            .any(|w| w.native_model == turn.native_model && w.system == turn.system)
+    }
+}
+
+/// The process-wide session pool.
+static POOL: OnceLock<Mutex<Pool>> = OnceLock::new();
+/// Signalled whenever a keepalive ends, so a waiting `take` re-checks.
+static POOL_CHANGED: Condvar = Condvar::new();
+
+fn locked_pool() -> MutexGuard<'static, Pool> {
+    let pool = POOL.get_or_init(|| Mutex::new(Pool::default()));
     // Tiny reaper: closes idle/dead sessions even when no turn is running.
     static REAPER: Once = Once::new();
     REAPER.call_once(|| {
@@ -221,7 +256,7 @@ fn locked_pool() -> MutexGuard<'static, Vec<LiveSession>> {
                 let dead = {
                     let Some(pool) = POOL.get() else { continue };
                     let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
-                    reap(&mut pool)
+                    reap(&mut pool.live)
                 };
                 for s in dead {
                     s.close();
@@ -258,70 +293,98 @@ fn reap(pool: &mut Vec<LiveSession>) -> Vec<LiveSession> {
     dead
 }
 
-/// Take the first pooled session this turn is a strict continuation of
-/// (same native model, same system text, `continuation` yields a delta).
-/// Returns the session plus the delta to prompt with; on a miss the
-/// second tuple item is the deepest reason any candidate reached
-/// (`no_session` when the pool was empty).
-pub fn take(turn: &PreparedTurn) -> (Option<(LiveSession, String)>, &'static str) {
+/// The first pooled session this turn is a strict continuation of (same
+/// native model, same system text, `continuation` yields a delta): its
+/// index plus the delta, or on a miss the deepest reason any candidate
+/// reached (`no_session` when the pool was empty).
+fn find(live: &[LiveSession], turn: &PreparedTurn) -> Result<(usize, String), &'static str> {
     let mut reason = "no_session";
-    let (found, dead) = {
-        let mut pool = locked_pool();
-        let dead = reap(&mut pool);
-        let mut depth = 0;
-        let mut found = None;
-        for (i, s) in pool.iter().enumerate() {
-            let (miss, d) = if s.native_model != turn.native_model {
-                ("model", 1)
-            } else if s.system != turn.system {
-                ("system", 2)
-            } else {
-                match continuation(&s.absorbed, &s.reply_call_ids, &s.reply_text, &turn.input) {
-                    Ok(delta) => {
-                        found = Some((i, delta));
-                        break;
-                    }
-                    Err(m) => (
-                        m,
-                        match m {
-                            "prefix" => 3,
-                            "echo" => 4,
-                            _ => 5,
-                        },
-                    ),
-                }
-            };
-            if d > depth {
-                depth = d;
-                reason = miss;
+    let mut depth = 0;
+    for (i, s) in live.iter().enumerate() {
+        let (miss, d) = if s.native_model != turn.native_model {
+            ("model", 1)
+        } else if s.system != turn.system {
+            ("system", 2)
+        } else {
+            match continuation(&s.absorbed, &s.reply_call_ids, &s.reply_text, &turn.input) {
+                Ok(delta) => return Ok((i, delta)),
+                Err(m) => (
+                    m,
+                    match m {
+                        "prefix" => 3,
+                        "echo" => 4,
+                        _ => 5,
+                    },
+                ),
             }
+        };
+        if d > depth {
+            depth = d;
+            reason = miss;
         }
-        (found.map(|(i, delta)| (pool.remove(i), delta)), dead)
+    }
+    Err(reason)
+}
+
+/// Take the pooled session this turn continues (see [`find`]), plus the
+/// delta to prompt with. While a session that could answer it is out for
+/// a keepalive, wait for it to come back — up to `KEEPALIVE_WINDOW`, or
+/// until `cancel` — rather than miss and re-bill the whole transcript on a
+/// fresh child. On a miss the second item is the reason.
+pub fn take(
+    turn: &PreparedTurn,
+    cancel: &AtomicBool,
+) -> (Option<(LiveSession, String)>, &'static str) {
+    let deadline = Instant::now() + KEEPALIVE_WINDOW;
+    let mut dead = Vec::new();
+    let result = {
+        let mut pool = locked_pool();
+        loop {
+            dead.extend(reap(&mut pool.live));
+            let reason = match find(&pool.live, turn) {
+                Ok((i, delta)) => break (Some((pool.live.remove(i), delta)), "reuse"),
+                Err(reason) => reason,
+            };
+            let left = deadline.saturating_duration_since(Instant::now());
+            if !pool.warming_for(turn) || cancel.load(Ordering::SeqCst) {
+                break (None, reason);
+            }
+            if left.is_zero() {
+                break (None, "keepalive_busy");
+            }
+            pool = POOL_CHANGED
+                .wait_timeout(pool, left.min(CANCEL_POLL))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
     };
     for s in dead {
         s.close();
     }
-    (found, reason)
+    result
 }
 
-/// Return a session to the pool after a successful turn, evicting the
-/// least-recently-used session past `MAX_LIVE`.
+/// Return a session to the pool after a successful turn or keepalive,
+/// evicting the least-recently-used session past `MAX_LIVE`.
 pub fn give_back(s: LiveSession) {
     let mut dead = {
         let mut pool = locked_pool();
-        let mut dead = reap(&mut pool);
-        pool.push(s);
-        if pool.len() > MAX_LIVE {
+        let mut dead = reap(&mut pool.live);
+        pool.warming.retain(|w| w.session_id != s.session_id);
+        pool.live.push(s);
+        if pool.live.len() > MAX_LIVE {
             let lru = pool
+                .live
                 .iter()
                 .enumerate()
                 .min_by_key(|(_, s)| s.last_used)
                 .map(|(i, _)| i)
                 .unwrap_or(0);
-            dead.push(pool.remove(lru));
+            dead.push(pool.live.remove(lru));
         }
         dead
     };
+    POOL_CHANGED.notify_all();
     for s in dead.drain(..) {
         s.close();
     }
@@ -340,30 +403,40 @@ fn keepalive_due(last_prompt_at: Option<Instant>, last_used: Instant, alive: boo
 
 /// Remove the first keepalive-due session from the pool. Out of the pool
 /// is exclusive use — exactly the serialization `take` gives a real
-/// turn — so no real prompt can overlap a keepalive on the same child
-/// (a host turn arriving mid-keepalive simply misses and spawns fresh).
+/// turn — so no real prompt can overlap a keepalive on the same child; it
+/// is listed as warming so a host turn arriving meanwhile waits for it.
 fn take_keepalive() -> Option<LiveSession> {
     let pool = POOL.get()?;
     let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
-    let i = pool.iter_mut().position(|s| {
+    let i = pool.live.iter_mut().position(|s| {
         keepalive_due(
             s.last_prompt_at,
             s.last_used,
             matches!(s.child.try_wait(), Ok(None)),
         )
     })?;
-    Some(pool.remove(i))
+    let s = pool.live.remove(i);
+    pool.warming.push(Warming {
+        session_id: s.session_id.clone(),
+        native_model: s.native_model.clone(),
+        system: s.system.clone(),
+    });
+    Some(s)
 }
 
 /// Warm every due session, one at a time. A settled keepalive returns
 /// through `give_back` so `MAX_LIVE` still bounds the pool; any failure
 /// closes the session — it is never pooled in a state the next turn
-/// can't trust.
+/// can't trust. Either way it stops being listed as warming.
 fn keepalive_sweep() {
     while let Some(mut s) = take_keepalive() {
         if s.keepalive() {
             give_back(s);
         } else {
+            locked_pool()
+                .warming
+                .retain(|w| w.session_id != s.session_id);
+            POOL_CHANGED.notify_all();
             s.close();
         }
     }
@@ -374,7 +447,7 @@ fn keepalive_sweep() {
 pub fn shutdown() {
     let dead = {
         let mut pool = locked_pool();
-        std::mem::take(&mut *pool)
+        std::mem::take(&mut pool.live)
     };
     for s in dead {
         s.close();

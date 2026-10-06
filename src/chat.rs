@@ -550,7 +550,7 @@ pub fn run_turn(
         format!("{}\n\n{}", turn.system, turn.content_line)
     };
     let chars = prompt_text.chars().count();
-    let (claimed, mut reason) = session::take(turn);
+    let (claimed, mut reason) = session::take(turn, cancel);
     let spawn_fresh = |reason: &str| match session::spawn(turn, deadline, cancel) {
         Ok(s) => Ok(s),
         Err(e) => {

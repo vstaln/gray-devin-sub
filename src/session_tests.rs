@@ -159,6 +159,71 @@ fn keepalives_do_not_extend_idle_ttl() {
 }
 
 #[test]
+fn a_turn_waits_for_its_session_to_return_from_a_keepalive() {
+    // Unique model: the pool is process-wide and tests run in parallel.
+    let model = "model-keepalive-wait";
+    let turn = |model: &str, input: Vec<Value>| PreparedTurn {
+        system: "sys".to_string(),
+        content_line: String::new(),
+        input,
+        names: Vec::new(),
+        native_model: model.to_string(),
+    };
+    let history = vec![json!({"role": "user", "content": "hi"})];
+    let first = turn(model, history.clone());
+    let mut s = stub_session();
+    s.session_id = "s-keepalive-wait".to_string();
+    s.native_model = model.to_string();
+    s.absorb(
+        &first,
+        &TurnResult {
+            text: "answer".to_string(),
+            thought: String::new(),
+            calls: Vec::new(),
+            usage: Usage::default(),
+            stop: "completed".to_string(),
+            unseen: false,
+        },
+    );
+    let mut input = history;
+    input.push(json!({"role": "assistant", "content": "answer"}));
+    input.push(json!({"role": "user", "content": "more"}));
+    let next = turn(model, input.clone());
+    let never = AtomicBool::new(false);
+
+    // Out for a keepalive: the turn must not miss straight to a fresh
+    // spawn, it waits and gets the same session back.
+    locked_pool().warming.push(Warming {
+        session_id: s.session_id.clone(),
+        native_model: model.to_string(),
+        system: "sys".to_string(),
+    });
+    let back = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        give_back(s);
+    });
+    let started = Instant::now();
+    let (claimed, _) = take(&next, &never);
+    back.join().unwrap();
+    let (mut s, delta) = claimed.expect("turn missed while its session was warming");
+    assert!(started.elapsed() >= Duration::from_millis(250));
+    assert_eq!(s.session_id, "s-keepalive-wait");
+    assert_eq!(delta, "[User]\nmore");
+    assert!(!locked_pool().warming_for(&next));
+
+    // Nothing warming for this turn: a miss returns at once.
+    let other = turn("model-keepalive-none", input);
+    let started = Instant::now();
+    let (claimed, reason) = take(&other, &never);
+    assert!(claimed.is_none());
+    assert_ne!(reason, "keepalive_busy");
+    assert!(started.elapsed() < Duration::from_millis(250));
+
+    let _ = s.child.kill();
+    let _ = s.child.wait();
+}
+
+#[test]
 fn keepalive_due_bounds_warming() {
     let active = Instant::now();
     let stale = Some(Instant::now() - KEEPALIVE_AFTER - Duration::from_secs(1));
