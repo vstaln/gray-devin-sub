@@ -4,7 +4,7 @@ use super::*;
 fn manifest_ids_and_protocol() {
     let m = serde_json::to_value(manifest()).unwrap();
     assert_eq!(m["name"], "devin-sub");
-    assert_eq!(m["version"], "0.1.0");
+    assert_eq!(m["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(m["protocol"], "1.2");
     let caps: Vec<&str> = m["capabilities"]
         .as_array()
