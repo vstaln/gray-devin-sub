@@ -64,21 +64,34 @@ fn funnel_parse_missing_block_is_none() {
 }
 
 #[test]
-fn funnel_parse_bad_json_is_none() {
-    let text = "```gray_calls\nnot json\n```";
-    assert!(parse_calls_block(text, &["bash".to_string()]).is_none());
+fn funnel_parse_bad_json_passes_raw_block() {
+    // A malformed block still goes to the host, which answers "arguments
+    // must be a valid JSON object" instead of the turn ending on raw JSON.
+    let text =
+        "fixing it\n```gray_calls\n[{\"name\":\"bash\",\"arguments\":{\"command\":\"a\"b\"}}]\n```";
+    let (before, calls) = parse_calls_block(text, &["bash".to_string()]).unwrap();
+    assert_eq!(before, "fixing it");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "bash");
+    assert!(serde_json::from_str::<serde_json::Value>(&calls[0].1).is_err());
 }
 
 #[test]
-fn funnel_parse_unknown_tool_is_none() {
-    let text = "```gray_calls\n[{\"name\": \"hack\", \"arguments\": {}}]\n```";
-    assert!(parse_calls_block(text, &["bash".to_string()]).is_none());
+fn funnel_parse_unknown_tool_passes_through() {
+    // Default surface is bash-only; models still reach for `edit`. The host
+    // rejects it with an error result the model can read and correct.
+    let text = "Adding it to BUSY.\n\n```gray_calls\n[{\"name\":\"edit\",\"arguments\":{\"file_path\":\"/tmp/d.py\",\"old_string\":\"a\",\"new_string\":\"b\"}}]\n```";
+    let (before, calls) = parse_calls_block(text, &["bash".to_string()]).unwrap();
+    assert_eq!(before, "Adding it to BUSY.");
+    assert_eq!(calls[0].0, "edit");
+    assert!(calls[0].1.contains("old_string"));
 }
 
 #[test]
-fn funnel_parse_non_object_args_is_none() {
+fn funnel_parse_non_object_args_pass_through() {
     let text = "```gray_calls\n[{\"name\": \"bash\", \"arguments\": [\"x\"]}]\n```";
-    assert!(parse_calls_block(text, &["bash".to_string()]).is_none());
+    let (_, calls) = parse_calls_block(text, &["bash".to_string()]).unwrap();
+    assert_eq!(calls[0], ("bash".to_string(), "[\"x\"]".to_string()));
 }
 
 #[test]
@@ -130,9 +143,10 @@ fn funnel_parse_junk_after_array_inside_fence() {
 }
 
 #[test]
-fn funnel_parse_unclosed_garbage_is_none() {
+fn funnel_parse_unclosed_garbage_is_one_raw_call() {
     let text = "thinking out loud\n```gray_calls\n[{not json";
-    assert!(parse_calls_block(text, &["bash".to_string()]).is_none());
+    let (_, calls) = parse_calls_block(text, &["bash".to_string()]).unwrap();
+    assert_eq!(calls, vec![("bash".to_string(), "[{not json".to_string())]);
 }
 
 #[test]
@@ -188,26 +202,13 @@ fn fold_emits_complete_function_call_items() {
         stop: "tool_use".to_string(),
         unseen: false,
     };
-    let sse = String::from_utf8(fold_result(&r, &["bash".to_string()]).unwrap()).unwrap();
+    let sse = String::from_utf8(fold_result(&r).unwrap()).unwrap();
     assert!(sse.contains("response.output_item.added"));
     assert!(sse.contains("\"cache_creation_tokens\":4"));
     assert!(sse.contains("response.function_call_arguments.done"));
     assert!(sse.contains("response.output_item.done"));
     assert!(sse.contains("response.completed"));
     assert!(sse.contains("\"call_id\":\"call_1_1\""));
-}
-
-#[test]
-fn fold_rejects_tool_outside_inventory() {
-    let r = TurnResult {
-        text: String::new(),
-        thought: String::new(),
-        calls: vec![("call_1_1".into(), "hack".into(), "{}".into())],
-        usage: Usage::default(),
-        stop: "tool_use".to_string(),
-        unseen: false,
-    };
-    assert!(fold_result(&r, &["bash".to_string()]).is_err());
 }
 
 #[test]
@@ -225,7 +226,7 @@ fn fold_marks_max_tokens_incomplete() {
         stop: "incomplete:max_output_tokens".to_string(),
         unseen: false,
     };
-    let sse = String::from_utf8(fold_result(&r, &[]).unwrap()).unwrap();
+    let sse = String::from_utf8(fold_result(&r).unwrap()).unwrap();
     assert!(sse.contains("\"status\":\"incomplete\""));
     assert!(sse.contains("\"reason\":\"max_output_tokens\""));
 }
@@ -408,4 +409,34 @@ fn usage_from_plain_keys() {
 fn usage_from_absent_or_zero_is_none() {
     assert!(usage_from(&json!({"sessionUpdate": "usage_update"})).is_none());
     assert!(usage_from(&json!({"inputTokens": 0, "outputTokens": 0})).is_none());
+}
+
+#[test]
+fn continuation_undelivered_reply_continues_with_note() {
+    // The session recorded a reply gray never got (interrupted before
+    // delivery): the echo zone is empty, yet the session is reused.
+    let mut input = absorbed();
+    input.push(json!({"role": "user", "content": "stop, do this instead"}));
+    let delta = continuation(&absorbed(), &["call_1".to_string()], "on it", &input).unwrap();
+    assert_eq!(
+        delta,
+        format!("{UNDELIVERED_NOTE}\n\n[User]\nstop, do this instead")
+    );
+}
+
+#[test]
+fn inline_images_become_acp_blocks() {
+    let input = vec![json!({"role": "user", "content": [
+        {"type": "input_text", "text": "what is this"},
+        {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0K"},
+        {"type": "input_image", "image_url": "https://example.com/x.png"},
+    ]})];
+    assert_eq!(
+        images_of(&input),
+        vec![json!({"type": "image", "mimeType": "image/png", "data": "iVBORw0K"})]
+    );
+    assert_eq!(
+        render_items(&input),
+        "[User]\nwhat is this[image attached][image omitted]"
+    );
 }

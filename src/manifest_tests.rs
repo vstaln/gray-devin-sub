@@ -43,3 +43,20 @@ fn manifest_ids_and_protocol() {
         .validate()
         .expect("subscription declaration validates");
 }
+
+#[test]
+fn fusion_command_opens_the_model_picker() {
+    let m = serde_json::to_value(manifest()).unwrap();
+    let cmds: Vec<&str> = m["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c.as_str())
+        .collect();
+    assert_eq!(cmds, ["/devin", "/fusion"]);
+    let r = run_command("/fusion").expect("claimed");
+    assert_eq!(r["model_picker"], "fusion");
+    // Hosts without `model_picker` support print the fallback text.
+    assert!(r["text"].as_str().unwrap().contains("/model"));
+    assert!(run_command("/nope").is_none());
+}

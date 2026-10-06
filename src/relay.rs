@@ -23,7 +23,7 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -32,6 +32,57 @@ use serde_json::{Value, json};
 const HEADER_GRACE: Duration = Duration::from_secs(20);
 /// SSE comment cadence once the response is streaming.
 const KEEPALIVE: Duration = Duration::from_secs(15);
+
+/// How often a waiting relay checks whether the client hung up.
+const PEER_POLL: Duration = Duration::from_millis(250);
+
+/// The client closed its end (gray interrupted the turn). Non-blocking
+/// peek: EOF or a hard error means gone; no data yet means still there.
+fn client_gone(s: &std::net::TcpStream) -> bool {
+    if s.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let gone = match s.peek(&mut [0u8; 1]) {
+        Ok(n) => n == 0,
+        Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+    };
+    let _ = s.set_nonblocking(false);
+    gone
+}
+
+enum Wait {
+    Done(Result<Vec<u8>, String>),
+    Timeout,
+    Died,
+    Gone,
+}
+
+/// `recv_timeout` that also watches the peer: a hang-up sets `cancel` at
+/// once, so the native turn stops instead of finishing for nobody.
+fn wait_turn(
+    rx: &mpsc::Receiver<Result<Vec<u8>, String>>,
+    s: &std::net::TcpStream,
+    cancel: &AtomicBool,
+    span: Duration,
+) -> Wait {
+    let end = Instant::now() + span;
+    loop {
+        let step = end.saturating_duration_since(Instant::now()).min(PEER_POLL);
+        match rx.recv_timeout(step) {
+            Ok(r) => return Wait::Done(r),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Wait::Died,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if client_gone(s) {
+                    cancel.store(true, Ordering::SeqCst);
+                    return Wait::Gone;
+                }
+                if Instant::now() >= end {
+                    return Wait::Timeout;
+                }
+            }
+        }
+    }
+}
 
 /// What `provider/chat` parked for one turn: the relay fills the body in.
 pub struct RelayIntent {
@@ -57,6 +108,8 @@ pub fn start_turn_server(
     let handle = std::thread::spawn(move || serve(listener, intents, bearer, used));
     Ok((port, handle))
 }
+
+const MAX_BODY: usize = 256 << 20;
 
 fn serve(listener: TcpListener, intents: Intents, bearer: String, used: Arc<AtomicBool>) {
     for stream in listener.incoming() {
@@ -97,15 +150,12 @@ fn handle_conn(
         if line.is_empty() {
             break;
         }
-        if let Some(v) = line
-            .strip_prefix("Content-Length:")
-            .or_else(|| line.strip_prefix("content-length:"))
-        {
+        let Some((name, v)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length") {
             len = v.trim().parse().unwrap_or(0);
-        } else if let Some(v) = line
-            .strip_prefix("Authorization:")
-            .or_else(|| line.strip_prefix("authorization:"))
-        {
+        } else if name.eq_ignore_ascii_case("authorization") {
             auth = v.trim().to_string();
         }
     }
@@ -115,7 +165,8 @@ fn handle_conn(
         .map(|i| i + 4)
         .unwrap_or(head.len());
     let mut body = head[header_end..].to_vec();
-    while body.len() < len.min(8_388_608) {
+    // Image-heavy histories run past 8 MiB; read the whole declared body.
+    while body.len() < len.min(MAX_BODY) {
         let Ok(n) = s.read(&mut buf) else { return };
         if n == 0 {
             break;
@@ -128,6 +179,18 @@ fn handle_conn(
     let ok_bearer = auth == format!("Bearer {bearer}");
     if !ok_path || !ok_bearer {
         write_resp(s, 404, b"not found");
+        return;
+    }
+    if len > MAX_BODY || body.len() < len {
+        let body = json!({"type": "error", "error": {
+            "type": "invalid_request_error",
+            "message": format!("relay body incomplete: read {} of {len} bytes (limit {MAX_BODY})", body.len()),
+        }});
+        write_resp(
+            s,
+            if len > MAX_BODY { 413 } else { 400 },
+            body.to_string().as_bytes(),
+        );
         return;
     }
     if used.swap(true, Ordering::SeqCst) {
@@ -151,8 +214,9 @@ fn handle_conn(
             let _ = tx.send(run_turn(&intents, &bearer, &body, &cancel));
         });
     }
-    match rx.recv_timeout(HEADER_GRACE) {
-        Ok(Ok(sse)) => {
+    match wait_turn(&rx, s, &cancel, HEADER_GRACE) {
+        Wait::Gone => {}
+        Wait::Done(Ok(sse)) => {
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 sse.len()
@@ -161,19 +225,19 @@ fn handle_conn(
             let _ = s.write_all(&sse);
             let _ = s.flush();
         }
-        Ok(Err(detail)) => {
+        Wait::Done(Err(detail)) => {
             let body = json!({"type": "error", "error": {
                 "type": "server_error", "message": detail,
             }});
             write_resp(s, 500, body.to_string().as_bytes());
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
+        Wait::Died => {
             let body = json!({"type": "error", "error": {
                 "type": "server_error", "message": "turn worker died",
             }});
             write_resp(s, 500, body.to_string().as_bytes());
         }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
+        Wait::Timeout => {
             // Slow turn: no Content-Length, the stream ends at close.
             // eventsource-stream ignores `:` comment lines.
             if s
@@ -187,13 +251,13 @@ fn handle_conn(
                 return;
             }
             loop {
-                match rx.recv_timeout(KEEPALIVE) {
-                    Ok(Ok(sse)) => {
+                match wait_turn(&rx, s, &cancel, KEEPALIVE) {
+                    Wait::Done(Ok(sse)) => {
                         let _ = s.write_all(&sse);
                         let _ = s.flush();
                         return;
                     }
-                    Ok(Err(detail)) => {
+                    Wait::Done(Err(detail)) => {
                         let failed = json!({"type": "response.failed",
                             "response": {"status": "failed",
                                 "error": {"code": "server_error", "message": detail}}});
@@ -202,7 +266,7 @@ fn handle_conn(
                         let _ = s.flush();
                         return;
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                    Wait::Timeout => {
                         if s.write_all(b": keepalive\n\n")
                             .and_then(|_| s.flush())
                             .is_err()
@@ -211,7 +275,7 @@ fn handle_conn(
                             return;
                         }
                     }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    Wait::Gone | Wait::Died => return,
                 }
             }
         }
@@ -230,27 +294,19 @@ fn run_turn(
         .ok()
         .flatten()
         .ok_or_else(|| "relay intent expired".to_string())?;
-    let body: Value =
-        serde_json::from_slice(raw).map_err(|_| "relay body is not JSON".to_string())?;
+    let body: Value = serde_json::from_slice(raw)
+        .map_err(|e| format!("relay body is not JSON ({} bytes): {e}", raw.len()))?;
     let turn = crate::chat::prepare_turn(&body, &intent.model)?;
-    let tools: Vec<Value> = body
-        .get("tools")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let names: Vec<String> = tools
-        .iter()
-        .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
-        .collect();
     // A pooled session when this history continues one, else a fresh
     // spawn — either way native makes exactly one upstream request.
     let result = crate::chat::run_turn(&turn, cancel, Duration::from_secs(600))?;
-    crate::chat::fold_result(&result, &names)
+    crate::chat::fold_result(&result)
 }
 
 fn write_resp(s: &mut std::net::TcpStream, status: u16, body: &[u8]) {
     let reason = match status {
         400 => "Bad Request",
+        413 => "Payload Too Large",
         404 => "Not Found",
         _ => "Error",
     };
