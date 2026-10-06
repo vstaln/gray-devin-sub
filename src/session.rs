@@ -19,6 +19,21 @@
 //! next turn can't trust. Sessions idle past `IDLE_TTL` or whose child
 //! exited are reaped on every pool access and by a 60s background sweep;
 //! [`shutdown`] closes everything.
+//!
+//! Devin's upstream prompt cache is per-ACP-session with a ~5min TTL: a
+//! pooled child idles while gray's own model runs its tools, and the next
+//! continuation would re-bill the whole prefix. A keepalive sweep
+//! therefore sends one fixed minimal `session/prompt` on any pooled
+//! session whose last upstream contact is older than `KEEPALIVE_AFTER`.
+//! The session leaves the pool for the keepalive (exclusive use, exactly
+//! like a real turn — no prompt can overlap on the same child), and the
+//! injected turn lives only in the child's transcript: matching keys off
+//! `absorbed` + the echo of our reply (gray's history), which the
+//! keepalive never touches, so `take` still yields the same delta and the
+//! next real turn simply appends after it. `last_used` (the `IDLE_TTL`
+//! user-activity clock) is likewise untouched — a warmed session still
+//! dies on schedule — and keepalives stop once user idleness passes
+//! `KEEPALIVE_IDLE_MAX`, where the reaper takes over anyway.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
@@ -40,6 +55,23 @@ use crate::setup;
 const MAX_LIVE: usize = 4;
 /// A pooled session idle this long is closed on the next pool access.
 const IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+/// How often the keepalive sweep checks pooled sessions for stale
+/// upstream contact.
+const KEEPALIVE_SWEEP: Duration = Duration::from_secs(30);
+/// Fire a keepalive once the last `session/prompt` this session settled
+/// is this old — comfortably under Devin's ~5min per-session prompt
+/// cache TTL (plus sweep granularity), so the next continuation still
+/// hits a warm prefix.
+const KEEPALIVE_AFTER: Duration = Duration::from_secs(4 * 60);
+/// Stop warming once the user has been idle this long: `IDLE_TTL` reaps
+/// the session soon anyway, so further refresh buys nothing.
+const KEEPALIVE_IDLE_MAX: Duration = Duration::from_secs(10 * 60);
+/// One keepalive prompt must settle inside this window; a session that
+/// can't is closed as untrusted, the same rule as a failed real turn.
+const KEEPALIVE_WINDOW: Duration = Duration::from_secs(60);
+/// Fixed minimal keepalive marker: refreshes the upstream cache for a
+/// near-zero reply (ACP's `session/prompt` takes no output cap).
+const KEEPALIVE_TEXT: &str = ".";
 /// How often an ACP wait wakes to check for a relay client disconnect.
 const CANCEL_POLL: Duration = Duration::from_secs(1);
 /// Internal error when the relay client went away mid-turn.
@@ -152,7 +184,19 @@ pub struct LiveSession {
     reply_call_ids: Vec<String>,
     /// The (trimmed) text emitted in that answer.
     reply_text: String,
+    /// User-activity clock for the `IDLE_TTL` reaper: bumped by `absorb`
+    /// only. A keepalive must never touch it or a warmed session would
+    /// never die.
     last_used: Instant,
+    /// Last `session/prompt` this session settled upstream, real or
+    /// keepalive: the clock `KEEPALIVE_AFTER` measures. `None` until the
+    /// first real prompt lands — the sweep never warms a session that
+    /// hasn't answered one yet.
+    last_prompt_at: Option<Instant>,
+    /// Keepalive prompts this session absorbed; folded into the debug
+    /// trace only — never into `absorbed`, the reply echo, or host usage
+    /// accounting.
+    keepalive_turns: u32,
     // Per-prompt state, reset in `send_prompt`.
     text: String,
     thought: String,
@@ -182,6 +226,15 @@ fn locked_pool() -> MutexGuard<'static, Vec<LiveSession>> {
                 for s in dead {
                     s.close();
                 }
+            }
+        });
+        // Cache keepalive: the upstream prompt cache outlives a turn only
+        // ~5min, so pooled children get a minimal refresh prompt while
+        // they wait out gray's own tool loop (see `keepalive_sweep`).
+        std::thread::spawn(|| {
+            loop {
+                std::thread::sleep(KEEPALIVE_SWEEP);
+                keepalive_sweep();
             }
         });
     });
@@ -271,6 +324,48 @@ pub fn give_back(s: LiveSession) {
     };
     for s in dead.drain(..) {
         s.close();
+    }
+}
+
+/// Keepalive predicate, kept field-level so tests can drive it without
+/// a live child: the session settled ≥1 real prompt, its last upstream
+/// contact is stale past `KEEPALIVE_AFTER`, the user is still active
+/// enough for a warm cache to pay off, and the child is alive (dead
+/// children are the reaper's job, not the sweep's).
+fn keepalive_due(last_prompt_at: Option<Instant>, last_used: Instant, alive: bool) -> bool {
+    alive
+        && last_prompt_at.is_some_and(|t| t.elapsed() > KEEPALIVE_AFTER)
+        && last_used.elapsed() <= KEEPALIVE_IDLE_MAX
+}
+
+/// Remove the first keepalive-due session from the pool. Out of the pool
+/// is exclusive use — exactly the serialization `take` gives a real
+/// turn — so no real prompt can overlap a keepalive on the same child
+/// (a host turn arriving mid-keepalive simply misses and spawns fresh).
+fn take_keepalive() -> Option<LiveSession> {
+    let pool = POOL.get()?;
+    let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
+    let i = pool.iter_mut().position(|s| {
+        keepalive_due(
+            s.last_prompt_at,
+            s.last_used,
+            matches!(s.child.try_wait(), Ok(None)),
+        )
+    })?;
+    Some(pool.remove(i))
+}
+
+/// Warm every due session, one at a time. A settled keepalive returns
+/// through `give_back` so `MAX_LIVE` still bounds the pool; any failure
+/// closes the session — it is never pooled in a state the next turn
+/// can't trust.
+fn keepalive_sweep() {
+    while let Some(mut s) = take_keepalive() {
+        if s.keepalive() {
+            give_back(s);
+        } else {
+            s.close();
+        }
     }
 }
 
@@ -371,6 +466,8 @@ pub fn spawn(
         reply_call_ids: Vec::new(),
         reply_text: String::new(),
         last_used: Instant::now(),
+        last_prompt_at: None,
+        keepalive_turns: 0,
         text: String::new(),
         thought: String::new(),
         redirected: Vec::new(),
@@ -482,7 +579,59 @@ impl LiveSession {
         } else {
             r.text.trim().to_string()
         };
-        self.last_used = Instant::now();
+        let now = Instant::now();
+        self.last_used = now;
+        self.last_prompt_at = Some(now);
+    }
+
+    /// Record a settled keepalive: bumps only the upstream-contact clock
+    /// and the internal counter. `absorbed`, `reply_call_ids`,
+    /// `reply_text` and `last_used` stay exactly as the last real turn
+    /// left them — `take`'s strict-continuation check keys off gray's
+    /// history, so the injected `.` turn (which lives only in the child's
+    /// transcript) changes nothing about the next match.
+    fn absorb_keepalive(&mut self) {
+        self.keepalive_turns += 1;
+        self.last_prompt_at = Some(Instant::now());
+    }
+
+    /// Drive one cache-refresh `session/prompt` while this session is out
+    /// of the pool: fixed marker text, empty tool inventory (native calls
+    /// are denied anyway), bounded by `KEEPALIVE_WINDOW`. The reply is
+    /// discarded; its usage goes to the debug trace under `keepalive:N`,
+    /// never into host accounting. Returns false on any failure — the
+    /// caller then closes the session rather than pooling an untrusted
+    /// state, the same rule as a failed real turn.
+    fn keepalive(&mut self) -> bool {
+        let never = AtomicBool::new(false);
+        let deadline = Instant::now() + KEEPALIVE_WINDOW;
+        let next = self.keepalive_turns + 1;
+        match self
+            .send_prompt(KEEPALIVE_TEXT, &[])
+            .and_then(|id| self.await_prompt(id, deadline, &never))
+        {
+            Ok(r) => {
+                self.absorb_keepalive();
+                crate::chat::trace_turn(
+                    &format!("keepalive:{next}"),
+                    &self.session_id,
+                    KEEPALIVE_TEXT.len(),
+                    Some(&r),
+                    None,
+                );
+                true
+            }
+            Err(e) => {
+                crate::chat::trace_turn(
+                    &format!("keepalive:{next}"),
+                    &self.session_id,
+                    KEEPALIVE_TEXT.len(),
+                    None,
+                    Some(&e),
+                );
+                false
+            }
+        }
     }
 
     /// Best-effort teardown: `session/delete` (≤5s), stdin closed, ≤2s
