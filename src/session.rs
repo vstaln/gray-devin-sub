@@ -88,6 +88,12 @@ const KEEPALIVE_TEXT: &str = "[automated cache refresh, not from the user: reply
 const CANCEL_POLL: Duration = Duration::from_secs(1);
 /// Internal error when the relay client went away mid-turn.
 const CLIENT_GONE: &str = "client disconnected";
+/// A real prompt settling `end_turn` with zero output is the silent
+/// usage-limit rejection ACP agents can return instead of an error (the
+/// turn "succeeds" with an empty reply the host can't tell from a real
+/// answer). Surfaced as a failure so the host retries; no transcript
+/// content in the message.
+const EMPTY_END_TURN: &str = "devin acp returned an empty end_turn with no output — likely a usage-limit rejection; session kept pooled";
 
 /// Deny list written into both the project config and the user config the
 /// child sees: every native capability Devin exposes.
@@ -224,6 +230,9 @@ pub struct LiveSession {
     /// Last `usage_update` snapshot for the in-flight prompt.
     usage: Usage,
     names: Vec<String>,
+    /// This prompt is the fixed keepalive: a near-empty `end_turn` is a
+    /// fine answer to it, never a silent drop.
+    keepalive_prompt: bool,
 }
 
 /// A session out of the pool for a keepalive: enough to tell whether a
@@ -564,6 +573,7 @@ pub fn spawn(
         redirected: Vec::new(),
         usage: Usage::default(),
         names: turn.names.clone(),
+        keepalive_prompt: false,
     };
     if let Err(e) = s.handshake(&stage.work, deadline, cancel) {
         s.close();
@@ -625,6 +635,7 @@ impl LiveSession {
         self.redirected.clear();
         self.usage = Usage::default();
         self.names = names.to_vec();
+        self.keepalive_prompt = text == KEEPALIVE_TEXT;
         let mut prompt = vec![json!({"type": "text", "text": text})];
         prompt.extend_from_slice(images);
         let id = self.send_request(
@@ -654,6 +665,21 @@ impl LiveSession {
             .unwrap_or("");
         if stop_reason == "refusal" {
             return Err("Devin refused this request under its usage policy".to_string());
+        }
+        // A settled end_turn whose stream carried nothing — no answer
+        // text, no thought, no tool call — is the silent usage-limit
+        // failure mode: the prompt settled, so `prompt_in_flight` is
+        // already clear and the caller pools the session for the host's
+        // identical retry instead of folding an empty reply into
+        // history. Keepalives ask for a near-empty reply by design and
+        // never take this branch.
+        if stop_reason == "end_turn"
+            && !self.keepalive_prompt
+            && self.text.trim().is_empty()
+            && self.thought.trim().is_empty()
+            && self.redirected.is_empty()
+        {
+            return Err(EMPTY_END_TURN.to_string());
         }
         let mut r = self.finish(stop_reason);
         r.unseen = unseen;

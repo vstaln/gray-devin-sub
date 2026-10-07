@@ -85,6 +85,7 @@ fn stub_session() -> LiveSession {
         redirected: Vec::new(),
         usage: Usage::default(),
         names: Vec::new(),
+        keepalive_prompt: false,
     }
 }
 
@@ -356,6 +357,9 @@ fn a_prompt_settling_in_the_grace_window_is_still_delivered() {
     let id = s.send_prompt("[User]\nhi", &[], &[]).expect("send_prompt");
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(300));
+        let _ = tx.send(json!({"jsonrpc": "2.0", "method": "session/update",
+            "params": {"update": {"sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "late answer"}}}}));
         let _ = tx.send(json!({"jsonrpc": "2.0", "id": id,
             "result": {"stopReason": "end_turn"}}));
     });
@@ -409,6 +413,97 @@ fn absorb_failed_marks_input_without_leaking_across_conversations() {
     let mut next = input;
     next.push(json!({"role": "user", "content": "more"}));
     assert_eq!(cont(&next), Ok("[User]\nmore".to_string()));
+    let _ = s.child.kill();
+    let _ = s.child.wait();
+}
+
+/// The silent usage-limit rejection: a real prompt settles `end_turn`
+/// with zero stream content — no text, no thought, no tool call. It must
+/// surface as a failure (the host can't tell an empty "success" from a
+/// dropped prompt), and the settled prompt leaves the session poolable.
+#[test]
+fn an_empty_end_turn_on_a_real_prompt_is_a_limit_failure() {
+    let (mut s, tx) = wired_session();
+    let id = s.send_prompt("[User]\nhi", &[], &[]).expect("send_prompt");
+    tx.send(json!({"jsonrpc": "2.0", "id": id,
+        "result": {"stopReason": "end_turn"}}))
+        .unwrap();
+    let never = AtomicBool::new(false);
+    let e = s
+        .await_prompt(id, Instant::now() + Duration::from_secs(30), &never)
+        .err()
+        .unwrap();
+    assert!(e.contains("empty end_turn"), "{e}");
+    assert!(e.contains("usage-limit"), "{e}");
+    assert!(
+        !s.prompt_in_flight,
+        "the prompt settled — the session stays poolable"
+    );
+    let _ = s.child.kill();
+    let _ = s.child.wait();
+}
+
+/// Keepalives ask for a near-empty reply by design: an empty `end_turn`
+/// answers one fine and must never be flagged.
+#[test]
+fn a_keepalive_may_answer_empty() {
+    let (mut s, tx) = wired_session();
+    let id = s
+        .send_prompt(KEEPALIVE_TEXT, &[], &[])
+        .expect("send_prompt");
+    tx.send(json!({"jsonrpc": "2.0", "id": id,
+        "result": {"stopReason": "end_turn"}}))
+        .unwrap();
+    let never = AtomicBool::new(false);
+    let r = s
+        .await_prompt(id, Instant::now() + Duration::from_secs(30), &never)
+        .expect("an empty keepalive reply is fine");
+    assert!(r.text.is_empty());
+    assert_eq!(r.stop, "completed");
+    let _ = s.child.kill();
+    let _ = s.child.wait();
+}
+
+/// A turn whose `session/update` stream carried content is a real answer,
+/// however short: not a silent drop.
+#[test]
+fn a_streamed_answer_is_not_flagged_empty() {
+    let (mut s, tx) = wired_session();
+    let id = s.send_prompt("[User]\nhi", &[], &[]).expect("send_prompt");
+    tx.send(json!({"jsonrpc": "2.0", "method": "session/update",
+        "params": {"update": {"sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "ok"}}}}))
+        .unwrap();
+    tx.send(json!({"jsonrpc": "2.0", "id": id,
+        "result": {"stopReason": "end_turn"}}))
+        .unwrap();
+    let never = AtomicBool::new(false);
+    let r = s
+        .await_prompt(id, Instant::now() + Duration::from_secs(30), &never)
+        .expect("a streamed answer is a normal completion");
+    assert_eq!(r.text, "ok");
+    let _ = s.child.kill();
+    let _ = s.child.wait();
+}
+
+/// Thought chunks are stream content too: a turn that reasoned but
+/// answered with no text still isn't a silent drop.
+#[test]
+fn a_thought_only_turn_is_not_flagged_empty() {
+    let (mut s, tx) = wired_session();
+    let id = s.send_prompt("[User]\nhi", &[], &[]).expect("send_prompt");
+    tx.send(json!({"jsonrpc": "2.0", "method": "session/update",
+        "params": {"update": {"sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": "hmm"}}}}))
+        .unwrap();
+    tx.send(json!({"jsonrpc": "2.0", "id": id,
+        "result": {"stopReason": "end_turn"}}))
+        .unwrap();
+    let never = AtomicBool::new(false);
+    let r = s
+        .await_prompt(id, Instant::now() + Duration::from_secs(30), &never)
+        .expect("streamed thought is content");
+    assert_eq!(r.thought, "hmm");
     let _ = s.child.kill();
     let _ = s.child.wait();
 }
