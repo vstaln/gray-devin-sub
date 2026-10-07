@@ -6,7 +6,7 @@ use gray_plugin::{
 };
 
 pub const PLUGIN_NAME: &str = "devin-sub";
-pub const PLUGIN_VERSION: &str = "0.1.2";
+pub const PLUGIN_VERSION: &str = "0.1.3";
 pub const PROVIDER_ID: &str = "devin-subscription";
 pub const AUTH_METHOD_ID: &str = "devin-login";
 /// Opens the host's `/model` picker focused on the folded Fusion row.
