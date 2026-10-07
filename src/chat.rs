@@ -537,7 +537,11 @@ pub struct Usage {
 /// when this request's history strictly extends what it last answered,
 /// else spawn `devin acp`, drive the ACP handshake and prompt with
 /// `system` + the whole transcript. `timeout` is the whole-turn budget;
-/// `cancel` is set when the relay client went away mid-turn.
+/// `cancel` is set when the relay client went away mid-turn. A failure
+/// whose prompt still settled upstream returns the session to the pool
+/// (`prompt_in_flight` cleared): the host retries a failed turn with an
+/// identical request, and a pooled continuation session re-answers it
+/// with just the delta instead of re-billing the transcript.
 pub fn run_turn(
     turn: &PreparedTurn,
     cancel: &Arc<AtomicBool>,
@@ -584,7 +588,20 @@ pub fn run_turn(
                                 None,
                                 Some(&e),
                             );
-                            s.close();
+                            if s.prompt_in_flight {
+                                // The prompt may still be live upstream
+                                // (dead wire, unsettled cancel): the
+                                // session can't be trusted.
+                                s.close();
+                            } else {
+                                // The failed prompt settled upstream —
+                                // the session's absorb state is exactly
+                                // what matched this turn, so the host's
+                                // identical retry re-prompts the same
+                                // delta on the warm session instead of
+                                // re-billing the whole transcript.
+                                session::give_back(s);
+                            }
                             Err(e)
                         }
                     };
@@ -602,10 +619,17 @@ pub fn run_turn(
         None => spawn_fresh(reason)?,
     };
     let mode = format!("fresh:{reason}");
-    match s
-        .send_prompt(&prompt_text, &images_of(&turn.input), &turn.names)
-        .and_then(|id| s.await_prompt(id, deadline, cancel))
-    {
+    let id = match s.send_prompt(&prompt_text, &images_of(&turn.input), &turn.names) {
+        Ok(id) => id,
+        Err(e) => {
+            // The prompt never reached the child (dead pipe): nothing to
+            // pool, and no fresh fallback left — the turn fails.
+            trace_turn(&mode, &s.session_id, chars, None, Some(&e));
+            s.close();
+            return Err(e);
+        }
+    };
+    match s.await_prompt(id, deadline, cancel) {
         Ok(r) => {
             s.absorb(turn, &r);
             trace_turn(&mode, &s.session_id, chars, Some(&r), None);
@@ -614,7 +638,18 @@ pub fn run_turn(
         }
         Err(e) => {
             trace_turn(&mode, &s.session_id, chars, None, Some(&e));
-            s.close();
+            if s.prompt_in_flight {
+                s.close();
+            } else {
+                // The failed prompt settled upstream: record the input as
+                // absorbed with no reply on record — an identical retry
+                // still respawns (nothing extends it), but a later turn
+                // of this conversation continues the warm session with
+                // only its new tail, and no other conversation can claim
+                // a child already holding this transcript.
+                s.absorb_failed(turn);
+                session::give_back(s);
+            }
             Err(e)
         }
     }

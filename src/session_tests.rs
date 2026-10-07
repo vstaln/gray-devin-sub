@@ -79,6 +79,7 @@ fn stub_session() -> LiveSession {
         last_used: Instant::now(),
         last_prompt_at: None,
         keepalive_turns: 0,
+        prompt_in_flight: false,
         text: String::new(),
         thought: String::new(),
         redirected: Vec::new(),
@@ -239,4 +240,175 @@ fn keepalive_due_bounds_warming() {
     // takes the session anyway.
     let idle = Instant::now() - KEEPALIVE_IDLE_MAX - Duration::from_secs(1);
     assert!(!keepalive_due(stale, idle, true));
+}
+
+/// A stub whose stdin still writes and whose response channel is
+/// caller-fed: enough wire for `send_prompt`/`await_prompt`.
+fn wired_session() -> (LiveSession, std::sync::mpsc::Sender<Value>) {
+    let mut s = stub_session();
+    let (tx, rx) = std::sync::mpsc::channel::<Value>();
+    s.rx = rx;
+    (s, tx)
+}
+
+fn turn(model: &str, input: Vec<Value>) -> PreparedTurn {
+    PreparedTurn {
+        system: "sys".to_string(),
+        content_line: String::new(),
+        input,
+        names: Vec::new(),
+        native_model: model.to_string(),
+    }
+}
+
+fn answered(text: &str) -> TurnResult {
+    TurnResult {
+        text: text.to_string(),
+        thought: String::new(),
+        calls: Vec::new(),
+        usage: Usage::default(),
+        stop: "completed".to_string(),
+        unseen: false,
+    }
+}
+
+/// The bug being fixed: a failed turn used to close the session, so the
+/// host's identical whole-turn retry missed the pool and re-billed the
+/// whole transcript. A failure whose prompt still settled (here, an RPC
+/// error) leaves the absorb state untouched — the retry produces the
+/// same delta on the warm session.
+#[test]
+fn a_settled_failure_keeps_the_retry_warm() {
+    let model = "model-settled-fail";
+    let history = vec![json!({"role": "user", "content": "hi"})];
+    let first = turn(model, history.clone());
+    let (mut s, tx) = wired_session();
+    s.session_id = "s-settled".to_string();
+    s.native_model = model.to_string();
+    s.absorb(&first, &answered("answer"));
+
+    // Turn 2 continues: history + our echo + a new user item.
+    let mut input = history;
+    input.push(json!({"role": "assistant", "content": "answer"}));
+    input.push(json!({"role": "user", "content": "more"}));
+    let next = turn(model, input.clone());
+    let delta = continuation(&s.absorbed, &s.reply_call_ids, &s.reply_text, &next.input)
+        .expect("continuation");
+
+    // The turn's prompt goes out, then settles with an RPC error.
+    let id = s.send_prompt(&delta, &[], &[]).expect("send_prompt");
+    assert!(s.prompt_in_flight);
+    tx.send(json!({"jsonrpc": "2.0", "id": id, "error": {"message": "boom"}}))
+        .unwrap();
+    let never = AtomicBool::new(false);
+    let e = s
+        .await_prompt(id, Instant::now() + Duration::from_secs(30), &never)
+        .err()
+        .unwrap();
+    assert!(e.contains("boom"), "{e}");
+    assert!(
+        !s.prompt_in_flight,
+        "a settled failure leaves the session poolable"
+    );
+
+    // Pooled, the host's identical retry takes the same session and the
+    // same delta — no transcript re-bill.
+    give_back(s);
+    let (claimed, reason) = take(&next, &never);
+    let (mut s, retry_delta) = claimed.unwrap_or_else(|| panic!("retry missed the pool: {reason}"));
+    assert_eq!(s.session_id, "s-settled");
+    assert_eq!(retry_delta, delta);
+    let _ = s.child.kill();
+    let _ = s.child.wait();
+}
+
+/// The closing half of the fix: a prompt that never settles (dead wire,
+/// a cancel upstream ignores) leaves the session untrusted — it must be
+/// closed, not pooled.
+#[test]
+fn an_unsettled_failure_cannot_be_pooled() {
+    let (mut s, tx) = wired_session();
+    let id = s.send_prompt("[User]\nhi", &[], &[]).expect("send_prompt");
+    assert!(s.prompt_in_flight);
+    // The wire dies mid-prompt: nothing settles, the prompt may still be
+    // live upstream.
+    drop(tx);
+    let never = AtomicBool::new(false);
+    let e = s
+        .await_prompt(id, Instant::now() + Duration::from_secs(30), &never)
+        .err()
+        .unwrap();
+    assert_eq!(e, "native stdout closed");
+    assert!(
+        s.prompt_in_flight,
+        "an unsettled prompt keeps the session untrusted"
+    );
+    let _ = s.child.kill();
+    let _ = s.child.wait();
+}
+
+/// The settle grace after a failed wait: the prompt's reply lands inside
+/// the cancel window — a known session state, and (client still present)
+/// a deliverable reply.
+#[test]
+fn a_prompt_settling_in_the_grace_window_is_still_delivered() {
+    let (mut s, tx) = wired_session();
+    let id = s.send_prompt("[User]\nhi", &[], &[]).expect("send_prompt");
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = tx.send(json!({"jsonrpc": "2.0", "id": id,
+            "result": {"stopReason": "end_turn"}}));
+    });
+    let never = AtomicBool::new(false);
+    let r = s
+        .await_prompt(id, Instant::now() + Duration::from_millis(150), &never)
+        .expect("late-settling reply must still return");
+    assert!(!r.unseen, "the relay client never went away");
+    assert!(!s.prompt_in_flight);
+    let _ = s.child.kill();
+    let _ = s.child.wait();
+}
+
+/// A refusal is a settled prompt: the session state is known, so the
+/// failure leaves the session poolable for the host's retry.
+#[test]
+fn a_refusal_leaves_the_session_poolable() {
+    let (mut s, tx) = wired_session();
+    let id = s.send_prompt("[User]\nhi", &[], &[]).expect("send_prompt");
+    tx.send(json!({"jsonrpc": "2.0", "id": id,
+        "result": {"stopReason": "refusal"}}))
+        .unwrap();
+    let never = AtomicBool::new(false);
+    let e = s
+        .await_prompt(id, Instant::now() + Duration::from_secs(30), &never)
+        .err()
+        .unwrap();
+    assert!(e.contains("refused"), "{e}");
+    assert!(!s.prompt_in_flight);
+    let _ = s.child.kill();
+    let _ = s.child.wait();
+}
+
+/// Fresh-path failure bookkeeping: `absorb_failed` records the failed
+/// input with no reply echo, so a later turn of THIS conversation
+/// continues warm — while the identical retry respawns (nothing extends
+/// the absorbed input) and no other conversation can claim the child.
+#[test]
+fn absorb_failed_marks_input_without_leaking_across_conversations() {
+    let (mut s, _tx) = wired_session();
+    let input = vec![json!({"role": "user", "content": "hi"})];
+    s.absorb_failed(&turn("model", input.clone()));
+    let cont = |input: &[Value]| continuation(&s.absorbed, &s.reply_call_ids, &s.reply_text, input);
+    // The identical host retry cannot extend — it respawns fresh.
+    assert_eq!(cont(&input), Err("prefix"));
+    // An unrelated conversation can't claim a child already holding this
+    // transcript either.
+    let other = vec![json!({"role": "user", "content": "different convo"})];
+    assert_eq!(cont(&other), Err("prefix"));
+    // A later turn of the same conversation continues with only its tail.
+    let mut next = input;
+    next.push(json!({"role": "user", "content": "more"}));
+    assert_eq!(cont(&next), Ok("[User]\nmore".to_string()));
+    let _ = s.child.kill();
+    let _ = s.child.wait();
 }

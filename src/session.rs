@@ -14,9 +14,14 @@
 //! including a client-disconnected turn whose prompt still settled: the
 //! reply was never delivered (the relay buffers a whole turn), so the
 //! session records an empty echo and the next request continues it with
-//! only its own tail. Errors, timeouts and disconnects that fail to
-//! settle close it instead — a session is never pooled in a state the
-//! next turn can't trust. Sessions idle past `IDLE_TTL` or whose child
+//! only its own tail. A failed turn whose prompt still settled upstream
+//! (RPC error, refusal, a timeout the cancel-grace then settled) keeps
+//! its session too: the upstream state is known, so the host's identical
+//! whole-turn retry continues it — re-sending just the failed delta —
+//! instead of re-billing the whole transcript on a fresh child. Only a
+//! failure leaving a prompt in flight (dead wire, an unsettled cancel)
+//! closes the session — it is never pooled in a state the next turn
+//! can't trust. Sessions idle past `IDLE_TTL` or whose child
 //! exited are reaped on every pool access and by a 60s background sweep;
 //! [`shutdown`] closes everything.
 //!
@@ -204,6 +209,13 @@ pub struct LiveSession {
     /// trace only — never into `absorbed`, the reply echo, or host usage
     /// accounting.
     keepalive_turns: u32,
+    /// A `session/prompt` whose terminal response never arrived: the
+    /// upstream turn may still be live, so the session can't be pooled —
+    /// a new prompt would interleave with it and late chunks would fold
+    /// into the wrong turn. Cleared the moment the prompt's result (or
+    /// error) comes off the wire, which is what makes a failed turn's
+    /// session poolable: its upstream state is then known.
+    pub(crate) prompt_in_flight: bool,
     // Per-prompt state, reset in `send_prompt`.
     text: String,
     thought: String,
@@ -425,12 +437,17 @@ fn take_keepalive() -> Option<LiveSession> {
 }
 
 /// Warm every due session, one at a time. A settled keepalive returns
-/// through `give_back` so `MAX_LIVE` still bounds the pool; any failure
-/// closes the session — it is never pooled in a state the next turn
-/// can't trust. Either way it stops being listed as warming.
+/// through `give_back` so `MAX_LIVE` still bounds the pool; a failure
+/// that leaves a prompt in flight closes the session — it is never
+/// pooled in a state the next turn can't trust. Either way it stops
+/// being listed as warming.
 fn keepalive_sweep() {
     while let Some(mut s) = take_keepalive() {
-        if s.keepalive() {
+        // A failed keepalive whose prompt still settled (RPC error) costs
+        // the session nothing — real-turn matching state is untouched —
+        // so it goes back to the pool like a settled real-turn failure.
+        // Only a prompt left in flight closes the child.
+        if s.keepalive() || !s.prompt_in_flight {
             give_back(s);
         } else {
             locked_pool()
@@ -541,6 +558,7 @@ pub fn spawn(
         last_used: Instant::now(),
         last_prompt_at: None,
         keepalive_turns: 0,
+        prompt_in_flight: false,
         text: String::new(),
         thought: String::new(),
         redirected: Vec::new(),
@@ -609,10 +627,12 @@ impl LiveSession {
         self.names = names.to_vec();
         let mut prompt = vec![json!({"type": "text", "text": text})];
         prompt.extend_from_slice(images);
-        self.send_request(
+        let id = self.send_request(
             "session/prompt",
             json!({"sessionId": self.session_id, "prompt": prompt}),
-        )
+        )?;
+        self.prompt_in_flight = true;
+        Ok(id)
     }
 
     /// Wait out an accepted prompt and fold it into a TurnResult.
@@ -663,6 +683,25 @@ impl LiveSession {
         self.last_prompt_at = Some(now);
     }
 
+    /// Record a failed turn whose prompt still settled upstream: the
+    /// input counts as absorbed (its text is already in the child's
+    /// transcript) but no reply is on record, so a later request
+    /// continues with only its own tail — the same shape as an unseen
+    /// answer. Used for a failed first prompt on a fresh session, where
+    /// keeping the empty pre-turn state would let an unrelated
+    /// conversation claim a child already holding this one's transcript.
+    /// The host's identical retry still misses by design — nothing
+    /// extends `absorbed` — and respawns, exactly like today.
+    pub(crate) fn absorb_failed(&mut self, turn: &PreparedTurn) {
+        self.system = turn.system.clone();
+        self.absorbed = turn.input.clone();
+        self.reply_call_ids = Vec::new();
+        self.reply_text = String::new();
+        let now = Instant::now();
+        self.last_used = now;
+        self.last_prompt_at = Some(now);
+    }
+
     /// Record a settled keepalive: bumps only the upstream-contact clock
     /// and the internal counter. `absorbed`, `reply_call_ids`,
     /// `reply_text` and `last_used` stay exactly as the last real turn
@@ -679,8 +718,8 @@ impl LiveSession {
     /// are denied anyway), bounded by `KEEPALIVE_WINDOW`. The reply is
     /// discarded; its usage goes to the debug trace under `keepalive:N`,
     /// never into host accounting. Returns false on any failure — the
-    /// caller then closes the session rather than pooling an untrusted
-    /// state, the same rule as a failed real turn.
+    /// caller then checks `prompt_in_flight` and only closes a session
+    /// whose prompt never settled, the same rule as a failed real turn.
     fn keepalive(&mut self) -> bool {
         let never = AtomicBool::new(false);
         let deadline = Instant::now() + KEEPALIVE_WINDOW;
@@ -874,11 +913,15 @@ impl LiveSession {
     }
 
     /// Drain notifications until the `session/prompt` result arrives,
-    /// plus an `unseen` flag. On client disconnect: `session/cancel` once,
-    /// then ≤10s for the prompt result to settle. A settled result returns
-    /// `unseen: true` — the session state is then known (the turn is over
-    /// and its reply never reached the client), so the caller can pool
-    /// it; only a grace timeout errors and costs the session.
+    /// plus an `unseen` flag. When the wait fails the prompt may still be
+    /// live upstream, so `session/cancel` goes out once and the wire gets
+    /// ≤10s for the result to settle. A settled result returns — `unseen`
+    /// only when the client went away (the reply never reaches it and
+    /// the session records an empty echo; any other settle is still
+    /// deliverable) — and a settled error returns that error; either way
+    /// `prompt_in_flight` clears, leaving a known session state the
+    /// caller can pool. Only a prompt that won't settle keeps the flag
+    /// and costs the session.
     fn prompt_result(
         &mut self,
         id: u64,
@@ -889,32 +932,34 @@ impl LiveSession {
             let line = match self.recv_response(Duration::from_secs(600), deadline, cancel) {
                 Ok(line) => line,
                 Err(e) => {
-                    if e == CLIENT_GONE {
-                        let _ = self.send(&json!({"jsonrpc": "2.0",
-                            "method": "session/cancel",
-                            "params": {"sessionId": self.session_id}}));
-                        let grace = Instant::now() + Duration::from_secs(10);
-                        let never = AtomicBool::new(false);
-                        while Instant::now() < grace {
-                            match self.recv_response(Duration::from_secs(10), grace, &never) {
-                                Ok(line) if line.get("id") == Some(&json!(id)) => {
-                                    if let Some(err) = line.get("error") {
-                                        return Err(map_rpc_error(err, &self.stderr_tail));
-                                    }
-                                    return Ok((
-                                        line.get("result").cloned().unwrap_or(Value::Null),
-                                        true,
-                                    ));
+                    let _ = self.send(&json!({"jsonrpc": "2.0",
+                        "method": "session/cancel",
+                        "params": {"sessionId": self.session_id}}));
+                    let grace = Instant::now() + Duration::from_secs(10);
+                    let never = AtomicBool::new(false);
+                    while Instant::now() < grace {
+                        match self.recv_response(Duration::from_secs(10), grace, &never) {
+                            Ok(line) if line.get("id") == Some(&json!(id)) => {
+                                self.prompt_in_flight = false;
+                                self.last_prompt_at = Some(Instant::now());
+                                if let Some(err) = line.get("error") {
+                                    return Err(map_rpc_error(err, &self.stderr_tail));
                                 }
-                                Ok(_) => {}
-                                Err(_) => break,
+                                return Ok((
+                                    line.get("result").cloned().unwrap_or(Value::Null),
+                                    e == CLIENT_GONE,
+                                ));
                             }
+                            Ok(_) => {}
+                            Err(_) => break,
                         }
                     }
                     return Err(e);
                 }
             };
             if line.get("id") == Some(&json!(id)) {
+                self.prompt_in_flight = false;
+                self.last_prompt_at = Some(Instant::now());
                 if let Some(err) = line.get("error") {
                     return Err(map_rpc_error(err, &self.stderr_tail));
                 }
