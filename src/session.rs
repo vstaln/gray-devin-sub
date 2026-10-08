@@ -73,9 +73,11 @@ const KEEPALIVE_SWEEP: Duration = Duration::from_secs(30);
 /// cache TTL (plus sweep granularity), so the next continuation still
 /// hits a warm prefix.
 const KEEPALIVE_AFTER: Duration = Duration::from_secs(4 * 60);
-/// Stop warming once the user has been idle this long: `IDLE_TTL` reaps
-/// the session soon anyway, so further refresh buys nothing.
-const KEEPALIVE_IDLE_MAX: Duration = Duration::from_secs(10 * 60);
+/// Keep warming for as long as a pooled session can still answer a turn:
+/// stopping earlier leaves a live session whose ~5min cache has already
+/// lapsed, so a turn landing in the gap re-bills the whole transcript on
+/// a session that looks warm. `IDLE_TTL` reaps it either way.
+const KEEPALIVE_IDLE_MAX: Duration = IDLE_TTL;
 /// One keepalive prompt must settle inside this window; a session that
 /// can't is closed as untrusted, the same rule as a failed real turn.
 const KEEPALIVE_WINDOW: Duration = Duration::from_secs(60);
@@ -224,6 +226,10 @@ pub struct LiveSession {
     pub(crate) prompt_in_flight: bool,
     // Per-prompt state, reset in `send_prompt`.
     text: String,
+    /// A non-message `session/update` arrived since the last message chunk:
+    /// the upstream segment ended, so the next chunk opens a new one and
+    /// gets a paragraph break — otherwise the segments fuse ("context.Now").
+    text_boundary: bool,
     thought: String,
     /// Native tool_call notifications redirected onto bash (name, args-json).
     redirected: Vec<(String, String)>,
@@ -570,6 +576,7 @@ pub fn spawn(
         prompt_in_flight: false,
         text: String::new(),
         thought: String::new(),
+        text_boundary: false,
         redirected: Vec::new(),
         usage: Usage::default(),
         names: turn.names.clone(),
@@ -631,6 +638,7 @@ impl LiveSession {
             }
         }
         self.text.clear();
+        self.text_boundary = false;
         self.thought.clear();
         self.redirected.clear();
         self.usage = Usage::default();
@@ -846,15 +854,25 @@ impl LiveSession {
         match update.get("sessionUpdate").and_then(Value::as_str) {
             Some("agent_message_chunk") => {
                 if let Some(t) = update.pointer("/content/text").and_then(Value::as_str) {
+                    if self.text_boundary
+                        && !self.text.is_empty()
+                        && !self.text.ends_with(char::is_whitespace)
+                        && !t.starts_with(char::is_whitespace)
+                    {
+                        self.text.push_str("\n\n");
+                    }
+                    self.text_boundary = false;
                     self.text.push_str(t);
                 }
             }
             Some("agent_thought_chunk") => {
+                self.text_boundary = true;
                 if let Some(t) = update.pointer("/content/text").and_then(Value::as_str) {
                     self.thought.push_str(t);
                 }
             }
             Some("tool_call") => {
+                self.text_boundary = true;
                 // First eligible redirect wins and ends the turn: the model
                 // reached for a native tool instead of the text funnel.
                 if self.redirected.is_empty()
@@ -868,13 +886,16 @@ impl LiveSession {
                 }
             }
             Some("usage_update") => {
+                self.text_boundary = true;
                 // Keep the LAST snapshot: a later update carries the final
                 // counters for this prompt.
                 if let Some(u) = usage_from(update) {
                     self.usage = u;
                 }
             }
-            _ => {}
+            _ => {
+                self.text_boundary = true;
+            }
         }
     }
 

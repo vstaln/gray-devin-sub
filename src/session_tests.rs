@@ -81,6 +81,7 @@ fn stub_session() -> LiveSession {
         keepalive_turns: 0,
         prompt_in_flight: false,
         text: String::new(),
+        text_boundary: false,
         thought: String::new(),
         redirected: Vec::new(),
         usage: Usage::default(),
@@ -482,6 +483,65 @@ fn a_streamed_answer_is_not_flagged_empty() {
         .await_prompt(id, Instant::now() + Duration::from_secs(30), &never)
         .expect("a streamed answer is a normal completion");
     assert_eq!(r.text, "ok");
+    let _ = s.child.kill();
+    let _ = s.child.wait();
+}
+
+/// Two message segments separated by a non-message update keep their
+/// paragraph break — upstream emits each segment as its own chunk series,
+/// and joining them raw fuses the boundary ("context.Now").
+#[test]
+fn message_segments_around_another_update_keep_their_break() {
+    let (mut s, tx) = wired_session();
+    let id = s.send_prompt("[User]\nhi", &[], &[]).expect("send_prompt");
+    for update in [
+        json!({"sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "first segment."}}),
+        json!({"sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": "thinking"}}),
+        json!({"sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "Second segment."}}),
+    ] {
+        tx.send(json!({"jsonrpc": "2.0", "method": "session/update",
+            "params": {"update": update}}))
+            .unwrap();
+    }
+    tx.send(json!({"jsonrpc": "2.0", "id": id,
+        "result": {"stopReason": "end_turn"}}))
+        .unwrap();
+    let never = AtomicBool::new(false);
+    let r = s
+        .await_prompt(id, Instant::now() + Duration::from_secs(30), &never)
+        .expect("completion");
+    assert_eq!(r.text, "first segment.\n\nSecond segment.", "{:?}", r.text);
+    let _ = s.child.kill();
+    let _ = s.child.wait();
+}
+
+/// Back-to-back message chunks in one segment still concatenate raw —
+/// delta streaming is untouched.
+#[test]
+fn adjacent_message_chunks_concatenate_raw() {
+    let (mut s, tx) = wired_session();
+    let id = s.send_prompt("[User]\nhi", &[], &[]).expect("send_prompt");
+    for update in [
+        json!({"sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "one "}}),
+        json!({"sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "two."}}),
+    ] {
+        tx.send(json!({"jsonrpc": "2.0", "method": "session/update",
+            "params": {"update": update}}))
+            .unwrap();
+    }
+    tx.send(json!({"jsonrpc": "2.0", "id": id,
+        "result": {"stopReason": "end_turn"}}))
+        .unwrap();
+    let never = AtomicBool::new(false);
+    let r = s
+        .await_prompt(id, Instant::now() + Duration::from_secs(30), &never)
+        .expect("completion");
+    assert_eq!(r.text, "one two.", "{:?}", r.text);
     let _ = s.child.kill();
     let _ = s.child.wait();
 }

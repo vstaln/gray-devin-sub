@@ -6,7 +6,7 @@ use gray_plugin::{
 };
 
 pub const PLUGIN_NAME: &str = "devin-sub";
-pub const PLUGIN_VERSION: &str = "0.1.3";
+pub const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROVIDER_ID: &str = "devin-subscription";
 pub const AUTH_METHOD_ID: &str = "devin-login";
 /// Opens the host's `/model` picker focused on the folded Fusion row.
@@ -72,6 +72,10 @@ pub fn provider() -> ProviderDecl {
                 tool_choice: Some("auto".to_string()),
                 parallel_tool_calls: Some(true),
                 text_verbosity: Some("low".to_string()),
+                // Devin's per-ACP-session prompt cache runs ~5min
+                // (measured; see session.rs) — tell the host's warmth
+                // timer and cold-cache notices the real lifetime.
+                cache_ttl_secs: Some(300),
             },
             headers: vec![ProviderHeaderDecl {
                 name: "session-id".to_string(),
