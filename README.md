@@ -1,4 +1,13 @@
-# devin-sub — Devin subscription provider sidecar for Gray
+<p align="center">
+  <img src="assets/gray-logo.svg" alt="gray" width="96">
+</p>
+<h1 align="center">gray-devin-sub</h1>
+<p align="center">Run gray on a Devin subscription through the official <code>devin acp</code> CLI.</p>
+<p align="center">
+  <a href="https://github.com/vstaln/gray-devin-sub/blob/main/LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="gray plugin" src="https://img.shields.io/badge/gray-plugin-7aa2f7.svg">
+  <img alt="rust" src="https://img.shields.io/badge/built%20with-rust-orange.svg">
+</p>
 
 A protocol-1.2 provider sidecar that puts a **Devin subscription** behind
 Gray's standard OpenAI-Responses transport: Gray keeps host-owned tools,
@@ -8,7 +17,7 @@ approvals, and compaction; Devin's CLI answers model requests.
 
 The sidecar talks to Devin exclusively through the **official
 `devin acp` command** — Devin's documented Agent Client Protocol
-integration, the same path Zed, JetBrains, and `hermes-devin-acp` use.
+integration, the same path editors like Zed and JetBrains use.
 There is no token handling anywhere: authentication lives entirely inside
 the Devin CLI (`devin auth login`); the sidecar never reads credentials
 files, never captures tokens, and refuses to run when a conflicting
@@ -64,3 +73,7 @@ config shape — this sidecar is a drop-in sibling).
 
 Requires the Devin CLI on `PATH` and `devin auth login` already done.
 Override the binary with `GRAY_DEVIN_SUB_COMMAND` if needed.
+
+---
+Part of the [gray](https://github.com/vstaln/gray) plugin ecosystem —
+the open-source AI agent harness. <https://gray.alignment.id>

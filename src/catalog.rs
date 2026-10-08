@@ -202,7 +202,7 @@ pub const EFFORT_VARIANTS: &[&str] = &["minimal", "low", "medium", "high", "xhig
 /// the tiers.
 pub const EFFORT_ORDER: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-/// Id suffixes that select the fast lane: Anthropic-style `-fast` and
+/// Id suffixes that select the fast lane: fast-tier `-fast` and
 /// OpenAI-style `-priority` (listed as "... Fast").
 const FAST_SUFFIXES: &[&str] = &["fast", "priority"];
 
