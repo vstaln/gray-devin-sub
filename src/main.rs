@@ -13,7 +13,10 @@
 //!   credentials; start/poll report external-login status, refresh/revoke
 //!   are unsupported.
 //! - `command/run` → `/fusion` opens the host's model picker on the
-//!   folded Fusion row (`{"model_picker":"fusion","text":<fallback>}`).
+//!   folded Fusion row (`{"model_picker":"fusion","text":<fallback>});
+//!   a bare `/devin` answers nothing so the host's provider-login
+//!   shortcut switches the session to Devin, and `/devin tools …` owns
+//!   the upstream tool allowlist (`{"text": …}`).
 //! - `plugin/shutdown` → clean exit. Unknown methods are protocol errors
 //!   (provider sidecars must fail loudly, never hang a turn).
 
@@ -58,6 +61,13 @@ async fn main() -> anyhow::Result<()> {
         Some("models") => {
             let catalog = models::catalog().map_err(anyhow::Error::msg)?;
             println!("{}", serde_json::to_string_pretty(&catalog)?);
+            return Ok(());
+        }
+        // `gray devin-sub tools …` and the REPL's captured `/devin tools
+        // …` both land here: one allowlist file, no sidecar needed.
+        Some("tools") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            println!("{}", devin_sub::settings::tools_command(&args));
             return Ok(());
         }
         _ => {}
@@ -165,7 +175,16 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            manifest::run_command(name)
+            let argv: Vec<String> = params
+                .get("argv")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            manifest::run_command(name, &argv)
                 .ok_or_else(|| ProviderRpcError::Protocol("unknown command".into()))
         }
         "plugin/shutdown" => Ok(json!({})),

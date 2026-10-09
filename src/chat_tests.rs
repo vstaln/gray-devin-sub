@@ -77,13 +77,14 @@ fn funnel_parse_bad_json_passes_raw_block() {
 }
 
 #[test]
-fn funnel_parse_unknown_tool_passes_through() {
-    // Default surface is bash-only; models still reach for `edit`. The host
-    // rejects it with an error result the model can read and correct.
+fn funnel_parse_unknown_tool_folds_native() {
+    // Default surface is bash-only; models still reach for `edit`. The
+    // unadvertised name folds to `native__edit`, so the host's
+    // "does not exist" error — never an execution — answers it.
     let text = "Adding it to BUSY.\n\n```gray_calls\n[{\"name\":\"edit\",\"arguments\":{\"file_path\":\"/tmp/d.py\",\"old_string\":\"a\",\"new_string\":\"b\"}}]\n```";
     let (before, calls) = parse_calls_block(text, &["bash".to_string()]).unwrap();
     assert_eq!(before, "Adding it to BUSY.");
-    assert_eq!(calls[0].0, "edit");
+    assert_eq!(calls[0].0, "native__edit");
     assert!(calls[0].1.contains("old_string"));
 }
 
@@ -162,15 +163,16 @@ fn funnel_parse_uses_last_block() {
 fn redirect_execute_maps_command() {
     let u = json!({"kind": "execute", "rawInput": {"command": "echo hi"}});
     assert_eq!(
-        redirect_call(&u, true).unwrap(),
-        "{\"command\":\"echo hi\"}"
+        redirect_call(&u, &["bash".to_string()]).unwrap(),
+        ("bash".to_string(), "{\"command\":\"echo hi\"}".to_string())
     );
 }
 
 #[test]
 fn redirect_read_quotes_single_quote_path() {
     let u = json!({"kind": "read", "rawInput": {"file_path": "/tmp/it's here.txt"}});
-    let args = redirect_call(&u, true).unwrap();
+    let (name, args) = redirect_call(&u, &["bash".to_string()]).unwrap();
+    assert_eq!(name, "bash");
     assert_eq!(args, "{\"command\":\"cat -- '/tmp/it'\\\\''s here.txt'\"}");
     let parsed: Value = serde_json::from_str(&args).unwrap();
     assert_eq!(parsed["command"], "cat -- '/tmp/it'\\''s here.txt'");
@@ -178,9 +180,51 @@ fn redirect_read_quotes_single_quote_path() {
 
 #[test]
 fn redirect_unknown_kind_ignored() {
+    let u = json!({"kind": "fetch", "rawInput": {"url": "https://x"}});
+    assert!(redirect_call(&u, &["bash".to_string()]).is_none());
+    assert!(redirect_call(&u, &[]).is_none());
+    // edit without old_string can't map either
     let u = json!({"kind": "edit", "rawInput": {"file_path": "/x"}});
-    assert!(redirect_call(&u, true).is_none());
-    assert!(redirect_call(&u, false).is_none());
+    assert!(redirect_call(&u, &["bash".to_string()]).is_none());
+}
+
+#[test]
+fn redirect_search_maps_to_host_web_search() {
+    let u = json!({"kind": "search", "rawInput": {"query": "x y"}});
+    let names = vec!["bash".to_string(), "web_search".to_string()];
+    let (name, args) = redirect_call(&u, &names).unwrap();
+    assert_eq!(name, "web_search");
+    let parsed: Value = serde_json::from_str(&args).unwrap();
+    assert_eq!(parsed["query"], "x y");
+    // without the host tool it stays unmappable
+    assert!(redirect_call(&u, &["bash".to_string()]).is_none());
+}
+
+#[test]
+fn redirect_edit_maps_to_python_replace() {
+    let u = json!({"kind": "edit", "rawInput": {"file_path": "/tmp/f.txt",
+        "old_string": "a'b", "new_string": "c"}});
+    let (name, args) = redirect_call(&u, &["bash".to_string()]).unwrap();
+    assert_eq!(name, "bash");
+    let parsed: Value = serde_json::from_str(&args).unwrap();
+    let cmd = parsed["command"].as_str().unwrap();
+    assert!(cmd.starts_with("python3 -c "), "{cmd}");
+    // JSON payload survives shell quoting verbatim
+    let payload = cmd.rsplit(' ').next().unwrap();
+    assert!(payload.starts_with('\''), "{payload}");
+    let inner = payload[1..payload.len() - 1].replace("'\\''", "'");
+    let a: Value = serde_json::from_str(&inner).unwrap();
+    assert_eq!(a["old_string"], "a'b");
+    assert_eq!(a["file_path"], "/tmp/f.txt");
+}
+
+#[test]
+fn redirect_write_maps_to_python_write() {
+    let u = json!({"kind": "write", "rawInput": {"file_path": "/tmp/f.txt", "content": "hi\n"}});
+    let (name, args) = redirect_call(&u, &["bash".to_string()]).unwrap();
+    assert_eq!(name, "bash");
+    let parsed: Value = serde_json::from_str(&args).unwrap();
+    assert!(parsed["command"].as_str().unwrap().starts_with("python3 -c "));
 }
 
 #[test]
@@ -439,4 +483,50 @@ fn inline_images_become_acp_blocks() {
         render_items(&input),
         "[User]\nwhat is this[image attached][image omitted]"
     );
+}
+
+#[test]
+fn funnel_parse_inline_mention_is_not_a_call() {
+    // A fence quoted mid-paragraph is prose about the contract, not a
+    // call: earlier it hijacked the parse and fed the trailing paragraph
+    // to bash as unparseable arguments.
+    let f = format!("{0}{0}{0}gray_calls", '`');
+    let text = format!("(the {f} contract), not as native tools — use the fenced shape");
+    assert!(parse_calls_block(&text, &["bash".to_string()]).is_none());
+}
+
+#[test]
+fn funnel_parse_fenced_prose_body_is_not_a_call() {
+    let f = format!("{0}{0}{0}gray_calls", '`');
+    let text = format!("explaining the shape:\n{f}\nname goes here, arguments there\n```");
+    assert!(parse_calls_block(&text, &["bash".to_string()]).is_none());
+}
+
+#[test]
+fn funnel_parse_real_block_beats_trailing_mention() {
+    let f = format!("{0}{0}{0}gray_calls", '`');
+    let text = format!(
+        "{f}\n[{{\"name\":\"bash\",\"arguments\":{{\"command\":\"ls\"}}}}]\n```\n\n(above: a {f} block)"
+    );
+    let (_, calls) = parse_calls_block(&text, &["bash".to_string()]).unwrap();
+    assert_eq!(calls[0].0, "bash");
+    assert!(calls[0].1.contains("ls"));
+}
+
+#[test]
+fn funnel_parse_empty_array_is_a_plain_answer() {
+    let f = format!("{0}{0}{0}gray_calls", '`');
+    let text = format!("nothing to run\n{f}\n[]\n```");
+    let (before, calls) = parse_calls_block(&text, &["bash".to_string()]).unwrap();
+    assert_eq!(before, "nothing to run");
+    assert!(calls.is_empty());
+}
+
+#[test]
+fn blocked_call_echoes_native_name_prefixed() {
+    let u = json!({"title": "mcp__rea__binary_session", "kind": "other"});
+    assert_eq!(blocked_call(&u).0, "native__mcp__rea__binary_session");
+    let u = json!({"kind": "edit"});
+    assert_eq!(blocked_call(&u).0, "native__edit");
+    assert_eq!(blocked_call(&json!({})).0, "native__tool_call");
 }

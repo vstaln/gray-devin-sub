@@ -11,6 +11,8 @@ pub const PROVIDER_ID: &str = "devin-subscription";
 pub const AUTH_METHOD_ID: &str = "devin-login";
 /// Opens the host's `/model` picker focused on the folded Fusion row.
 pub const FUSION_COMMAND: &str = "/fusion";
+/// The operator command: `/devin tools …` owns the funnel allowlist.
+pub const DEVIN_COMMAND: &str = "/devin";
 
 /// A protocol-1.2 manifest value. Credentials stay with the user's own
 /// `devin` CLI login: the `devin-login` method performs no credential
@@ -20,7 +22,7 @@ pub fn manifest() -> gray_plugin::Manifest {
         name: PLUGIN_NAME.to_string(),
         version: PLUGIN_VERSION.to_string(),
         tools: Vec::new(),
-        commands: vec!["/devin".to_string(), FUSION_COMMAND.to_string()],
+        commands: vec![DEVIN_COMMAND.to_string(), FUSION_COMMAND.to_string()],
         hooks: Vec::new(),
         protocol: Some("1.2".to_string()),
         subcommands: Vec::new(),
@@ -36,14 +38,27 @@ pub fn manifest() -> gray_plugin::Manifest {
 /// `command/run` result for a claimed command, `None` for names this
 /// sidecar doesn't answer. `/fusion` asks the host to open its model
 /// picker on the `fusion` row (`model_picker`); `text` is the fallback a
-/// host without `model_picker` support prints instead.
-pub fn run_command(name: &str) -> Option<serde_json::Value> {
-    (name == FUSION_COMMAND).then(|| {
-        serde_json::json!({
+/// host without `model_picker` support prints instead. `/devin` is the
+/// operator surface: a bare `/devin` answers nothing (`{}`) so the host
+/// falls back to the provider-login shortcut — connect → model picker on
+/// Devin's rows, i.e. "switch to Devin" — while `/devin tools …` owns the
+/// funnel allowlist (see [`crate::settings`]), answered as `{"text": …}`.
+pub fn run_command(name: &str, argv: &[String]) -> Option<serde_json::Value> {
+    if name == FUSION_COMMAND {
+        return Some(serde_json::json!({
             "model_picker": crate::models::FUSION_ID,
             "text": "Open /model and pick Fusion (this gray is too old for /fusion)",
-        })
-    })
+        }));
+    }
+    if name == DEVIN_COMMAND {
+        if argv.is_empty() {
+            return Some(serde_json::json!({}));
+        }
+        return Some(serde_json::json!({
+            "text": crate::settings::command(argv),
+        }));
+    }
+    None
 }
 
 /// Devin subscription provider. Requests go to the loopback relay the

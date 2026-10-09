@@ -56,8 +56,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::chat::{
-    PreparedTurn, TurnResult, Usage, continuation, parse_calls_block, rand_hex, redirect_call,
-    usage_from,
+    PreparedTurn, TurnResult, Usage, blocked_call, continuation, parse_calls_block, rand_hex,
+    redirect_call, usage_from,
 };
 use crate::setup;
 
@@ -873,13 +873,18 @@ impl LiveSession {
             }
             Some("tool_call") => {
                 self.text_boundary = true;
-                // First eligible redirect wins and ends the turn: the model
+                // First native call wins and ends the turn: the model
                 // reached for a native tool instead of the text funnel.
-                if self.redirected.is_empty()
-                    && let Some(args) =
-                        redirect_call(update, self.names.iter().any(|n| n == "bash"))
-                {
-                    self.redirected.push(("bash".to_string(), args));
+                // execute/read redirect onto bash; anything else echoes
+                // back native__-prefixed so the host's "does not exist"
+                // error — which lists the real surface — feeds back to
+                // the model instead of dropping into a dead turn.
+                if self.redirected.is_empty() {
+                    let call = match redirect_call(update, &self.names) {
+                        Some(call) => call,
+                        None => blocked_call(update),
+                    };
+                    self.redirected.push(call);
                     let _ = self.send(&json!({"jsonrpc": "2.0",
                         "method": "session/cancel",
                         "params": {"sessionId": self.session_id}}));

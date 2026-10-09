@@ -10,11 +10,15 @@
 //!   answered prompts that session with only the delta — the transcript is
 //!   already upstream. One upstream request per turn either way.
 //! * gray tools are NOT native tools. They are described in the system text
-//!   and the model answers with a fenced ```gray_calls block; models that
+//!   and the model answers with a fenced ```gray_calls block — gated by the
+//!   `/devin tools` allowlist (default bash-only, [`crate::settings`]).
+//!   Models that
 //!   ignore the text funnel and reach for a native tool anyway are caught by
-//!   `tool_call` notifications and redirected to `bash` (see
-//!   [`redirect_call`]). A project-level `.devin/config.json` deny list makes
-//!   every native tool fail closed regardless.
+//!   `tool_call` notifications: execute/read redirect onto `bash`, anything
+//!   else echoes back `native__`-prefixed so the host's unknown-tool error
+//!   lists the real surface instead of silently ending the turn (see
+//!   [`redirect_call`], [`blocked_call`]). A project-level `.devin/config.json`
+//!   deny list makes every native tool fail closed regardless.
 //! * `session/request_permission` is always answered `cancelled`: nothing a
 //!   harness turn does may wait on a prompt.
 //! * The relay speaks the OpenAI Responses SSE wire the host already streams,
@@ -218,6 +222,9 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     let mut names: Vec<String> = Vec::new();
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut tool_specs: Vec<String> = Vec::new();
+    // The operator's allowlist (`/devin tools`, default bash-only): only
+    // passing tools are described upstream or callable through the funnel.
+    let policy = crate::settings::ToolPolicy::load();
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         for t in tools {
             let name = t.get("name").and_then(Value::as_str).unwrap_or("");
@@ -226,6 +233,11 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
                 .and_then(Value::as_str)
                 .is_some_and(|k| k != "function")
             {
+                continue;
+            }
+            // Filter before validating: a disallowed tool is invisible
+            // here, so its name (valid or not) can never fail a turn.
+            if !policy.allows(name) {
                 continue;
             }
             check_tool_name(name, &seen_names)?;
@@ -317,13 +329,17 @@ fn funnel_contract(tool_specs: &[String]) -> String {
     s
 }
 
-/// Parse the funnel: the LAST ```gray_calls fenced block in `text`.
-/// No block → `None` (plain answer). A block is always the model asking
-/// for tools, so it is never dumped as text (that ends the turn on raw
-/// JSON): unknown names and non-object arguments pass through as-is, and
-/// an unparseable array becomes one call carrying the raw block. The host
-/// validates every call and answers bad ones with an error result without
-/// executing them, so the model sees why and retries.
+/// Parse the funnel: the LAST real ```gray_calls block in `text` — real
+/// meaning a bare info string (the next char is a newline or EOF) and a
+/// body that leads with `[`. Inline mentions and fenced prose stay in
+/// the answer text, where the host's leaked-markup nudge can answer
+/// them. No real block → `None` (plain answer). A real block is always
+/// the model asking for tools, so it is never dumped as text (that ends
+/// the turn on raw JSON): non-object arguments pass through as-is, an
+/// unparseable array becomes one call carrying the raw block, and a
+/// name outside the advertised set folds to `native__…` — the host's
+/// error result names the real surface either way, so the model sees
+/// why and retries.
 ///
 /// The closing fence is optional: SWE models often terminate the call
 /// list with their native pipe-delimited tool markup instead of ``` — or
@@ -331,13 +347,26 @@ fn funnel_contract(tool_specs: &[String]) -> String {
 /// tail, so a prefix parse recovers it and the markup is dropped.
 pub fn parse_calls_block(text: &str, names: &[String]) -> Option<(String, Vec<(String, String)>)> {
     const FENCE: &str = "```gray_calls";
-    let start = text.rfind(FENCE)?;
-    let after = &text[start + FENCE.len()..];
-    let candidate = match after.find("```") {
-        Some(close) => &after[..close],
-        None => after,
-    }
-    .trim();
+    // Scan occurrences last-to-first; the first real block wins. A real
+    // block's info string ends at the newline (or EOF) and its body leads
+    // with `[` — an inline mention (`the <fence> contract)`) or a fenced
+    // explanation is prose about the funnel, not a call, so it stays in
+    // the text where the host's leaked-markup nudge can answer it.
+    let mut search_from = text.len();
+    let (start, candidate) = loop {
+        let idx = text[..search_from].rfind(FENCE)?;
+        let after = &text[idx + FENCE.len()..];
+        let info_ends = after.is_empty() || after.starts_with('\n');
+        let body = match after.find("```") {
+            Some(close) => &after[..close],
+            None => after,
+        }
+        .trim();
+        if info_ends && body.starts_with('[') {
+            break (idx, body);
+        }
+        search_from = idx;
+    };
     // The tool the model most likely meant, so the host's error names it.
     let guess = names
         .iter()
@@ -353,7 +382,16 @@ pub fn parse_calls_block(text: &str, names: &[String]) -> Option<(String, Vec<(S
             .map(|c| {
                 let name = c.get("name").and_then(Value::as_str).unwrap_or(guess);
                 let args = c.get("arguments").unwrap_or(&Value::Null);
-                (name.to_string(), args.to_string())
+                // The advertised set is the whole permit: a name outside
+                // `names` can't run even when the host owns such a tool —
+                // fold to `native__…` so the "does not exist" error
+                // teaches the real surface instead of silently executing.
+                let name = if names.iter().any(|n| n == name) {
+                    name.to_string()
+                } else {
+                    native_name(name)
+                };
+                (name, args.to_string())
             })
             .collect(),
         None => vec![(guess.to_string(), candidate.to_string())],
@@ -371,26 +409,115 @@ fn json_array_prefix(s: &str) -> Option<Vec<Value>> {
         .ok()
 }
 
-/// Redirect a native `tool_call` notification onto `bash`, when the host
-/// tools include it. Verified shapes: `{"kind":"execute","rawInput":
-/// {"command": "..."}}` and `{"kind":"read","rawInput":{"file_path":"..."}}`.
-pub(crate) fn redirect_call(update: &Value, has_bash: bool) -> Option<String> {
-    if !has_bash {
-        return None;
-    }
+/// Redirect a native `tool_call` notification onto a host tool — `bash` for
+/// execute/read/edit/write, the host's own web tools for search/fetch —
+/// when the tool exists in `names`. Verified shapes: `{"kind":"execute",
+/// "rawInput":{"command": "..."}}` and `{"kind":"read","rawInput":
+/// {"file_path":"..."}}`.
+pub(crate) fn redirect_call(update: &Value, names: &[String]) -> Option<(String, String)> {
     let kind = update.get("kind").and_then(Value::as_str).unwrap_or("");
     let input = update.get("rawInput").unwrap_or(&Value::Null);
+    let has = |n: &str| names.iter().any(|x| x == n);
+    let bash = |cmd: String| {
+        has("bash").then(|| ("bash".to_string(), json!({"command": cmd}).to_string()))
+    };
     match kind {
         "execute" => input
             .get("command")
             .and_then(Value::as_str)
-            .map(|c| json!({"command": c}).to_string()),
+            .and_then(|c| bash(c.to_string())),
         "read" => input
             .get("file_path")
             .and_then(Value::as_str)
-            .map(|p| json!({"command": format!("cat -- {}", shell_quote(p))}).to_string()),
+            .and_then(|p| bash(format!("cat -- {}", shell_quote(p)))),
+        // edit/write land on a python3 one-liner instead of the native__ dead
+        // end: same file semantics, still host-mediated through `bash`.
+        "edit" => edit_redirect(input).and_then(|a| bash_args(a, has("bash"))),
+        "write" | "create" => write_redirect(input).and_then(|a| bash_args(a, has("bash"))),
+        // Native search/fetch land on the host's own tools — the model asked
+        // for a capability the surface already has; rawInput passes through
+        // as the args verbatim.
+        "search" => has("web_search").then(|| ("web_search".to_string(), input.to_string())),
+        "fetch" => has("web_fetch").then(|| ("web_fetch".to_string(), input.to_string())),
         _ => None,
     }
+}
+
+fn bash_args(args_json: String, has_bash: bool) -> Option<(String, String)> {
+    has_bash.then(|| ("bash".to_string(), args_json))
+}
+
+/// `edit` → exact-string replace via python3. `old_string` must appear
+/// exactly once unless `replace_all` is set — same contract as the native
+/// tool, so the error text still teaches the model what went wrong.
+fn edit_redirect(input: &Value) -> Option<String> {
+    let path = input.get("file_path").and_then(Value::as_str)?;
+    let old_s = input.get("old_string").and_then(Value::as_str)?;
+    let new_s = input.get("new_string").and_then(Value::as_str).unwrap_or("");
+    let replace_all = input.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+    let payload = json!({
+        "file_path": path, "old_string": old_s,
+        "new_string": new_s, "replace_all": replace_all,
+    })
+    .to_string();
+    let script = "import json,sys
+        a=json.loads(sys.argv[1]);p=a['file_path']
+        s=open(p,encoding='utf-8').read()
+        o,n=a['old_string'],a['new_string']
+        if a.get('replace_all'): out=s.replace(o,n)
+        else:
+            c=s.count(o)
+            assert c==1,f'old_string found {c} times in {p} (need exactly 1)'
+            out=s.replace(o,n,1)
+        open(p,'w',encoding='utf-8').write(out)";
+    Some(json!({"command": format!("python3 -c {} {}", shell_quote(script), shell_quote(&payload))}).to_string())
+}
+
+/// `write`/`create` → python3 writes the content verbatim.
+fn write_redirect(input: &Value) -> Option<String> {
+    let path = input.get("file_path").and_then(Value::as_str)?;
+    let content = input.get("content").and_then(Value::as_str).unwrap_or("");
+    let payload = json!({"file_path": path, "content": content}).to_string();
+    let script = "import json,sys
+        a=json.loads(sys.argv[1])
+        open(a['file_path'],'w',encoding='utf-8').write(a['content'])";
+    Some(json!({"command": format!("python3 -c {} {}", shell_quote(script), shell_quote(&payload))}).to_string())
+}
+
+/// The call a native `tool_call` becomes when [`redirect_call`] can't map
+/// it onto bash (edit/fetch/other kinds, or a bash-less surface): the name
+/// the model reached for — the update's `title`, else `kind` — sanitized
+/// and `native__`-prefixed so it can never collide with a real tool. The
+/// host answers "Tool 'native__X' does not exist. Available: …", an error
+/// result that names the true surface and keeps the turn alive; a dropped
+/// native call is how turns end dead text-only.
+pub(crate) fn blocked_call(update: &Value) -> (String, String) {
+    let raw = update
+        .get("title")
+        .and_then(Value::as_str)
+        .or_else(|| update.get("kind").and_then(Value::as_str))
+        .unwrap_or("tool_call");
+    (native_name(raw), "{}".to_string())
+}
+
+/// `native__`-prefixed form of a name the model reached for — sanitized,
+/// capped at 50 chars, and unable to collide with a real tool. Shared by
+/// [`blocked_call`] (native tool calls) and [`parse_calls_block`] (funnel
+/// calls outside the advertised set): both end at the host's
+/// "does not exist" error.
+pub(crate) fn native_name(raw: &str) -> String {
+    let mut name = String::from("native__");
+    for c in raw.chars() {
+        if name.len() >= 50 {
+            break;
+        }
+        name.push(if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            c
+        } else {
+            '_'
+        });
+    }
+    name
 }
 
 /// POSIX single-quote a path: `'` becomes `'\''`.
@@ -719,6 +846,33 @@ pub fn fold_result(r: &TurnResult) -> Result<Vec<u8>, String> {
         &json!({"type": "response.created", "response": {"id": resp_id, "model": "", "status": "in_progress"}}),
     );
     let mut item_id = 0;
+    if !r.thought.is_empty() {
+        item_id += 1;
+        let item = json!({"type": "reasoning", "id": format!("rs_{item_id}"),
+            "summary": [{"type": "summary_text", "text": r.thought}]});
+        emit(
+            &mut sse,
+            &json!({"type": "response.output_item.added",
+                "output_index": item_id - 1, "item": item}),
+        );
+        emit(
+            &mut sse,
+            &json!({"type": "response.output_item.done",
+                "output_index": item_id - 1, "item": item}),
+        );
+    }
+    if !r.text.is_empty() {
+        item_id += 1;
+        let idx = item_id - 1;
+        emit(
+            &mut sse,
+            &json!({"type": "response.output_text.delta", "output_index": idx, "delta": r.text}),
+        );
+        emit(
+            &mut sse,
+            &json!({"type": "response.output_text.done", "output_index": idx, "text": r.text}),
+        );
+    }
     for (id, name, args) in &r.calls {
         item_id += 1;
         emit(
@@ -741,31 +895,6 @@ pub fn fold_result(r: &TurnResult) -> Result<Vec<u8>, String> {
                 "output_index": item_id - 1,
                 "item": {"type": "function_call", "id": format!("fc_{item_id}"),
                     "call_id": id, "name": name, "arguments": args}}),
-        );
-    }
-    if !r.thought.is_empty() {
-        item_id += 1;
-        let item = json!({"type": "reasoning", "id": format!("rs_{item_id}"),
-            "summary": [{"type": "summary_text", "text": r.thought}]});
-        emit(
-            &mut sse,
-            &json!({"type": "response.output_item.added",
-                "output_index": item_id - 1, "item": item}),
-        );
-        emit(
-            &mut sse,
-            &json!({"type": "response.output_item.done",
-                "output_index": item_id - 1, "item": item}),
-        );
-    }
-    if !r.text.is_empty() {
-        emit(
-            &mut sse,
-            &json!({"type": "response.output_text.delta", "output_index": 0, "delta": r.text}),
-        );
-        emit(
-            &mut sse,
-            &json!({"type": "response.output_text.done", "output_index": 0, "text": r.text}),
         );
     }
     let usage_val = json!({"input_tokens": r.usage.input_tokens,
