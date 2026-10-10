@@ -598,6 +598,53 @@ fn title_named_call_redirects_to_advertised_tool() {
 }
 
 #[test]
+fn payload_shape_redirects_when_title_says_nothing() {
+    let names = vec!["bash".to_string(), "web_fetch".to_string()];
+
+    // "Wrote X" notification shape: no parseable title, no kind — but
+    // rawInput is a write and the write should land, not dead-end.
+    let u = json!({"kind": "other", "title": "Wrote /tmp/e2e-out",
+        "rawInput": {"file_path": "/tmp/e2e-out", "content": "hi"}});
+    let (name, args) = redirect_call(&u, &names).unwrap();
+    assert_eq!(name, "bash");
+    assert!(args.contains("e2e-out"), "{args}");
+
+    // Read-shaped payload under a builtin name.
+    let u = json!({"kind": "other", "title": "Read shell",
+        "rawInput": {"file_path": "/etc/hostname"}});
+    let (name, args) = redirect_call(&u, &names).unwrap();
+    assert_eq!(name, "bash");
+    assert!(args.contains("cat"), "{args}");
+
+    // Command payload with no usable title.
+    let u = json!({"kind": "other", "rawInput": {"command": "ls /tmp"}});
+    let (name, args) = redirect_call(&u, &names).unwrap();
+    assert_eq!(name, "bash");
+    assert!(args.contains("ls /tmp"), "{args}");
+
+    // Fetch-shaped payload routes through web_redirect.
+    let u = json!({"kind": "other", "rawInput": {"url": "https://example.com"}});
+    let (name, args) = redirect_call(&u, &names).unwrap();
+    assert_eq!(name, "web_fetch");
+    assert!(args.contains("example.com"), "{args}");
+
+    // Alien payloads still fail closed.
+    let u = json!({"kind": "other", "title": "Requested write access to /x",
+        "rawInput": {}});
+    assert!(redirect_call(&u, &names).is_none());
+}
+
+#[test]
+fn namespaced_tool_name_strips_to_advertised() {
+    let names = vec!["ctx_exec".to_string()];
+    let u = json!({"kind": "other", "title": "Calling plugin_ctx_exec from apify",
+        "rawInput": {"a": 1}});
+    // "Calling X from Y" where X carries a plugin_ namespace prefix
+    let (name, _) = redirect_call(&u, &names).unwrap();
+    assert_eq!(name, "ctx_exec");
+}
+
+#[test]
 fn mcp_call_to_harness_tool_unwraps() {
     let names = vec!["bash".to_string(), "recall".to_string()];
     let u = json!({"kind": "other", "title": "Calling bash from harness",

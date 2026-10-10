@@ -389,7 +389,7 @@ pub fn parse_calls_block(text: &str, names: &[String]) -> Option<(String, Vec<(S
                 let name = if names.iter().any(|n| n == name) {
                     name.to_string()
                 } else {
-                    native_name(name)
+                    denamespace(name, names).unwrap_or_else(|| native_name(name))
                 };
                 (name, args.to_string())
             })
@@ -446,8 +446,46 @@ pub(crate) fn redirect_call(update: &Value, names: &[String]) -> Option<(String,
         // kind:"other" is the grab-bag: MCP-bridge and native-tool calls
         // whose title ("Calling bash from harness") still names the tool
         // the model meant even when rawInput doesn't carry tool_name.
-        _ => title_call(update, input, names),
+        // When the title says nothing either, the payload itself still
+        // does — "Wrote /x" with {file_path, content} is a write.
+        _ => title_call(update, input, names)
+            .or_else(|| shape_call(update, input, names)),
     }
+}
+
+/// Title and kind said nothing, but the payload still carries intent:
+/// {command} is an execute, {file_path} a read — or a write/edit when
+/// content rides along — {url|query} a web call. Read_shell-family
+/// builtins and "Wrote X" updates used to die as native__ noise even
+/// though their rawInput is exactly what a named kind would carry.
+fn shape_call(update: &Value, input: &Value, names: &[String]) -> Option<(String, String)> {
+    if !input.is_object() {
+        return None;
+    }
+    let has = |n: &str| names.iter().any(|x| x == n);
+    if let Some(cmd) = input.get("command").and_then(Value::as_str) {
+        return has("bash").then(|| ("bash".to_string(), json!({"command": cmd}).to_string()));
+    }
+    if input.get("file_path").is_some() {
+        let args = if input.get("old_string").is_some() {
+            edit_redirect(input)
+        } else if input.get("content").is_some() || input.get("new_string").is_some() {
+            write_redirect(&json!({
+                "file_path": input["file_path"],
+                "content": input.get("content").or_else(|| input.get("new_string")).cloned().unwrap_or(Value::Null),
+            }))
+        } else {
+            input
+                .get("file_path")
+                .and_then(Value::as_str)
+                .map(|p| json!({"command": format!("cat -- {}", shell_quote(p))}).to_string())
+        };
+        return args.and_then(|a| bash_args(a, has("bash")));
+    }
+    if input.get("url").is_some() || input.get("query").is_some() {
+        return web_redirect(update, input, names);
+    }
+    None
 }
 
 /// The tool a native update was reaching for, parsed out of its title.
@@ -467,6 +505,16 @@ fn title_tool(update: &Value) -> Option<String> {
         .and_then(|t| t.rsplit("__").next())
         .filter(|t| !t.is_empty())
         .map(String::from)
+        .or_else(|| {
+            // A bare "tool_name" title — some harnesses label the update
+            // with nothing but the tool's name.
+            (!title.is_empty()
+                && title.len() <= 50
+                && title
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+            .then(|| title.to_string())
+        })
 }
 
 /// A title-named call whose tool is on the advertised surface becomes the
@@ -479,10 +527,24 @@ fn title_call(update: &Value, input: &Value, names: &[String]) -> Option<(String
     if matches!(tool.as_str(), "web_search" | "web_fetch" | "webfetch") {
         return web_redirect(update, input, names);
     }
-    names
-        .iter()
-        .any(|n| n == &tool)
-        .then(|| (tool, input.to_string()))
+    if names.iter().any(|n| n == &tool) {
+        return Some((tool, input.to_string()));
+    }
+    denamespace(&tool, names).map(|t| (t, input.to_string()))
+}
+
+/// "plugin_ctx_exec" / "harness_bash": the model namespaces an advertised
+/// tool. Strip the prefix and retry the advertised check before folding
+/// to native__.
+fn denamespace(name: &str, names: &[String]) -> Option<String> {
+    for pre in ["plugin_", "harness_", "gray_"] {
+        if let Some(rest) = name.strip_prefix(pre) {
+            if names.iter().any(|n| n == rest) {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Devin's `mcp_call_tool` aimed at a harness tool. The prompt calls our
