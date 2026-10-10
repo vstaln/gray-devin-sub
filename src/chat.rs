@@ -443,8 +443,46 @@ pub(crate) fn redirect_call(update: &Value, names: &[String]) -> Option<(String,
         // carries `rawInput.url` and `"webfetch"`), so classify by payload,
         // not kind.
         "search" | "fetch" => web_redirect(update, input, names),
-        _ => None,
+        // kind:"other" is the grab-bag: MCP-bridge and native-tool calls
+        // whose title ("Calling bash from harness") still names the tool
+        // the model meant even when rawInput doesn't carry tool_name.
+        _ => title_call(update, input, names),
     }
+}
+
+/// The tool a native update was reaching for, parsed out of its title.
+/// "Calling ctx_exec from apify" -> ctx_exec; "mcp__srv__tool" -> tool;
+/// anything else -> None.
+fn title_tool(update: &Value) -> Option<String> {
+    let title = update.get("title").and_then(Value::as_str)?;
+    if let Some(rest) = title.strip_prefix("Calling ") {
+        let tool = rest.split(" from ").next()?;
+        if !tool.is_empty() && tool.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Some(tool.to_string());
+        }
+        return None;
+    }
+    title
+        .strip_prefix("mcp__")
+        .and_then(|t| t.rsplit("__").next())
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+}
+
+/// A title-named call whose tool is on the advertised surface becomes the
+/// call the model meant. web_* goes through web_redirect so a disallowed
+/// fetch still lands on curl; anything else gets rawInput passed as its
+/// args — a shape mismatch surfaces as the tool's own error, which still
+/// teaches more than a dead-end rejection.
+fn title_call(update: &Value, input: &Value, names: &[String]) -> Option<(String, String)> {
+    let tool = title_tool(update)?;
+    if matches!(tool.as_str(), "web_search" | "web_fetch" | "webfetch") {
+        return web_redirect(update, input, names);
+    }
+    names
+        .iter()
+        .any(|n| n == &tool)
+        .then(|| (tool, input.to_string()))
 }
 
 /// Devin's `mcp_call_tool` aimed at a harness tool. The prompt calls our
@@ -578,12 +616,11 @@ fn write_redirect(input: &Value) -> Option<String> {
 /// result that names the true surface and keeps the turn alive; a dropped
 /// native call is how turns end dead text-only.
 pub(crate) fn blocked_call(update: &Value) -> (String, String) {
-    let raw = update
-        .get("title")
-        .and_then(Value::as_str)
-        .or_else(|| update.get("kind").and_then(Value::as_str))
-        .unwrap_or("tool_call");
-    (native_name(raw), "{}".to_string())
+    let raw = title_tool(update)
+        .or_else(|| update.get("kind").and_then(Value::as_str).map(String::from))
+        .or_else(|| update.get("title").and_then(Value::as_str).map(String::from))
+        .unwrap_or_else(|| "tool_call".to_string());
+    (native_name(&raw), "{}".to_string())
 }
 
 /// `native__`-prefixed form of a name the model reached for — sanitized,

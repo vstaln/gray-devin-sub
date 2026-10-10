@@ -530,7 +530,11 @@ fn funnel_parse_empty_array_is_a_plain_answer() {
 #[test]
 fn blocked_call_echoes_native_name_prefixed() {
     let u = json!({"title": "mcp__rea__binary_session", "kind": "other"});
-    assert_eq!(blocked_call(&u).0, "native__mcp__rea__binary_session");
+    assert_eq!(blocked_call(&u).0, "native__binary_session");
+    // unparseable titles fall through to kind — arg-leaking labels like
+    // native__Searched_web_for__Welch_Labs__transformers are gone
+    let u = json!({"title": "Searched web for 'x'", "kind": "other"});
+    assert_eq!(blocked_call(&u).0, "native__other");
     let u = json!({"kind": "edit"});
     assert_eq!(blocked_call(&u).0, "native__edit");
     assert_eq!(blocked_call(&json!({})).0, "native__tool_call");
@@ -573,6 +577,24 @@ fn redirect_real_devin_fetch_shape() {
     let cmd = parsed["command"].as_str().unwrap();
     assert!(cmd.starts_with("curl -fsSL"), "{cmd}");
     assert!(cmd.contains("-- 'https://example.com'"), "{cmd}");
+}
+
+#[test]
+fn title_named_call_redirects_to_advertised_tool() {
+    // kind:"other" + "Calling X from Y" title, no tool_name in rawInput:
+    // the reached-for tool still resolves when it is on the surface.
+    let names = vec!["ctx_exec".to_string(), "bash".to_string()];
+    let u = json!({"kind": "other", "title": "Calling ctx_exec from apify",
+        "rawInput": {"a": 1}});
+    let (name, args) = redirect_call(&u, &names).unwrap();
+    assert_eq!(name, "ctx_exec");
+    assert_eq!(serde_json::from_str::<Value>(&args).unwrap()["a"], 1);
+
+    // a tool that is NOT advertised keeps failing closed, cleanly named
+    let u = json!({"kind": "other", "title": "Calling recall from gray",
+        "rawInput": {}});
+    assert!(redirect_call(&u, &names).is_none());
+    assert_eq!(blocked_call(&u).0, "native__recall");
 }
 
 #[test]
