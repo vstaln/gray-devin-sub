@@ -168,8 +168,7 @@ pub fn tools_command(args: &[String]) -> String {
         }
     }
     if policy.allow.is_empty() {
-        return "refusing to write an empty tool list — `/devin tools bash` resets"
-            .to_string();
+        return "refusing to write an empty tool list — `/devin tools bash` resets".to_string();
     }
     match policy.save() {
         Ok(path) => format!("{}\n(saved to {path})", status_line(&policy)),

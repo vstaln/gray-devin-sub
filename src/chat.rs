@@ -417,6 +417,9 @@ fn json_array_prefix(s: &str) -> Option<Vec<Value>> {
 pub(crate) fn redirect_call(update: &Value, names: &[String]) -> Option<(String, String)> {
     let kind = update.get("kind").and_then(Value::as_str).unwrap_or("");
     let input = update.get("rawInput").unwrap_or(&Value::Null);
+    if let Some(call) = mcp_redirect(input, names) {
+        return Some(call);
+    }
     let has = |n: &str| names.iter().any(|x| x == n);
     let bash = |cmd: String| {
         has("bash").then(|| ("bash".to_string(), json!({"command": cmd}).to_string()))
@@ -434,13 +437,84 @@ pub(crate) fn redirect_call(update: &Value, names: &[String]) -> Option<(String,
         // end: same file semantics, still host-mediated through `bash`.
         "edit" => edit_redirect(input).and_then(|a| bash_args(a, has("bash"))),
         "write" | "create" => write_redirect(input).and_then(|a| bash_args(a, has("bash"))),
-        // Native search/fetch land on the host's own tools — the model asked
-        // for a capability the surface already has; rawInput passes through
-        // as the args verbatim.
-        "search" => has("web_search").then(|| ("web_search".to_string(), input.to_string())),
-        "fetch" => has("web_fetch").then(|| ("web_fetch".to_string(), input.to_string())),
+        // Devin reports BOTH web search and web fetch as `kind: "fetch"`
+        // (verified: search carries `rawInput.query` and
+        // `_meta["cognition.ai/inferenceToolName"] = "web_search"`, fetch
+        // carries `rawInput.url` and `"webfetch"`), so classify by payload,
+        // not kind.
+        "search" | "fetch" => web_redirect(update, input, names),
         _ => None,
     }
+}
+
+/// Devin's `mcp_call_tool` aimed at a harness tool. The prompt calls our
+/// surface "harness tools", so the model sometimes reaches for them via its
+/// native MCP bridge: `{"server_name":"harness","tool_name":"bash",
+/// "arguments":{…}}` (titled "Calling bash from harness"). When `tool_name`
+/// is on the allowed surface, unwrap it into the call it meant; web tools
+/// go through [`web_redirect`] so a disallowed fetch still lands on curl.
+/// Anything else (a real MCP server's tool) stays blocked.
+fn mcp_redirect(input: &Value, names: &[String]) -> Option<(String, String)> {
+    let tool = input.get("tool_name").and_then(Value::as_str)?;
+    input.get("server_name")?;
+    let args = match input.get("arguments") {
+        Some(Value::String(raw)) => serde_json::from_str(raw).unwrap_or(Value::Null),
+        Some(v) => v.clone(),
+        None => Value::Null,
+    };
+    let args = if args.is_object() { args } else { json!({}) };
+    if matches!(tool, "web_fetch" | "web_search" | "webfetch") {
+        let meta = if tool == "web_search" {
+            "web_search"
+        } else {
+            "webfetch"
+        };
+        let update = json!({"_meta": {"cognition.ai/inferenceToolName": meta}});
+        return web_redirect(&update, &args, names);
+    }
+    names
+        .iter()
+        .any(|n| n == tool)
+        .then(|| (tool.to_string(), args.to_string()))
+}
+
+/// Native web search/fetch → the host's own tools when the policy allows
+/// them. A fetch the policy keeps off `web_fetch` still lands on `bash` as
+/// `curl` when bash is allowed — same capability the bash surface already
+/// grants, and what the model falls back to by hand otherwise. A search
+/// with no `web_search` has no faithful bash equivalent: it folds to a
+/// self-explaining `native__` name so the host error says why.
+fn web_redirect(update: &Value, input: &Value, names: &[String]) -> Option<(String, String)> {
+    let has = |n: &str| names.iter().any(|x| x == n);
+    let tool = update
+        .pointer("/_meta/cognition.ai~1inferenceToolName")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let url = input.get("url").and_then(Value::as_str);
+    let query = input.get("query").and_then(Value::as_str);
+    let is_search = tool == "web_search" || (url.is_none() && query.is_some());
+    if is_search {
+        let q = query?;
+        return Some(if has("web_search") {
+            ("web_search".to_string(), json!({"query": q}).to_string())
+        } else {
+            (
+                native_name("web_search_not_enabled_for_devin"),
+                "{}".to_string(),
+            )
+        });
+    }
+    let url = url?;
+    if has("web_fetch") {
+        return Some(("web_fetch".to_string(), json!({"url": url}).to_string()));
+    }
+    has("bash").then(|| {
+        let cmd = format!(
+            "curl -fsSL --max-time 30 -A 'Mozilla/5.0' -- {} | head -c 200000",
+            shell_quote(url)
+        );
+        ("bash".to_string(), json!({"command": cmd}).to_string())
+    })
 }
 
 fn bash_args(args_json: String, has_bash: bool) -> Option<(String, String)> {
@@ -453,8 +527,14 @@ fn bash_args(args_json: String, has_bash: bool) -> Option<(String, String)> {
 fn edit_redirect(input: &Value) -> Option<String> {
     let path = input.get("file_path").and_then(Value::as_str)?;
     let old_s = input.get("old_string").and_then(Value::as_str)?;
-    let new_s = input.get("new_string").and_then(Value::as_str).unwrap_or("");
-    let replace_all = input.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+    let new_s = input
+        .get("new_string")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let replace_all = input
+        .get("replace_all")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let payload = json!({
         "file_path": path, "old_string": old_s,
         "new_string": new_s, "replace_all": replace_all,
@@ -470,7 +550,10 @@ fn edit_redirect(input: &Value) -> Option<String> {
             assert c==1,f'old_string found {c} times in {p} (need exactly 1)'
             out=s.replace(o,n,1)
         open(p,'w',encoding='utf-8').write(out)";
-    Some(json!({"command": format!("python3 -c {} {}", shell_quote(script), shell_quote(&payload))}).to_string())
+    Some(
+        json!({"command": format!("python3 -c {} {}", shell_quote(script), shell_quote(&payload))})
+            .to_string(),
+    )
 }
 
 /// `write`/`create` → python3 writes the content verbatim.
@@ -481,7 +564,10 @@ fn write_redirect(input: &Value) -> Option<String> {
     let script = "import json,sys
         a=json.loads(sys.argv[1])
         open(a['file_path'],'w',encoding='utf-8').write(a['content'])";
-    Some(json!({"command": format!("python3 -c {} {}", shell_quote(script), shell_quote(&payload))}).to_string())
+    Some(
+        json!({"command": format!("python3 -c {} {}", shell_quote(script), shell_quote(&payload))})
+            .to_string(),
+    )
 }
 
 /// The call a native `tool_call` becomes when [`redirect_call`] can't map

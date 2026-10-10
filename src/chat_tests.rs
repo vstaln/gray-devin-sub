@@ -181,7 +181,6 @@ fn redirect_read_quotes_single_quote_path() {
 #[test]
 fn redirect_unknown_kind_ignored() {
     let u = json!({"kind": "fetch", "rawInput": {"url": "https://x"}});
-    assert!(redirect_call(&u, &["bash".to_string()]).is_none());
     assert!(redirect_call(&u, &[]).is_none());
     // edit without old_string can't map either
     let u = json!({"kind": "edit", "rawInput": {"file_path": "/x"}});
@@ -196,8 +195,9 @@ fn redirect_search_maps_to_host_web_search() {
     assert_eq!(name, "web_search");
     let parsed: Value = serde_json::from_str(&args).unwrap();
     assert_eq!(parsed["query"], "x y");
-    // without the host tool it stays unmappable
-    assert!(redirect_call(&u, &["bash".to_string()]).is_none());
+    // without the host tool it folds to a self-explaining native__ name
+    let (name, _) = redirect_call(&u, &["bash".to_string()]).unwrap();
+    assert_eq!(name, "native__web_search_not_enabled_for_devin");
 }
 
 #[test]
@@ -224,7 +224,12 @@ fn redirect_write_maps_to_python_write() {
     let (name, args) = redirect_call(&u, &["bash".to_string()]).unwrap();
     assert_eq!(name, "bash");
     let parsed: Value = serde_json::from_str(&args).unwrap();
-    assert!(parsed["command"].as_str().unwrap().starts_with("python3 -c "));
+    assert!(
+        parsed["command"]
+            .as_str()
+            .unwrap()
+            .starts_with("python3 -c ")
+    );
 }
 
 #[test]
@@ -529,4 +534,81 @@ fn blocked_call_echoes_native_name_prefixed() {
     let u = json!({"kind": "edit"});
     assert_eq!(blocked_call(&u).0, "native__edit");
     assert_eq!(blocked_call(&json!({})).0, "native__tool_call");
+}
+
+// Real `devin acp` shapes (probed): search AND fetch both arrive as
+// kind "fetch", told apart by rawInput / _meta inferenceToolName.
+#[test]
+fn redirect_real_devin_search_shape() {
+    let u = json!({"sessionUpdate": "tool_call", "title": "Searched web for Welch Labs transformers",
+        "kind": "fetch", "rawInput": {"query": "Welch Labs transformers"},
+        "_meta": {"cognition.ai/inferenceToolName": "web_search"}});
+    let names = vec![
+        "bash".to_string(),
+        "web_search".to_string(),
+        "web_fetch".to_string(),
+    ];
+    let (name, args) = redirect_call(&u, &names).unwrap();
+    assert_eq!(name, "web_search");
+    let parsed: Value = serde_json::from_str(&args).unwrap();
+    assert_eq!(parsed["query"], "Welch Labs transformers");
+    let (name, _) = redirect_call(&u, &["bash".to_string()]).unwrap();
+    assert_eq!(name, "native__web_search_not_enabled_for_devin");
+}
+
+#[test]
+fn redirect_real_devin_fetch_shape() {
+    let u = json!({"sessionUpdate": "tool_call", "title": "Fetched https://example.com",
+        "kind": "fetch", "rawInput": {"url": "https://example.com"},
+        "_meta": {"cognition.ai/inferenceToolName": "webfetch"}});
+    let names = vec!["bash".to_string(), "web_fetch".to_string()];
+    let (name, args) = redirect_call(&u, &names).unwrap();
+    assert_eq!(name, "web_fetch");
+    let parsed: Value = serde_json::from_str(&args).unwrap();
+    assert_eq!(parsed["url"], "https://example.com");
+    // bash-only policy: curl through bash instead of a native__ dead end
+    let (name, args) = redirect_call(&u, &["bash".to_string()]).unwrap();
+    assert_eq!(name, "bash");
+    let parsed: Value = serde_json::from_str(&args).unwrap();
+    let cmd = parsed["command"].as_str().unwrap();
+    assert!(cmd.starts_with("curl -fsSL"), "{cmd}");
+    assert!(cmd.contains("-- 'https://example.com'"), "{cmd}");
+}
+
+#[test]
+fn mcp_call_to_harness_tool_unwraps() {
+    let names = vec!["bash".to_string(), "recall".to_string()];
+    let u = json!({"kind": "other", "title": "Calling bash from harness",
+        "rawInput": {"server_name": "harness", "tool_name": "bash",
+            "arguments": {"command": "echo hi"}}});
+    let (name, args) = redirect_call(&u, &names).unwrap();
+    assert_eq!(name, "bash");
+    assert_eq!(
+        serde_json::from_str::<Value>(&args).unwrap()["command"],
+        "echo hi"
+    );
+
+    // Stringified arguments, a different "server", another allowed tool.
+    let u = json!({"title": "Calling recall from gray",
+        "rawInput": {"server_name": "gray", "tool_name": "recall",
+            "arguments": "{\"query\":\"x\"}"}});
+    let (name, args) = redirect_call(&u, &names).unwrap();
+    assert_eq!(name, "recall");
+    assert_eq!(serde_json::from_str::<Value>(&args).unwrap()["query"], "x");
+}
+
+#[test]
+fn mcp_call_web_fetch_falls_back_to_curl_and_foreign_tools_stay_blocked() {
+    let names = vec!["bash".to_string()];
+    let u = json!({"title": "Calling web_fetch from harness",
+        "rawInput": {"server_name": "harness", "tool_name": "web_fetch",
+            "arguments": {"url": "https://example.com"}}});
+    let (name, args) = redirect_call(&u, &names).unwrap();
+    assert_eq!(name, "bash");
+    assert!(args.contains("curl"), "{args}");
+
+    let u = json!({"title": "Calling fetch_actor_details from apify",
+        "rawInput": {"server_name": "apify", "tool_name": "fetch_actor_details",
+            "arguments": {}}});
+    assert!(redirect_call(&u, &names).is_none());
 }
