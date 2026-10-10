@@ -51,7 +51,7 @@ fn run_list() -> Result<String, String> {
         .args(["models", "list"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .envs(crate::setup::child_env())
         .spawn()
         .map_err(|e| format!("devin models list: {e}"))?;
@@ -68,10 +68,20 @@ fn run_list() -> Result<String, String> {
         let _ = stdout.read_to_string(&mut s);
         s
     });
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "devin models list stderr unavailable".to_string())?;
+    let err_reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -79,12 +89,19 @@ fn run_list() -> Result<String, String> {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = reader.join();
+                let _ = err_reader.join();
                 return Err("devin models list timed out".into());
             }
             Err(e) => return Err(format!("devin models list: {e}")),
         }
+    };
+    let out = reader.join().unwrap_or_default();
+    let err = err_reader.join().unwrap_or_default();
+    if !status.success() {
+        let detail = err.trim().lines().last().unwrap_or("unknown error");
+        return Err(format!("devin models list failed ({status}): {detail}"));
     }
-    Ok(reader.join().unwrap_or_default())
+    Ok(out)
 }
 
 /// Parse `devin models list` text into routable entries. Unindented lines
