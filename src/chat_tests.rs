@@ -224,7 +224,12 @@ fn redirect_write_maps_to_python_write() {
     let (name, args) = redirect_call(&u, &["bash".to_string()]).unwrap();
     assert_eq!(name, "bash");
     let parsed: Value = serde_json::from_str(&args).unwrap();
-    assert!(parsed["command"].as_str().unwrap().starts_with("python3 -c "));
+    assert!(
+        parsed["command"]
+            .as_str()
+            .unwrap()
+            .starts_with("python3 -c ")
+    );
 }
 
 #[test]
@@ -538,7 +543,11 @@ fn redirect_real_devin_search_shape() {
     let u = json!({"sessionUpdate": "tool_call", "title": "Searched web for Welch Labs transformers",
         "kind": "fetch", "rawInput": {"query": "Welch Labs transformers"},
         "_meta": {"cognition.ai/inferenceToolName": "web_search"}});
-    let names = vec!["bash".to_string(), "web_search".to_string(), "web_fetch".to_string()];
+    let names = vec![
+        "bash".to_string(),
+        "web_search".to_string(),
+        "web_fetch".to_string(),
+    ];
     let (name, args) = redirect_call(&u, &names).unwrap();
     assert_eq!(name, "web_search");
     let parsed: Value = serde_json::from_str(&args).unwrap();
@@ -574,7 +583,10 @@ fn mcp_call_to_harness_tool_unwraps() {
             "arguments": {"command": "echo hi"}}});
     let (name, args) = redirect_call(&u, &names).unwrap();
     assert_eq!(name, "bash");
-    assert_eq!(serde_json::from_str::<Value>(&args).unwrap()["command"], "echo hi");
+    assert_eq!(
+        serde_json::from_str::<Value>(&args).unwrap()["command"],
+        "echo hi"
+    );
 
     // Stringified arguments, a different "server", another allowed tool.
     let u = json!({"title": "Calling recall from gray",

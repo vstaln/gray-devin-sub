@@ -464,7 +464,11 @@ fn mcp_redirect(input: &Value, names: &[String]) -> Option<(String, String)> {
     };
     let args = if args.is_object() { args } else { json!({}) };
     if matches!(tool, "web_fetch" | "web_search" | "webfetch") {
-        let meta = if tool == "web_search" { "web_search" } else { "webfetch" };
+        let meta = if tool == "web_search" {
+            "web_search"
+        } else {
+            "webfetch"
+        };
         let update = json!({"_meta": {"cognition.ai/inferenceToolName": meta}});
         return web_redirect(&update, &args, names);
     }
@@ -494,7 +498,10 @@ fn web_redirect(update: &Value, input: &Value, names: &[String]) -> Option<(Stri
         return Some(if has("web_search") {
             ("web_search".to_string(), json!({"query": q}).to_string())
         } else {
-            (native_name("web_search_not_enabled_for_devin"), "{}".to_string())
+            (
+                native_name("web_search_not_enabled_for_devin"),
+                "{}".to_string(),
+            )
         });
     }
     let url = url?;
@@ -520,8 +527,14 @@ fn bash_args(args_json: String, has_bash: bool) -> Option<(String, String)> {
 fn edit_redirect(input: &Value) -> Option<String> {
     let path = input.get("file_path").and_then(Value::as_str)?;
     let old_s = input.get("old_string").and_then(Value::as_str)?;
-    let new_s = input.get("new_string").and_then(Value::as_str).unwrap_or("");
-    let replace_all = input.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+    let new_s = input
+        .get("new_string")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let replace_all = input
+        .get("replace_all")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let payload = json!({
         "file_path": path, "old_string": old_s,
         "new_string": new_s, "replace_all": replace_all,
@@ -537,7 +550,10 @@ fn edit_redirect(input: &Value) -> Option<String> {
             assert c==1,f'old_string found {c} times in {p} (need exactly 1)'
             out=s.replace(o,n,1)
         open(p,'w',encoding='utf-8').write(out)";
-    Some(json!({"command": format!("python3 -c {} {}", shell_quote(script), shell_quote(&payload))}).to_string())
+    Some(
+        json!({"command": format!("python3 -c {} {}", shell_quote(script), shell_quote(&payload))})
+            .to_string(),
+    )
 }
 
 /// `write`/`create` → python3 writes the content verbatim.
@@ -548,7 +564,10 @@ fn write_redirect(input: &Value) -> Option<String> {
     let script = "import json,sys
         a=json.loads(sys.argv[1])
         open(a['file_path'],'w',encoding='utf-8').write(a['content'])";
-    Some(json!({"command": format!("python3 -c {} {}", shell_quote(script), shell_quote(&payload))}).to_string())
+    Some(
+        json!({"command": format!("python3 -c {} {}", shell_quote(script), shell_quote(&payload))})
+            .to_string(),
+    )
 }
 
 /// The call a native `tool_call` becomes when [`redirect_call`] can't map
