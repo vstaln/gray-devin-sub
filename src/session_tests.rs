@@ -268,7 +268,7 @@ fn keepalive_due_bounds_warming() {
     assert!(keepalive_due(stale, active, true));
     // Dead child → the reaper's job, not the sweep's.
     assert!(!keepalive_due(stale, active, false));
-    // User idle past the keepalive horizon → stop; the 15min reaper
+    // User idle past the keepalive horizon → stop; the idle reaper
     // takes the session anyway.
     let idle = Instant::now() - KEEPALIVE_IDLE_MAX - Duration::from_secs(1);
     assert!(!keepalive_due(stale, idle, true));

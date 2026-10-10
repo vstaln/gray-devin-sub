@@ -39,7 +39,7 @@ files, never captures tokens, and refuses to run when a conflicting
    same prefix, and the host's replay of the last answer byte-identical —
    that session gets prompted with only the delta (`[Tool result]` /
    `[User]` blocks) and ~the whole transcript is already upstream.
-   Anything else spawns a fresh `devin acp`. Sessions idle 15 min (or
+   Anything else spawns a fresh `devin acp`. Sessions idle 60 min (or
    dead) are reaped; the pool caps at 4 children.
 3. Gray's tools ride in as a text funnel contract (`​```gray_calls`
    fenced block); models that ignore it and reach for a native `exec` /

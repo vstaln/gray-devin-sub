@@ -64,7 +64,10 @@ use crate::setup;
 /// Pool bound: at most this many live `devin acp` children.
 const MAX_LIVE: usize = 4;
 /// A pooled session idle this long is closed on the next pool access.
-const IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+/// Keepalives run until then, so this is also how long a paused
+/// conversation stays cache-warm: at 15min, coming back after a coffee
+/// re-billed the whole transcript on a fresh child (measured 0% cached).
+const IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 /// How often the keepalive sweep checks pooled sessions for stale
 /// upstream contact.
 const KEEPALIVE_SWEEP: Duration = Duration::from_secs(30);
@@ -327,9 +330,11 @@ fn reap(pool: &mut Vec<LiveSession>) -> Vec<LiveSession> {
     let mut dead = Vec::new();
     let mut i = 0;
     while i < pool.len() {
-        let stale =
-            pool[i].last_used.elapsed() > IDLE_TTL || !matches!(pool[i].child.try_wait(), Ok(None));
-        if stale {
+        let idle = pool[i].last_used.elapsed() > IDLE_TTL;
+        let exited = !matches!(pool[i].child.try_wait(), Ok(None));
+        if idle || exited {
+            let why = if exited { "reap:child_exited" } else { "reap:idle" };
+            crate::chat::pool_event(why, &pool[i].session_id);
             dead.push(pool.remove(i));
         } else {
             i += 1;
@@ -425,6 +430,7 @@ pub fn give_back(s: LiveSession) {
                 .min_by_key(|(_, s)| s.last_used)
                 .map(|(i, _)| i)
                 .unwrap_or(0);
+            crate::chat::pool_event("evict:max_live", &pool.live[lru].session_id);
             dead.push(pool.live.remove(lru));
         }
         dead

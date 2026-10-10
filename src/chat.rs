@@ -1016,7 +1016,13 @@ pub(crate) fn trace_turn(
     r: Option<&TurnResult>,
     err: Option<&str>,
 ) {
-    if std::env::var_os("DEVIN_SUB_DEBUG").is_none() {
+    // Fresh spawns and failures always land in the persistent pool log:
+    // each one is a whole-transcript re-bill, and without the reason a
+    // cache miss can't be told apart from an eviction or a diverged prefix.
+    // Reuse turns (the normal case) stay behind DEVIN_SUB_DEBUG.
+    let persist = mode.starts_with("fresh") || err.is_some();
+    let debug = std::env::var_os("DEVIN_SUB_DEBUG").is_some();
+    if !persist && !debug {
         return;
     }
     let ts = std::time::SystemTime::now()
@@ -1042,7 +1048,44 @@ pub(crate) fn trace_turn(
     let line = format!(
         "{ts}\t{mode}\tsession={session_id}\tprompt_chars={prompt_chars}\tusage={usage}\tstop={stop}\n"
     );
-    let path = std::env::temp_dir().join(format!("devin-sub-{}.log", std::process::id()));
+    if persist {
+        append_pool_log(&line);
+    }
+    if debug {
+        let path = std::env::temp_dir().join(format!("devin-sub-{}.log", std::process::id()));
+        append_private(&path, &line);
+    }
+}
+
+/// One pool lifecycle line (reap/evict) in the persistent pool log: the
+/// reason a later turn finds `no_session` and spawns fresh.
+pub(crate) fn pool_event(event: &str, session_id: &str) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| format!("{}.{:03}", d.as_secs(), d.subsec_millis()))
+        .unwrap_or_default();
+    append_pool_log(&format!("{ts}\t{event}\tsession={session_id}\n"));
+}
+
+/// The persistent pool log rotates past this size (one `.1` kept).
+const POOL_LOG_MAX: u64 = 1 << 20;
+
+/// `<gray home>/devin-sub/pool.log`, pid-tagged so concurrent sidecars
+/// (one per gray process) stay distinguishable. Best-effort.
+fn append_pool_log(line: &str) {
+    let Some(dir) = gray_core::paths::gray_home().map(|h| h.join("devin-sub")) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("pool.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > POOL_LOG_MAX) {
+        let _ = std::fs::rename(&path, dir.join("pool.log.1"));
+    }
+    append_private(&path, &format!("pid={}\t{line}", std::process::id()));
+}
+
+/// Append to a 0600 file, creating it.
+fn append_private(path: &std::path::Path, line: &str) {
     let mut opts = std::fs::OpenOptions::new();
     opts.append(true).create(true);
     #[cfg(unix)]
