@@ -1,6 +1,36 @@
 use super::*;
 use serde_json::json;
 
+#[test]
+fn web_search_is_denied_only_off_the_advertised_surface() {
+    // deny_search=true: the child config kills native web_search — the
+    // model gets Devin's own denial, not a funnel-made native__ name.
+    let stage = AcpStage::make(true).unwrap();
+    let proj: Value = serde_json::from_str(
+        &std::fs::read_to_string(stage.work.join(".devin/config.json")).unwrap(),
+    )
+    .unwrap();
+    let user: Value = serde_json::from_str(
+        &std::fs::read_to_string(stage.cfg.join("config.json")).unwrap(),
+    )
+    .unwrap();
+    let deny = proj["permissions"]["deny"].as_array().unwrap();
+    assert!(deny.iter().any(|r| r == "web_search"));
+    let deny = user["permissions"]["deny"].as_array().unwrap();
+    assert!(deny.iter().any(|r| r == "web_search"));
+
+    // deny_search=false: host advertises web_search, funnel redirects it —
+    // the upstream deny would race the redirect, so it stays off.
+    let stage = AcpStage::make(false).unwrap();
+    let proj: Value = serde_json::from_str(
+        &std::fs::read_to_string(stage.work.join(".devin/config.json")).unwrap(),
+    )
+    .unwrap();
+    let deny = proj["permissions"]["deny"].as_array().unwrap();
+    assert!(!deny.iter().any(|r| r == "web_search"));
+    assert!(deny.iter().any(|r| r == "exec"));
+}
+
 fn stderr(lines: &[&str]) -> Arc<Mutex<VecDeque<String>>> {
     Arc::new(Mutex::new(
         lines.iter().map(|line| line.to_string()).collect(),

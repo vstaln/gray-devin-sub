@@ -645,6 +645,34 @@ fn namespaced_tool_name_strips_to_advertised() {
 }
 
 #[test]
+fn frame_tool_name_beats_display_title() {
+    // The request_scope probe shape: no kind, descriptive title with a
+    // path — the name must come from the frame, not the title text.
+    let u = json!({"toolCallId": "request_scope:0#abc",
+        "title": "Requested write access to /home/vstaln/gray",
+        "rawInput": {"scope": "write", "path": "/home/vstaln/gray"}});
+    let names = vec!["bash".to_string()];
+    assert!(redirect_call(&u, &names).is_none());
+    assert_eq!(blocked_call(&u).0, "native__request_scope");
+
+    // inferenceToolName carries it too (older frames without toolCallId).
+    let u = json!({"kind": "other", "title": "some display label",
+        "_meta": {"cognition.ai/inferenceToolName": "recall"}});
+    assert_eq!(blocked_call(&u).0, "native__recall");
+}
+
+#[test]
+fn frame_named_advertised_tool_executes() {
+    let names = vec!["ctx_exec".to_string()];
+    let u = json!({"toolCallId": "ctx_exec:1#f00d",
+        "title": "Ran a command", "kind": "other",
+        "rawInput": {"a": 1}});
+    let (name, args) = redirect_call(&u, &names).unwrap();
+    assert_eq!(name, "ctx_exec");
+    assert_eq!(serde_json::from_str::<Value>(&args).unwrap()["a"], 1);
+}
+
+#[test]
 fn mcp_call_to_harness_tool_unwraps() {
     let names = vec!["bash".to_string(), "recall".to_string()];
     let u = json!({"kind": "other", "title": "Calling bash from harness",

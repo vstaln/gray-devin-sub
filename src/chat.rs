@@ -448,7 +448,8 @@ pub(crate) fn redirect_call(update: &Value, names: &[String]) -> Option<(String,
         // the model meant even when rawInput doesn't carry tool_name.
         // When the title says nothing either, the payload itself still
         // does — "Wrote /x" with {file_path, content} is a write.
-        _ => title_call(update, input, names)
+        _ => name_call(update, input, names)
+            .or_else(|| title_call(update, input, names))
             .or_else(|| shape_call(update, input, names)),
     }
 }
@@ -488,6 +489,44 @@ fn shape_call(update: &Value, input: &Value, names: &[String]) -> Option<(String
     None
 }
 
+/// The native tool a `tool_call` update was for, from the frame itself:
+/// `_meta.inferenceToolName`, else the `name:` prefix of toolCallId
+/// ("web_search:1#db12" -> web_search). Always the stable tool name —
+/// never the display title, so paths and queries can't leak into
+/// blocked-call names (`request_scope` titles carry the target path).
+fn native_tool_name(update: &Value) -> Option<String> {
+    if let Some(t) = update
+        .pointer("/_meta/cognition.ai~1inferenceToolName")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+    {
+        return Some(t.to_string());
+    }
+    update
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .and_then(|id| id.split_once(':').map(|(t, _)| t))
+        .filter(|t| t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .map(String::from)
+}
+
+/// Resolve a reached-for tool name: web tools route through web_redirect,
+/// advertised names execute, namespaced names strip down.
+fn resolve_tool(
+    tool: &str,
+    update: &Value,
+    input: &Value,
+    names: &[String],
+) -> Option<(String, String)> {
+    if matches!(tool, "web_search" | "web_fetch" | "webfetch") {
+        return web_redirect(update, input, names);
+    }
+    if names.iter().any(|n| n == tool) {
+        return Some((tool.to_string(), input.to_string()));
+    }
+    denamespace(tool, names).map(|t| (t, input.to_string()))
+}
+
 /// The tool a native update was reaching for, parsed out of its title.
 /// "Calling ctx_exec from apify" -> ctx_exec; "mcp__srv__tool" -> tool;
 /// anything else -> None.
@@ -523,14 +562,12 @@ fn title_tool(update: &Value) -> Option<String> {
 /// args — a shape mismatch surfaces as the tool's own error, which still
 /// teaches more than a dead-end rejection.
 fn title_call(update: &Value, input: &Value, names: &[String]) -> Option<(String, String)> {
-    let tool = title_tool(update)?;
-    if matches!(tool.as_str(), "web_search" | "web_fetch" | "webfetch") {
-        return web_redirect(update, input, names);
-    }
-    if names.iter().any(|n| n == &tool) {
-        return Some((tool, input.to_string()));
-    }
-    denamespace(&tool, names).map(|t| (t, input.to_string()))
+    resolve_tool(&title_tool(update)?, update, input, names)
+}
+
+/// Frame-named call: the update carries the stable tool name outright.
+fn name_call(update: &Value, input: &Value, names: &[String]) -> Option<(String, String)> {
+    resolve_tool(&native_tool_name(update)?, update, input, names)
 }
 
 /// "plugin_ctx_exec" / "harness_bash": the model namespaces an advertised
@@ -678,7 +715,8 @@ fn write_redirect(input: &Value) -> Option<String> {
 /// result that names the true surface and keeps the turn alive; a dropped
 /// native call is how turns end dead text-only.
 pub(crate) fn blocked_call(update: &Value) -> (String, String) {
-    let raw = title_tool(update)
+    let raw = native_tool_name(update)
+        .or_else(|| title_tool(update))
         .or_else(|| update.get("kind").and_then(Value::as_str).map(String::from))
         .or_else(|| update.get("title").and_then(Value::as_str).map(String::from))
         .unwrap_or_else(|| "tool_call".to_string());

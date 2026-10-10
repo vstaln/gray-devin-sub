@@ -107,7 +107,19 @@ const DENY_RULES: &[&str] = &[
     "exec",
     "Fetch(domain:*)",
     "mcp__*",
+    // Asks the user for directory access — impossible over the relay
+    // (session/request_permission is always cancelled), so deny it up
+    // front rather than let the call surface as a native__ dead end.
+    "request_scope",
 ];
+
+/// Added when the host surface has no `web_search`: deny the native tool
+/// upstream so the model gets Devin's own "denied by rule" answer instead
+/// of reaching it, the funnel catching the tool_call update, and the host
+/// returning a made-up `native__web_search_not_enabled_for_devin` error
+/// the model retries past. When the host DOES advertise web_search the
+/// rule stays off and the funnel redirect keeps serving the call.
+const DENY_SEARCH_RULE: &str = "web_search";
 
 /// Process-wide staging: one scratch cwd + generated user config shared by
 /// every pooled child, created lazily on first spawn and removed by
@@ -120,10 +132,10 @@ struct AcpStage {
     _cfg_dir: tempfile::TempDir,
 }
 
-static STAGE: OnceLock<AcpStage> = OnceLock::new();
+static STAGE: [OnceLock<AcpStage>; 2] = [OnceLock::new(), OnceLock::new()];
 
 impl AcpStage {
-    fn make() -> Result<Self, String> {
+    fn make(deny_search: bool) -> Result<Self, String> {
         let work_dir = tempfile::Builder::new()
             .prefix("devin-sub-work-")
             .tempdir()
@@ -138,9 +150,13 @@ impl AcpStage {
         // (the user-config deny alone does not).
         let proj = work.join(".devin");
         std::fs::create_dir_all(&proj).map_err(|e| format!("staging dir: {e}"))?;
+        let mut deny: Vec<&str> = DENY_RULES.to_vec();
+        if deny_search {
+            deny.push(DENY_SEARCH_RULE);
+        }
         std::fs::write(
             proj.join("config.json"),
-            json!({"permissions": {"deny": DENY_RULES}}).to_string(),
+            json!({"permissions": {"deny": deny}}).to_string(),
         )
         .map_err(|e| format!("staging config: {e}"))?;
         // User config: no MCP servers, rules, skills, subagents, auto-update
@@ -156,7 +172,7 @@ impl AcpStage {
                     "agents_standard": false, "cursor": false, "windsurf": false,
                     "claude": false, "copilot": false, "opencode": false, "zed": false,
                 },
-                "permissions": {"deny": DENY_RULES, "allow": [], "ask": []},
+                "permissions": {"deny": deny, "allow": [], "ask": []},
             })
             .to_string(),
         )
@@ -175,13 +191,15 @@ impl AcpStage {
     }
 }
 
-/// The one stage every child in this sidecar process uses.
-fn stage() -> Result<&'static AcpStage, String> {
-    if let Some(s) = STAGE.get() {
+/// The stage for this surface variant — pooled children group by whether
+/// native web_search is denied, since the generated config bakes it in.
+fn stage(deny_search: bool) -> Result<&'static AcpStage, String> {
+    let slot = &STAGE[deny_search as usize];
+    if let Some(s) = slot.get() {
         return Ok(s);
     }
-    let made = AcpStage::make()?;
-    Ok(STAGE.get_or_init(|| made))
+    let made = AcpStage::make(deny_search)?;
+    Ok(slot.get_or_init(|| made))
 }
 
 /// One live `devin acp` child + ACP session, with the replay state needed
@@ -484,8 +502,10 @@ pub fn shutdown() {
     for s in dead {
         s.close();
     }
-    if let Some(stage) = STAGE.get() {
-        stage.remove();
+    for slot in &STAGE {
+        if let Some(stage) = slot.get() {
+            stage.remove();
+        }
     }
 }
 
@@ -497,7 +517,7 @@ pub fn spawn(
     cancel: &AtomicBool,
 ) -> Result<LiveSession, String> {
     let binary = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
-    let stage = stage()?;
+    let stage = stage(!turn.names.iter().any(|n| n == "web_search"))?;
     let mut child = Command::new(&binary)
         .args([
             "--config",
