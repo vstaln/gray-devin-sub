@@ -344,7 +344,10 @@ fn funnel_contract(tool_specs: &[String]) -> String {
 /// The closing fence is optional: SWE models often terminate the call
 /// list with their native pipe-delimited tool markup instead of ``` — or
 /// emit no close at all. In both cases the JSON array still leads the
-/// tail, so a prefix parse recovers it and the markup is dropped.
+/// tail, so a prefix parse recovers it and the markup is dropped. The
+/// array is parsed from the whole tail, never cut at the first closing
+/// fence: a command may carry its own fence (a heredoc writing markdown).
+/// A strict parse that fails gets one retry through [`repair_json`].
 pub fn parse_calls_block(text: &str, names: &[String]) -> Option<(String, Vec<(String, String)>)> {
     const FENCE: &str = "```gray_calls";
     // Scan occurrences last-to-first; the first real block wins. A real
@@ -353,7 +356,7 @@ pub fn parse_calls_block(text: &str, names: &[String]) -> Option<(String, Vec<(S
     // explanation is prose about the funnel, not a call, so it stays in
     // the text where the host's leaked-markup nudge can answer it.
     let mut search_from = text.len();
-    let (start, candidate) = loop {
+    let (start, candidate, tail) = loop {
         let idx = text[..search_from].rfind(FENCE)?;
         let after = &text[idx + FENCE.len()..];
         let info_ends = after.is_empty() || after.starts_with('\n');
@@ -363,7 +366,7 @@ pub fn parse_calls_block(text: &str, names: &[String]) -> Option<(String, Vec<(S
         }
         .trim();
         if info_ends && body.starts_with('[') {
-            break (idx, body);
+            break (idx, body, after.trim_start());
         }
         search_from = idx;
     };
@@ -376,7 +379,9 @@ pub fn parse_calls_block(text: &str, names: &[String]) -> Option<(String, Vec<(S
         })
         .or(names.first())
         .map_or("gray_calls", String::as_str);
-    let calls: Vec<(String, String)> = match json_array_prefix(candidate) {
+    let calls: Vec<(String, String)> = match json_array_prefix(tail)
+        .or_else(|| json_array_prefix(&repair_json(tail)))
+    {
         Some(arr) => arr
             .iter()
             .map(|c| {
@@ -407,6 +412,42 @@ fn json_array_prefix(s: &str) -> Option<Vec<Value>> {
         .into_iter::<Vec<Value>>()
         .next()?
         .ok()
+}
+
+/// Undo the slips models make inside JSON strings: raw control characters
+/// (a heredoc's literal newlines and tabs) get escaped, and escapes JSON
+/// doesn't define (a shell dollar, a regex digit class) keep their
+/// backslash as a literal one. Structure is never touched.
+fn repair_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut chars = s.chars().peekable();
+    let mut in_str = false;
+    while let Some(c) = chars.next() {
+        if !in_str {
+            in_str = c == '"';
+            out.push(c);
+            continue;
+        }
+        match c {
+            '"' => {
+                in_str = false;
+                out.push(c);
+            }
+            '\\' => match chars.peek() {
+                Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') => {
+                    out.push(c);
+                    out.extend(chars.next());
+                }
+                _ => out.push_str("\\\\"),
+            },
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Redirect a native `tool_call` notification onto a host tool — `bash` for

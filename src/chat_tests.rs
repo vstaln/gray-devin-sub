@@ -709,3 +709,30 @@ fn mcp_call_web_fetch_falls_back_to_curl_and_foreign_tools_stay_blocked() {
             "arguments": {}}});
     assert!(redirect_call(&u, &names).is_none());
 }
+
+#[test]
+fn funnel_parse_fence_inside_a_command_survives() {
+    // A heredoc writing markdown carries its own fence: the body used to
+    // be cut there, leaving half an array that fell through as raw args.
+    let fence = "`".repeat(3);
+    let cmd = format!("cat > d.md <<'EOF'\n{fence}rust\nfn x() {{}}\n{fence}\nEOF");
+    let call = json!([{"name": "bash", "arguments": {"command": cmd}}]);
+    let text = format!("writing it\n{fence}gray_calls\n{call}\n{fence}");
+    let (before, calls) = parse_calls_block(&text, &["bash".to_string()]).unwrap();
+    assert_eq!(before, "writing it");
+    assert_eq!(calls.len(), 1);
+    let args: Value = serde_json::from_str(&calls[0].1).unwrap();
+    assert_eq!(args["command"], cmd.as_str());
+}
+
+#[test]
+fn funnel_parse_repairs_raw_newlines_and_shell_escapes() {
+    // Literal newlines/tabs in a heredoc and shell or regex escapes JSON
+    // doesn't define used to bounce the whole call.
+    let fence = "`".repeat(3);
+    let body = "[{\"name\":\"bash\",\"arguments\":{\"command\":\"echo \\$HOME\n\tgrep '\\d+'\"}}]";
+    let text = format!("{fence}gray_calls\n{body}\n{fence}");
+    let (_, calls) = parse_calls_block(&text, &["bash".to_string()]).unwrap();
+    let args: Value = serde_json::from_str(&calls[0].1).unwrap();
+    assert_eq!(args["command"], "echo \\$HOME\n\tgrep '\\d+'");
+}
