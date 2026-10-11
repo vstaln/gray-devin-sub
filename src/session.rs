@@ -71,9 +71,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::chat::{
-    PreparedTurn, TurnResult, Usage, blocked_call, continuation, parse_calls_block, rand_hex,
-    redirect_call, usage_from,
+    CUT_NOTE, PreparedTurn, TurnResult, Usage, blocked_call, continuation, parse_calls_block,
+    rand_hex, redirect_call, usage_from,
 };
+use crate::guard::{TurnGuard, marker_name, strip_reasoning};
 use crate::setup;
 
 /// Pool bound: at most this many live `devin acp` children.
@@ -341,6 +342,8 @@ pub struct LiveSession {
     thought: String,
     /// Native tool_call notifications redirected onto bash (name, args-json).
     redirected: Vec<(String, String)>,
+    guard: TurnGuard,
+    prior_cut: bool,
     /// Last `usage_update` snapshot for the in-flight prompt.
     usage: Usage,
     names: Vec<String>,
@@ -760,7 +763,8 @@ pub(crate) fn persisted_rejections(turn: &PreparedTurn) -> String {
     }
     let now = unix_now();
     let max_age = reload_max_age().as_secs();
-    let (mut owner_alive, mut too_old, mut model, mut system, mut no_continuation) = (0, 0, 0, 0, 0);
+    let (mut owner_alive, mut too_old, mut model, mut system, mut no_continuation) =
+        (0, 0, 0, 0, 0);
     for p in &records {
         if pid_alive(p.owner_pid) {
             owner_alive += 1;
@@ -1046,6 +1050,8 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         thought: String::new(),
         text_boundary: false,
         redirected: Vec::new(),
+        guard: TurnGuard::default(),
+        prior_cut: false,
         usage: Usage::default(),
         names: turn.names.clone(),
         keepalive_prompt: false,
@@ -1156,6 +1162,7 @@ impl LiveSession {
         self.text_boundary = false;
         self.thought.clear();
         self.redirected.clear();
+        self.guard = TurnGuard::default();
         self.usage = Usage::default();
         self.names = names.to_vec();
         self.keepalive_prompt = text == KEEPALIVE_TEXT;
@@ -1196,7 +1203,7 @@ impl LiveSession {
         // identical retry instead of folding an empty reply into
         // history. Keepalives ask for a near-empty reply by design and
         // never take this branch.
-        if stop_reason == "end_turn"
+        if (stop_reason == "end_turn" || self.guard.cut().is_some())
             && !self.keepalive_prompt
             && self.text.trim().is_empty()
             && self.thought.trim().is_empty()
@@ -1383,7 +1390,11 @@ impl LiveSession {
             return;
         }
         let update = &line["params"]["update"];
-        match update.get("sessionUpdate").and_then(Value::as_str) {
+        let kind = update.get("sessionUpdate").and_then(Value::as_str);
+        if self.guard.cut().is_some() && kind != Some("usage_update") {
+            return;
+        }
+        match kind {
             Some("agent_message_chunk") => {
                 if let Some(t) = update.pointer("/content/text").and_then(Value::as_str) {
                     if self.text_boundary
@@ -1395,6 +1406,9 @@ impl LiveSession {
                     }
                     self.text_boundary = false;
                     self.text.push_str(t);
+                    if let Some(m) = self.guard.feed(&mut self.text) {
+                        self.on_cut(m);
+                    }
                 }
             }
             Some("agent_thought_chunk") => {
@@ -1432,6 +1446,34 @@ impl LiveSession {
             _ => {
                 self.text_boundary = true;
             }
+        }
+    }
+
+    fn on_cut(&mut self, marker: &str) {
+        let at = self.text.len();
+        crate::chat::pool_event(
+            &format!("turn_cut:{}\tat={at}", marker_name(marker)),
+            &self.session_id,
+        );
+        eprintln!(
+            "devin-sub: reply cut at fabricated {} record (offset {at}); upstream cancelled",
+            marker_name(marker)
+        );
+        if !self.keepalive_prompt {
+            self.prior_cut = true;
+        }
+        if self.redirected.is_empty() {
+            let _ = self.send(&json!({"jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {"sessionId": self.session_id}}));
+        }
+    }
+
+    pub(crate) fn note_cut(&mut self, delta: String) -> String {
+        if std::mem::take(&mut self.prior_cut) {
+            format!("{CUT_NOTE}\n\n{delta}")
+        } else {
+            delta
         }
     }
 
@@ -1567,6 +1609,7 @@ impl LiveSession {
                 None => Vec::new(),
             }
         };
+        let text = strip_reasoning(&text).trim().to_string();
         let calls: Vec<(String, String, String)> = calls
             .into_iter()
             .enumerate()

@@ -113,6 +113,8 @@ fn stub_session() -> LiveSession {
         text_boundary: false,
         thought: String::new(),
         redirected: Vec::new(),
+        guard: crate::guard::TurnGuard::default(),
+        prior_cut: false,
         usage: Usage::default(),
         names: Vec::new(),
         keepalive_prompt: false,

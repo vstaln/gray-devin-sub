@@ -321,7 +321,10 @@ fn funnel_contract(tool_specs: &[String]) -> String {
         to be woken when it finishes, `tail` its log to peek, `kill -- -<pgid>` to stop it; \
         otherwise reply with no block. \
         Later messages in this conversation come from the harness: tool results \
-        arrive as `[Tool result id=…]` blocks and new user input as `[User]` blocks.",
+        arrive as `[Tool result id=…]` blocks and new user input as `[User]` blocks.\n\
+        You write exactly ONE assistant turn. Never write `[User]`, `[Tool result …]` or any other \
+        transcript record yourself; tool results only come from the harness. Never claim a command \
+        ran unless its `[Tool result]` is in the transcript.",
     );
     s.push_str("\n\nHarness tools:\n");
     if tool_specs.is_empty() {
@@ -831,6 +834,8 @@ fn assistant_side(item: &Value) -> bool {
 /// the host.
 pub(crate) const UNDELIVERED_NOTE: &str = "[Harness note] Your previous reply was interrupted by the user and never delivered; none of its tool calls ran.";
 
+pub(crate) const CUT_NOTE: &str = "[Harness note] Your previous reply was cut where you started writing a transcript record yourself; everything from that point on was discarded, never delivered, and none of it ran. Write exactly one assistant turn.";
+
 /// Strict-continuation check: `input` is `absorbed` plus the echo of the
 /// session's own last answer plus a non-assistant tail. Returns the tail
 /// rendered to transcript text — the only thing the session still needs
@@ -999,6 +1004,7 @@ pub fn run_turn(
     };
     let mut s = match claimed {
         Some((mut s, delta)) => {
+            let delta = s.note_cut(delta);
             let images = images_of(&turn.input[s.absorbed.len()..]);
             match s.send_prompt(&delta, &images, &turn.names) {
                 Ok(id) => {
