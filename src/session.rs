@@ -499,7 +499,7 @@ pub(crate) fn reload_candidates(
             Some((p, delta))
         })
         .collect();
-    out.sort_by(|a, b| b.0.last_prompt_unix.cmp(&a.0.last_prompt_unix));
+    out.sort_by_key(|e| std::cmp::Reverse(e.0.last_prompt_unix));
     out
 }
 

@@ -87,11 +87,6 @@ pub fn auth_status_verdict(exit_ok: bool, output: &str) -> LoginState {
     }
 }
 
-/// Probe login state with `devin auth status` (8s cap; output captured and
-/// never echoed — it may carry account details).
-/// * exit 0 + "logged in" text → logged in.
-/// * exit 0 without the phrase, or nonzero → logged out.
-/// * spawn failure / timeout → `Unknown`.
 /// `devin auth status` with the same spawn hygiene as [`probe_login`],
 /// returning the verdict plus the captured output for callers that can
 /// parse account lines out of it (`/devin status`).
@@ -141,6 +136,11 @@ pub fn auth_status_output() -> (LoginState, Option<String>) {
     (auth_status_verdict(status.success(), &buf), Some(buf))
 }
 
+/// Probe login state with `devin auth status` (8s cap; output captured and
+/// never echoed — it may carry account details).
+/// * exit 0 + "logged in" text → logged in.
+/// * exit 0 without the phrase, or nonzero → logged out.
+/// * spawn failure / timeout → `Unknown`.
 pub fn probe_login() -> LoginState {
     auth_status_output().0
 }

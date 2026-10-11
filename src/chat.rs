@@ -370,8 +370,7 @@ pub fn parse_calls_block(text: &str, names: &[String]) -> Option<(String, Vec<(S
             // (a command grepping for the funnel's own marker) must not cut
             // the block short. Only an array that fails to parse falls back
             // to the fence-delimited text, for the guess path below.
-            let parsed =
-                json_array_prefix(body).or_else(|| json_array_prefix(&repair_json(body)));
+            let parsed = json_array_prefix(body).or_else(|| json_array_prefix(&repair_json(body)));
             let body = if parsed.is_some() {
                 body
             } else {
@@ -631,10 +630,10 @@ fn name_call(update: &Value, input: &Value, names: &[String]) -> Option<(String,
 /// to native__.
 fn denamespace(name: &str, names: &[String]) -> Option<String> {
     for pre in ["plugin_", "harness_", "gray_"] {
-        if let Some(rest) = name.strip_prefix(pre) {
-            if names.iter().any(|n| n == rest) {
-                return Some(rest.to_string());
-            }
+        if let Some(rest) = name.strip_prefix(pre)
+            && names.iter().any(|n| n == rest)
+        {
+            return Some(rest.to_string());
         }
     }
     None
