@@ -92,9 +92,12 @@ pub fn auth_status_verdict(exit_ok: bool, output: &str) -> LoginState {
 /// * exit 0 + "logged in" text → logged in.
 /// * exit 0 without the phrase, or nonzero → logged out.
 /// * spawn failure / timeout → `Unknown`.
-pub fn probe_login() -> LoginState {
+/// `devin auth status` with the same spawn hygiene as [`probe_login`],
+/// returning the verdict plus the captured output for callers that can
+/// parse account lines out of it (`/devin status`).
+pub fn auth_status_output() -> (LoginState, Option<String>) {
     let Some(binary) = resolve_command() else {
-        return LoginState::Unknown;
+        return (LoginState::Unknown, None);
     };
     let mut child = match std::process::Command::new(&binary)
         .args(["auth", "status"])
@@ -108,7 +111,7 @@ pub fn probe_login() -> LoginState {
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return LoginState::Unknown,
+        Err(_) => return (LoginState::Unknown, None),
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     let status = loop {
@@ -124,7 +127,7 @@ pub fn probe_login() -> LoginState {
     let Some(status) = status else {
         let _ = child.kill();
         let _ = child.wait();
-        return LoginState::Unknown;
+        return (LoginState::Unknown, None);
     };
     let mut buf = String::new();
     if let Some(mut out) = child.stdout.take() {
@@ -135,7 +138,11 @@ pub fn probe_login() -> LoginState {
         use std::io::Read;
         let _ = err.read_to_string(&mut buf);
     }
-    auth_status_verdict(status.success(), &buf)
+    (auth_status_verdict(status.success(), &buf), Some(buf))
+}
+
+pub fn probe_login() -> LoginState {
+    auth_status_output().0
 }
 
 #[path = "setup_tests.rs"]

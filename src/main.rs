@@ -73,6 +73,34 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => {}
     }
+    // Drop persisted pool records too old for any reattach to pay off.
+    devin_sub::session::prune_persisted();
+    // Sweep orphaned `/tmp/devin-sub-cfg-*` dirs left by sidecars that
+    // died ungracefully (TempDir drop never ran). `session::IDLE_TTL`
+    // reaps every pooled child, so a dir older than twice that cannot
+    // belong to a live `devin acp` — delete-only-the-clearly-dead.
+    std::thread::spawn(|| {
+        let tmp = std::env::temp_dir();
+        let cutoff = std::time::SystemTime::now()
+            - (devin_sub::session::IDLE_TTL * 2 + std::time::Duration::from_secs(300));
+        if let Ok(rd) = std::fs::read_dir(&tmp) {
+            for e in rd.flatten() {
+                let name = e.file_name();
+                if !name.to_string_lossy().starts_with("devin-sub-cfg-") {
+                    continue;
+                }
+                let stale = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .map(|m| m < cutoff)
+                    .unwrap_or(false);
+                if stale {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        }
+    });
+
     let relays: Relays = Arc::new(Mutex::new(HashMap::new()));
     let mut lines =
         tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(tokio::io::stdin()));
@@ -204,6 +232,9 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
                         .collect()
                 })
                 .unwrap_or_default();
+            if argv.first().map(String::as_str) == Some("status") {
+                return Ok(json!({"text": devin_sub::status::text()}));
+            }
             manifest::run_command(name, &argv)
                 .ok_or_else(|| ProviderRpcError::Protocol("unknown command".into()))
         }

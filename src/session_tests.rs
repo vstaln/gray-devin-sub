@@ -10,10 +10,9 @@ fn web_search_is_denied_only_off_the_advertised_surface() {
         &std::fs::read_to_string(stage.work.join(".devin/config.json")).unwrap(),
     )
     .unwrap();
-    let user: Value = serde_json::from_str(
-        &std::fs::read_to_string(stage.cfg.join("config.json")).unwrap(),
-    )
-    .unwrap();
+    let user: Value =
+        serde_json::from_str(&std::fs::read_to_string(stage.cfg.join("config.json")).unwrap())
+            .unwrap();
     let deny = proj["permissions"]["deny"].as_array().unwrap();
     assert!(deny.iter().any(|r| r == "web_search"));
     let deny = user["permissions"]["deny"].as_array().unwrap();
@@ -117,6 +116,7 @@ fn stub_session() -> LiveSession {
         usage: Usage::default(),
         names: Vec::new(),
         keepalive_prompt: false,
+        loading: false,
     }
 }
 
@@ -270,7 +270,7 @@ fn keepalive_due_bounds_warming() {
     assert!(!keepalive_due(stale, active, false));
     // User idle past the keepalive horizon → stop; the idle reaper
     // takes the session anyway.
-    let idle = Instant::now() - KEEPALIVE_IDLE_MAX - Duration::from_secs(1);
+    let idle = Instant::now() - keepalive_idle_max() - Duration::from_secs(1);
     assert!(!keepalive_due(stale, idle, true));
 }
 
@@ -596,4 +596,163 @@ fn a_thought_only_turn_is_not_flagged_empty() {
     assert_eq!(r.thought, "hmm");
     let _ = s.child.kill();
     let _ = s.child.wait();
+}
+
+fn record(session_id: &str, model: &str, owner_pid: u32, last_prompt_unix: u64) -> Persisted {
+    Persisted {
+        session_id: session_id.to_string(),
+        native_model: model.to_string(),
+        system: "sys".to_string(),
+        absorbed: vec![json!({"role": "user", "content": "hi"})],
+        reply_call_ids: Vec::new(),
+        reply_text: "answer".to_string(),
+        last_used_unix: last_prompt_unix,
+        last_prompt_unix,
+        owner_pid,
+    }
+}
+
+fn continued() -> Vec<Value> {
+    vec![
+        json!({"role": "user", "content": "hi"}),
+        json!({"role": "assistant", "content": "answer"}),
+        json!({"role": "user", "content": "more"}),
+    ]
+}
+
+#[test]
+fn reload_candidates_take_only_orphaned_fresh_matching_continuations() {
+    let now = 10_000;
+    let max_age = Duration::from_secs(30 * 60);
+    let dead = |_: u32| false;
+    let next = turn("m", continued());
+
+    // The plain case: dead owner, young, same model/system, strict
+    // continuation -> one candidate carrying the delta.
+    let got = reload_candidates(
+        vec![record("a", "m", 1, now - 60)],
+        &next,
+        now,
+        max_age,
+        &dead,
+    );
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0.session_id, "a");
+    assert!(
+        got[0].1.contains("more"),
+        "delta is the new tail: {}",
+        got[0].1
+    );
+
+    // A live owner still holds the session: never load out from under it.
+    let alive = |pid: u32| pid == 1;
+    assert!(
+        reload_candidates(
+            vec![record("a", "m", 1, now - 60)],
+            &next,
+            now,
+            max_age,
+            &alive
+        )
+        .is_empty()
+    );
+
+    // Past max_age the cache is cold: a load buys nothing over fresh.
+    let old = record("a", "m", 1, now - max_age.as_secs() - 1);
+    assert!(reload_candidates(vec![old], &next, now, max_age, &dead).is_empty());
+    let edge = record("a", "m", 1, now - max_age.as_secs());
+    assert_eq!(
+        reload_candidates(vec![edge], &next, now, max_age, &dead).len(),
+        1
+    );
+
+    // Other model or other system text: not this conversation's child.
+    assert!(
+        reload_candidates(
+            vec![record("a", "other", 1, now - 60)],
+            &next,
+            now,
+            max_age,
+            &dead
+        )
+        .is_empty()
+    );
+    let mut sys = record("a", "m", 1, now - 60);
+    sys.system = "other sys".to_string();
+    assert!(reload_candidates(vec![sys], &next, now, max_age, &dead).is_empty());
+
+    // Not a strict continuation (the echo differs): skipped.
+    let mut echo = record("a", "m", 1, now - 60);
+    echo.reply_text = "something else".to_string();
+    assert!(reload_candidates(vec![echo], &next, now, max_age, &dead).is_empty());
+
+    // Several qualify: newest upstream contact first.
+    let got = reload_candidates(
+        vec![
+            record("older", "m", 1, now - 300),
+            record("newer", "m", 2, now - 30),
+        ],
+        &next,
+        now,
+        max_age,
+        &dead,
+    );
+    assert_eq!(
+        got.iter()
+            .map(|(p, _)| p.session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["newer", "older"]
+    );
+}
+
+#[test]
+fn persisted_record_round_trips_and_mirrors_live_state() {
+    let mut s = stub_session();
+    s.session_id = "s-persist".to_string();
+    s.native_model = "m".to_string();
+    // Never prompted: nothing upstream worth a record.
+    assert!(s.persisted().is_none());
+    s.absorb(
+        &turn("m", vec![json!({"role": "user", "content": "hi"})]),
+        &answered("answer"),
+    );
+    let p = s.persisted().expect("a prompted session persists");
+    assert_eq!(p.session_id, "s-persist");
+    assert_eq!(p.native_model, "m");
+    assert_eq!(p.system, "sys");
+    assert_eq!(p.absorbed, vec![json!({"role": "user", "content": "hi"})]);
+    assert_eq!(p.reply_text, "answer");
+    assert_eq!(p.owner_pid, std::process::id());
+    assert!(unix_now() - p.last_prompt_unix <= 1);
+    let back: Persisted = serde_json::from_slice(&serde_json::to_vec(&p).unwrap()).unwrap();
+    assert_eq!(back, p);
+    // Our own pid counts as a live owner: a record we wrote for a session
+    // currently out of our pool is never reloaded into a second child.
+    assert!(pid_alive(std::process::id()));
+    // What the record says this conversation continues with is exactly
+    // what the live pool would have said.
+    let next = turn("m", continued());
+    let got = reload_candidates(
+        vec![back],
+        &next,
+        unix_now(),
+        Duration::from_secs(60),
+        &|_| false,
+    );
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        got[0].1,
+        continuation(&s.absorbed, &s.reply_call_ids, &s.reply_text, &next.input).unwrap()
+    );
+    s.close();
+}
+
+#[test]
+fn usage_limit_errors_are_the_ones_not_worth_retrying() {
+    assert!(is_usage_limit(
+        "Devin usage limit reached: Reached free model rate limit. Please switch"
+    ));
+    assert!(is_usage_limit("HTTP 429 Too Many Requests"));
+    assert!(!is_usage_limit("prompt timed out after 60s"));
+    assert!(!is_usage_limit("child exited"));
 }

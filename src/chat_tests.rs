@@ -529,15 +529,34 @@ fn funnel_parse_empty_array_is_a_plain_answer() {
 
 #[test]
 fn blocked_call_echoes_native_name_prefixed() {
+    // bash-less surface: the `native__` fold names what was reached for.
     let u = json!({"title": "mcp__rea__binary_session", "kind": "other"});
-    assert_eq!(blocked_call(&u).0, "native__binary_session");
+    assert_eq!(blocked_call(&u, &[]).0, "native__binary_session");
     // unparseable titles fall through to kind — arg-leaking labels like
     // native__Searched_web_for__Welch_Labs__transformers are gone
     let u = json!({"title": "Searched web for 'x'", "kind": "other"});
-    assert_eq!(blocked_call(&u).0, "native__other");
+    assert_eq!(blocked_call(&u, &[]).0, "native__other");
     let u = json!({"kind": "edit"});
-    assert_eq!(blocked_call(&u).0, "native__edit");
-    assert_eq!(blocked_call(&json!({})).0, "native__tool_call");
+    assert_eq!(blocked_call(&u, &[]).0, "native__edit");
+    assert_eq!(blocked_call(&json!({}), &[]).0, "native__tool_call");
+}
+
+#[test]
+fn blocked_call_lands_on_self_explaining_bash_echo() {
+    let names = vec!["bash".to_string()];
+    let u = json!({"toolCallId": "request_scope:0#abc",
+        "title": "Requested write access to /home/vstaln/gray",
+        "rawInput": {"scope": "write", "path": "/home/vstaln/gray"}});
+    let (name, args) = blocked_call(&u, &names);
+    assert_eq!(name, "bash");
+    let cmd = serde_json::from_str::<Value>(&args).unwrap()["command"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(cmd.contains("request_scope"), "{cmd}");
+    assert!(cmd.contains("disabled built-in tool"), "{cmd}");
+    // The echo must never leak the title's target path.
+    assert!(!cmd.contains("/home/vstaln/gray"), "{cmd}");
 }
 
 // Real `devin acp` shapes (probed): search AND fetch both arrive as
@@ -590,11 +609,13 @@ fn title_named_call_redirects_to_advertised_tool() {
     assert_eq!(name, "ctx_exec");
     assert_eq!(serde_json::from_str::<Value>(&args).unwrap()["a"], 1);
 
-    // a tool that is NOT advertised keeps failing closed, cleanly named
+    // a tool that is NOT advertised lands on the self-explaining echo
     let u = json!({"kind": "other", "title": "Calling recall from gray",
         "rawInput": {}});
     assert!(redirect_call(&u, &names).is_none());
-    assert_eq!(blocked_call(&u).0, "native__recall");
+    let (n, a) = blocked_call(&u, &names);
+    assert_eq!(n, "bash");
+    assert!(a.contains("recall"), "{a}");
 }
 
 #[test]
@@ -653,12 +674,16 @@ fn frame_tool_name_beats_display_title() {
         "rawInput": {"scope": "write", "path": "/home/vstaln/gray"}});
     let names = vec!["bash".to_string()];
     assert!(redirect_call(&u, &names).is_none());
-    assert_eq!(blocked_call(&u).0, "native__request_scope");
+    let (n, a) = blocked_call(&u, &names);
+    assert_eq!(n, "bash");
+    assert!(a.contains("request_scope"), "{a}");
+    // and without bash on the surface it still names the blocked call
+    assert_eq!(blocked_call(&u, &[]).0, "native__request_scope");
 
     // inferenceToolName carries it too (older frames without toolCallId).
     let u = json!({"kind": "other", "title": "some display label",
         "_meta": {"cognition.ai/inferenceToolName": "recall"}});
-    assert_eq!(blocked_call(&u).0, "native__recall");
+    assert_eq!(blocked_call(&u, &[]).0, "native__recall");
 }
 
 #[test]
@@ -708,4 +733,22 @@ fn mcp_call_web_fetch_falls_back_to_curl_and_foreign_tools_stay_blocked() {
         "rawInput": {"server_name": "apify", "tool_name": "fetch_actor_details",
             "arguments": {}}});
     assert!(redirect_call(&u, &names).is_none());
+}
+
+/// The funnel's own marker inside a call string (a command grepping for
+/// it) used to close the block early and hand truncated text to `bash`.
+#[test]
+fn a_fence_inside_a_call_string_does_not_close_the_block() {
+    let f = "```";
+    let names = vec!["bash".to_string()];
+    let text = format!(
+        "Looking.\n\n{f}gray_calls\n[{{\"name\":\"bash\",\"arguments\":{{\"command\":\"grep -c '{f}gray_calls' x.rs\"}}}}]\n{f}"
+    );
+    let (before, calls) = crate::chat::parse_calls_block(&text, &names).expect("parses");
+    assert_eq!(before, "Looking.");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "bash");
+    let args: serde_json::Value =
+        serde_json::from_str(&calls[0].1).expect("arguments stay a JSON object");
+    assert!(args["command"].as_str().unwrap().contains("grep -c"));
 }

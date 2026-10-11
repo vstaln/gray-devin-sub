@@ -110,11 +110,41 @@ pub fn start_turn_server(
 }
 
 const MAX_BODY: usize = 256 << 20;
+/// After the single admission the socket only exists to deny stragglers:
+/// native retries must see a 400, not a hang. A grace window covers them,
+/// then the listener drops and the thread exits — an unbounded accept loop
+/// leaks a thread (and its ~2MiB stack) for every turn the sidecar serves.
+const POST_ADMISSION_GRACE: Duration = Duration::from_secs(120);
+/// A relay the host never POSTs to (turn abandoned before the request)
+/// gets this long, then the thread exits instead of parking forever.
+const UNUSED_TTL: Duration = Duration::from_secs(10 * 60);
+/// Accept-poll cadence while nonblocking.
+const ACCEPT_POLL: Duration = Duration::from_millis(50);
 
 fn serve(listener: TcpListener, intents: Intents, bearer: String, used: Arc<AtomicBool>) {
-    for stream in listener.incoming() {
-        let Ok(mut s) = stream else { continue };
-        handle_conn(&mut s, &intents, &bearer, &used);
+    let _ = listener.set_nonblocking(true);
+    let minted = Instant::now();
+    let mut admitted_at: Option<Instant> = None;
+    loop {
+        match listener.accept() {
+            Ok((mut s, _)) => {
+                handle_conn(&mut s, &intents, &bearer, &used);
+                if admitted_at.is_none() && used.load(Ordering::SeqCst) {
+                    admitted_at = Some(Instant::now());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let done = match admitted_at {
+                    Some(t) => Instant::now() >= t + POST_ADMISSION_GRACE,
+                    None => Instant::now() >= minted + UNUSED_TTL,
+                };
+                if done {
+                    break;
+                }
+                std::thread::sleep(ACCEPT_POLL);
+            }
+            Err(_) => break,
+        }
     }
 }
 

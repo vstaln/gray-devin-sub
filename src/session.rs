@@ -43,16 +43,31 @@
 //! next real turn simply appends after it. `last_used` (the `IDLE_TTL`
 //! user-activity clock) is likewise untouched — a warmed session still
 //! dies on schedule — and keepalives stop once user idleness passes
-//! `KEEPALIVE_IDLE_MAX`, where the reaper takes over anyway.
+//! `keepalive_idle_max()`, where the reaper takes over anyway.
+//!
+//! The pool is per sidecar process, but the upstream session is not: it
+//! survives in Devin's own store, `devin acp` can `session/load` it, and
+//! its prompt cache stays warm for as long as the keepalives ran. So every
+//! pooled session's replay state is also persisted under
+//! `<gray home>/devin-sub/pool/` on each return to the pool, and a turn
+//! that misses the live pool first tries [`reattach`]: an orphaned record
+//! (its owner pid gone) with the same model and system text that this
+//! turn strictly continues is loaded into a fresh child and prompted
+//! with only the delta — a gray restart no longer re-bills every open
+//! conversation's whole transcript. Shutdown therefore detaches sessions
+//! that answered a prompt (kills the child, keeps the upstream session)
+//! instead of deleting them; only never-prompted ones are still deleted.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, OnceLock};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::chat::{
@@ -67,7 +82,7 @@ const MAX_LIVE: usize = 4;
 /// Keepalives run until then, so this is also how long a paused
 /// conversation stays cache-warm: at 15min, coming back after a coffee
 /// re-billed the whole transcript on a fresh child (measured 0% cached).
-const IDLE_TTL: Duration = Duration::from_secs(60 * 60);
+pub const IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 /// How often the keepalive sweep checks pooled sessions for stale
 /// upstream contact.
 const KEEPALIVE_SWEEP: Duration = Duration::from_secs(30);
@@ -76,14 +91,42 @@ const KEEPALIVE_SWEEP: Duration = Duration::from_secs(30);
 /// cache TTL (plus sweep granularity), so the next continuation still
 /// hits a warm prefix.
 const KEEPALIVE_AFTER: Duration = Duration::from_secs(4 * 60);
-/// Keep warming for as long as a pooled session can still answer a turn:
-/// stopping earlier leaves a live session whose ~5min cache has already
-/// lapsed, so a turn landing in the gap re-bills the whole transcript on
-/// a session that looks warm. `IDLE_TTL` reaps it either way.
-const KEEPALIVE_IDLE_MAX: Duration = IDLE_TTL;
+/// Keep warming only while the user is plausibly mid-break. The tradeoff
+/// is arithmetic: each keepalive is a billed upstream prompt, so warming
+/// the full `IDLE_TTL` costs ~14 prompts per pooled session — more than
+/// the single cold-cache re-bill it saves on a late return. `IDLE_TTL`
+/// still governs the pool: a session past this cap stays pooled and a
+/// return turn just re-warms on contact. `DEVIN_SUB_KEEPALIVE_MIN`
+/// overrides (minutes; `0` disables keepalives entirely).
+fn keepalive_idle_max() -> Duration {
+    std::env::var("DEVIN_SUB_KEEPALIVE_MIN")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .map(|m| m * 60)
+        .unwrap_or(Duration::from_secs(20 * 60))
+}
+/// How long after its last upstream prompt a persisted session of a dead
+/// sidecar is still worth reattaching. Its owner kept it keepalive-warm
+/// up to `keepalive_idle_max()` and the cache outlives the last prompt
+/// by ~5min; past that a `session/load` costs what `session/new` costs (a
+/// cold prefill) plus the history replay, so there is nothing to gain.
+/// `DEVIN_SUB_RELOAD_MAX_MIN` overrides (minutes; `0` disables reattach).
+fn reload_max_age() -> Duration {
+    std::env::var("DEVIN_SUB_RELOAD_MAX_MIN")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|m| Duration::from_secs(m * 60))
+        .unwrap_or(Duration::from_secs(30 * 60))
+}
 /// One keepalive prompt must settle inside this window; a session that
 /// can't is closed as untrusted, the same rule as a failed real turn.
 const KEEPALIVE_WINDOW: Duration = Duration::from_secs(60);
+/// After a keepalive fails on the account's usage/rate limit, no session
+/// is warmed for this long: every retry is another request against the
+/// same limit (observed: 4-minute retries for hours, every one refused),
+/// and a real turn that arrives meanwhile re-warms on contact anyway.
+const KEEPALIVE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// Fixed minimal keepalive prompt: refreshes the upstream cache for a
 /// near-zero reply (ACP's `session/prompt` takes no output cap). It stays
 /// in the model's context, so it says what it is: a bare "." reads as a
@@ -125,47 +168,70 @@ const DENY_RULES: &[&str] = &[
 const DENY_SEARCH_RULE: &str = "web_search";
 
 /// Process-wide staging: one scratch cwd + generated user config shared by
-/// every pooled child, created lazily on first spawn and removed by
-/// [`shutdown`]. Still random `tempfile` dirs — nothing is planted in a
-/// shared /tmp path.
+/// every pooled child, created lazily on first spawn. The dirs are STABLE
+/// per surface variant, under the user's own gray home (never a
+/// predictable shared /tmp path): the child's cwd is part of Devin's
+/// system prompt, so a per-process random dir would give every
+/// reattached session (see [`reattach`]) a different prompt prefix and a
+/// cold cache — measured 0 cached tokens on a reload against ~99% on an
+/// in-process reuse. Only without a gray home does a private tempdir
+/// stand in, removed by [`shutdown`].
 struct AcpStage {
     work: std::path::PathBuf,
     cfg: std::path::PathBuf,
-    _work_dir: tempfile::TempDir,
-    _cfg_dir: tempfile::TempDir,
+    _tmp: Option<tempfile::TempDir>,
 }
 
 static STAGE: [OnceLock<AcpStage>; 2] = [OnceLock::new(), OnceLock::new()];
 
 impl AcpStage {
     fn make(deny_search: bool) -> Result<Self, String> {
-        let work_dir = tempfile::Builder::new()
-            .prefix("devin-sub-work-")
-            .tempdir()
-            .map_err(|e| format!("staging dir: {e}"))?;
-        let cfg_dir = tempfile::Builder::new()
-            .prefix("devin-sub-cfg-")
-            .tempdir()
-            .map_err(|e| format!("staging dir: {e}"))?;
-        let work = work_dir.path().to_path_buf();
-        let cfg = cfg_dir.path().to_path_buf();
+        match gray_core::paths::gray_home() {
+            Some(home) => {
+                let base = home.join("devin-sub").join("stage").join(if deny_search {
+                    "search-denied"
+                } else {
+                    "search-open"
+                });
+                Self::make_in(base.join("work"), base.join("cfg"), deny_search, None)
+            }
+            None => {
+                let tmp = tempfile::Builder::new()
+                    .prefix("devin-sub-stage-")
+                    .tempdir()
+                    .map_err(|e| format!("staging dir: {e}"))?;
+                let root = tmp.path().to_path_buf();
+                Self::make_in(root.join("work"), root.join("cfg"), deny_search, Some(tmp))
+            }
+        }
+    }
+
+    fn make_in(
+        work: std::path::PathBuf,
+        cfg: std::path::PathBuf,
+        deny_search: bool,
+        tmp: Option<tempfile::TempDir>,
+    ) -> Result<Self, String> {
         // Project-level deny: verified to actually block native read/exec
         // (the user-config deny alone does not).
         let proj = work.join(".devin");
         std::fs::create_dir_all(&proj).map_err(|e| format!("staging dir: {e}"))?;
+        std::fs::create_dir_all(&cfg).map_err(|e| format!("staging dir: {e}"))?;
         let mut deny: Vec<&str> = DENY_RULES.to_vec();
         if deny_search {
             deny.push(DENY_SEARCH_RULE);
         }
-        std::fs::write(
-            proj.join("config.json"),
-            json!({"permissions": {"deny": deny}}).to_string(),
+        write_atomic(
+            &proj.join("config.json"),
+            json!({"permissions": {"deny": deny}})
+                .to_string()
+                .as_bytes(),
         )
         .map_err(|e| format!("staging config: {e}"))?;
         // User config: no MCP servers, rules, skills, subagents, auto-update
         // or notifications — but credentials still load.
-        std::fs::write(
-            cfg.join("config.json"),
+        write_atomic(
+            &cfg.join("config.json"),
             json!({
                 "version": 1,
                 "subagents_enabled": false,
@@ -177,21 +243,42 @@ impl AcpStage {
                 },
                 "permissions": {"deny": deny, "allow": [], "ask": []},
             })
-            .to_string(),
+            .to_string()
+            .as_bytes(),
         )
         .map_err(|e| format!("staging config: {e}"))?;
         Ok(Self {
             work,
             cfg,
-            _work_dir: work_dir,
-            _cfg_dir: cfg_dir,
+            _tmp: tmp,
         })
     }
 
+    /// Stable dirs are shared with every other sidecar process and stay;
+    /// only a private tempdir stand-in is removed.
     fn remove(&self) {
-        let _ = std::fs::remove_dir_all(&self.work);
-        let _ = std::fs::remove_dir_all(&self.cfg);
+        if self._tmp.is_some() {
+            let _ = std::fs::remove_dir_all(&self.work);
+            let _ = std::fs::remove_dir_all(&self.cfg);
+        }
     }
+}
+
+/// Write via a sibling temp file + rename: several sidecars may stage the
+/// same (identical) config at once, and a child must never read a
+/// half-written one.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let tmp = dir.join(format!(
+        ".{}.{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("stage"),
+        std::process::id()
+    ));
+    let done = std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path));
+    if done.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    done
 }
 
 /// The stage for this surface variant — pooled children group by whether
@@ -260,6 +347,215 @@ pub struct LiveSession {
     /// This prompt is the fixed keepalive: a near-empty `end_turn` is a
     /// fine answer to it, never a silent drop.
     keepalive_prompt: bool,
+    /// A `session/load` is replaying history: its `session/update`s are
+    /// past turns, not this prompt's stream, and must not fold into the
+    /// per-prompt state or trigger the native-call cancel.
+    loading: bool,
+}
+
+/// Replay state of a pooled session as persisted for [`reattach`]:
+/// everything `find` keys off, plus the two clocks as unix seconds and
+/// the sidecar pid that held the live child when it was written.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Persisted {
+    pub session_id: String,
+    pub native_model: String,
+    pub system: String,
+    pub absorbed: Vec<Value>,
+    pub reply_call_ids: Vec<String>,
+    pub reply_text: String,
+    pub last_used_unix: u64,
+    pub last_prompt_unix: u64,
+    pub owner_pid: u32,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// `<gray home>/devin-sub/pool`, the persisted replay records.
+fn pool_dir() -> Option<PathBuf> {
+    gray_core::paths::gray_home().map(|h| h.join("devin-sub").join("pool"))
+}
+
+fn persisted_path(session_id: &str) -> Option<PathBuf> {
+    let safe: String = session_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .collect();
+    if safe.is_empty() {
+        return None;
+    }
+    pool_dir().map(|d| d.join(format!("{safe}.json")))
+}
+
+/// Write (0600, atomic rename) the replay record of a session that has
+/// answered at least one real prompt; a never-prompted session has no
+/// upstream transcript worth coming back to. Best effort: a failed write
+/// only costs the reattach it would have enabled.
+fn persist(s: &LiveSession) {
+    let Some(record) = s.persisted() else { return };
+    let Some(path) = persisted_path(&record.session_id) else {
+        return;
+    };
+    let Some(dir) = path.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let Ok(bytes) = serde_json::to_vec(&record) else {
+        return;
+    };
+    let tmp = dir.join(format!(".{}.{}.tmp", record.session_id, std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let written = opts
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(&bytes))
+        .and_then(|_| std::fs::rename(&tmp, &path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn unpersist(session_id: &str) {
+    if let Some(path) = persisted_path(session_id) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Every parseable record in the pool dir; unparseable files are removed.
+fn read_persisted() -> Vec<Persisted> {
+    let Some(dir) = pool_dir() else {
+        return Vec::new();
+    };
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        match std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Persisted>(&b).ok())
+        {
+            Some(p) => out.push(p),
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    out
+}
+
+/// Delete records older than [`reload_max_age`] (plus the sweep slack a
+/// dead owner can't provide). Called once per sidecar start.
+pub fn prune_persisted() {
+    let cutoff = unix_now().saturating_sub(reload_max_age().as_secs() + IDLE_TTL.as_secs());
+    for p in read_persisted() {
+        if p.last_prompt_unix < cutoff {
+            unpersist(&p.session_id);
+        }
+    }
+}
+
+/// Whether `pid` is a running process. Linux `/proc` probe; elsewhere
+/// unknown counts as dead and Devin's own session lock is the backstop
+/// (a load of a session held by a live sidecar fails `session_locked`).
+fn pid_alive(pid: u32) -> bool {
+    pid == std::process::id() || Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Persisted sessions this turn could reattach to, newest upstream
+/// contact first, each with the delta it would be prompted with: records
+/// no live sidecar owns (`alive(owner_pid)` false), younger than
+/// `max_age`, with this turn's model and system text, that this turn's
+/// history strictly continues. Pure over its inputs so tests can drive it.
+pub(crate) fn reload_candidates(
+    records: Vec<Persisted>,
+    turn: &PreparedTurn,
+    now_unix: u64,
+    max_age: Duration,
+    alive: &dyn Fn(u32) -> bool,
+) -> Vec<(Persisted, String)> {
+    let mut out: Vec<(Persisted, String)> = records
+        .into_iter()
+        .filter(|p| !alive(p.owner_pid))
+        .filter(|p| now_unix.saturating_sub(p.last_prompt_unix) <= max_age.as_secs())
+        .filter(|p| p.native_model == turn.native_model && p.system == turn.system)
+        .filter_map(|p| {
+            let delta =
+                continuation(&p.absorbed, &p.reply_call_ids, &p.reply_text, &turn.input).ok()?;
+            Some((p, delta))
+        })
+        .collect();
+    out.sort_by(|a, b| b.0.last_prompt_unix.cmp(&a.0.last_prompt_unix));
+    out
+}
+
+/// Reattach to an orphaned upstream session this turn strictly continues:
+/// a fresh child, `session/load`, and the live session plus the delta to
+/// prompt with — the same shape `take` returns for a pooled reuse. `None`
+/// when no record qualifies or none loads; a record whose session is gone
+/// upstream is removed, one that is merely locked (a sidecar whose pid
+/// this host can't see) is left for its owner.
+pub fn reattach(
+    turn: &PreparedTurn,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Option<(LiveSession, String)> {
+    let max_age = reload_max_age();
+    if max_age.is_zero() {
+        return None;
+    }
+    let candidates = reload_candidates(read_persisted(), turn, unix_now(), max_age, &pid_alive);
+    for (record, delta) in candidates {
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        let stage = stage(!turn.names.iter().any(|n| n == "web_search")).ok()?;
+        let mut s = spawn_child(turn, stage).ok()?;
+        match s.load(&record.session_id, &stage.work, deadline, cancel) {
+            Ok(()) => {
+                let now = unix_now();
+                let back = |t: u64| {
+                    Instant::now()
+                        .checked_sub(Duration::from_secs(now.saturating_sub(t)))
+                        .unwrap_or_else(Instant::now)
+                };
+                s.absorbed = record.absorbed;
+                s.reply_call_ids = record.reply_call_ids;
+                s.reply_text = record.reply_text;
+                s.last_used = back(record.last_used_unix);
+                s.last_prompt_at = Some(back(record.last_prompt_unix));
+                // Ours now: a concurrent sidecar must see a live owner.
+                persist(&s);
+                return Some((s, delta));
+            }
+            Err(e) => {
+                let gone = e.to_lowercase().contains("not found");
+                crate::chat::pool_event(
+                    if gone { "reload:gone" } else { "reload:failed" },
+                    &record.session_id,
+                );
+                if gone {
+                    unpersist(&record.session_id);
+                }
+                s.abandon();
+            }
+        }
+    }
+    None
 }
 
 /// A session out of the pool for a keepalive: enough to tell whether a
@@ -333,7 +629,11 @@ fn reap(pool: &mut Vec<LiveSession>) -> Vec<LiveSession> {
         let idle = pool[i].last_used.elapsed() > IDLE_TTL;
         let exited = !matches!(pool[i].child.try_wait(), Ok(None));
         if idle || exited {
-            let why = if exited { "reap:child_exited" } else { "reap:idle" };
+            let why = if exited {
+                "reap:child_exited"
+            } else {
+                "reap:idle"
+            };
             crate::chat::pool_event(why, &pool[i].session_id);
             dead.push(pool.remove(i));
         } else {
@@ -417,6 +717,7 @@ pub fn take(
 /// Return a session to the pool after a successful turn or keepalive,
 /// evicting the least-recently-used session past `MAX_LIVE`.
 pub fn give_back(s: LiveSession) {
+    persist(&s);
     let mut dead = {
         let mut pool = locked_pool();
         let mut dead = reap(&mut pool.live);
@@ -441,6 +742,23 @@ pub fn give_back(s: LiveSession) {
     }
 }
 
+/// Whether an upstream error is the account's usage/rate limit — the
+/// one failure a retry can only prolong.
+fn is_usage_limit(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("rate limit") || e.contains("usage limit") || e.contains("429")
+}
+
+/// When keepalives resume after a usage-limit failure (`None` = not paused).
+static KEEPALIVE_PAUSED_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn keepalive_paused() -> bool {
+    KEEPALIVE_PAUSED_UNTIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|until| Instant::now() < until)
+}
+
 /// Keepalive predicate, kept field-level so tests can drive it without
 /// a live child: the session settled ≥1 real prompt, its last upstream
 /// contact is stale past `KEEPALIVE_AFTER`, the user is still active
@@ -449,7 +767,7 @@ pub fn give_back(s: LiveSession) {
 fn keepalive_due(last_prompt_at: Option<Instant>, last_used: Instant, alive: bool) -> bool {
     alive
         && last_prompt_at.is_some_and(|t| t.elapsed() > KEEPALIVE_AFTER)
-        && last_used.elapsed() <= KEEPALIVE_IDLE_MAX
+        && last_used.elapsed() <= keepalive_idle_max()
 }
 
 /// Remove the first keepalive-due session from the pool. Out of the pool
@@ -457,6 +775,9 @@ fn keepalive_due(last_prompt_at: Option<Instant>, last_used: Instant, alive: boo
 /// turn — so no real prompt can overlap a keepalive on the same child; it
 /// is listed as warming so a host turn arriving meanwhile waits for it.
 fn take_keepalive() -> Option<LiveSession> {
+    if keepalive_paused() {
+        return None;
+    }
     let pool = POOL.get()?;
     let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
     let i = pool.live.iter_mut().position(|s| {
@@ -486,7 +807,21 @@ fn keepalive_sweep() {
         // the session nothing — real-turn matching state is untouched —
         // so it goes back to the pool like a settled real-turn failure.
         // Only a prompt left in flight closes the child.
-        if s.keepalive() || !s.prompt_in_flight {
+        let failed = s.keepalive().err();
+        if let Some(e) = failed.as_deref().filter(|e| is_usage_limit(e)) {
+            *KEEPALIVE_PAUSED_UNTIL
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + KEEPALIVE_COOLDOWN);
+            crate::chat::pool_event(
+                &format!("keepalive:paused:{}m", KEEPALIVE_COOLDOWN.as_secs() / 60),
+                &s.session_id,
+            );
+            eprintln!(
+                "devin-sub: keepalives paused {}s after usage limit: {e}",
+                KEEPALIVE_COOLDOWN.as_secs()
+            );
+        }
+        if failed.is_none() || !s.prompt_in_flight {
             give_back(s);
         } else {
             locked_pool()
@@ -506,7 +841,15 @@ pub fn shutdown() {
         std::mem::take(&mut pool.live)
     };
     for s in dead {
-        s.close();
+        // A session that answered a prompt is persisted and worth coming
+        // back to from the next sidecar; one that never did has nothing
+        // upstream and is deleted as before.
+        if s.last_prompt_at.is_some() && !s.prompt_in_flight {
+            persist(&s);
+            s.abandon();
+        } else {
+            s.close();
+        }
     }
     for slot in &STAGE {
         if let Some(stage) = slot.get() {
@@ -522,8 +865,19 @@ pub fn spawn(
     deadline: Instant,
     cancel: &AtomicBool,
 ) -> Result<LiveSession, String> {
-    let binary = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
     let stage = stage(!turn.names.iter().any(|n| n == "web_search"))?;
+    let mut s = spawn_child(turn, stage)?;
+    if let Err(e) = s.handshake(&stage.work, deadline, cancel) {
+        s.close();
+        return Err(e);
+    }
+    Ok(s)
+}
+
+/// Spawn a `devin acp` child on `stage` with the reader threads wired and
+/// an empty replay state; no ACP traffic yet (`handshake` or `load` next).
+fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, String> {
+    let binary = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
     let mut child = Command::new(&binary)
         .args([
             "--config",
@@ -584,7 +938,7 @@ pub fn spawn(
         .take()
         .ok_or_else(|| "native stdin unavailable".to_string())?;
 
-    let mut s = LiveSession {
+    let s = LiveSession {
         child,
         stdin,
         rx,
@@ -607,11 +961,8 @@ pub fn spawn(
         usage: Usage::default(),
         names: turn.names.clone(),
         keepalive_prompt: false,
+        loading: false,
     };
-    if let Err(e) = s.handshake(&stage.work, deadline, cancel) {
-        s.close();
-        return Err(e);
-    }
     Ok(s)
 }
 
@@ -645,6 +996,56 @@ impl LiveSession {
             .unwrap_or("")
             .to_string();
         Ok(())
+    }
+
+    /// initialize → session/load of an orphaned upstream session. The
+    /// agent replays the whole history as `session/update`s before it
+    /// answers; `loading` keeps them out of the per-prompt state.
+    fn load(
+        &mut self,
+        session_id: &str,
+        work: &Path,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        self.call(
+            "initialize",
+            json!({"protocolVersion": 1,
+                "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false},
+                    "terminal": false}}),
+            Duration::from_secs(60),
+            deadline,
+            cancel,
+        )?;
+        self.loading = true;
+        let loaded = self.call(
+            "session/load",
+            json!({"sessionId": session_id, "cwd": work.to_string_lossy(), "mcpServers": []}),
+            Duration::from_secs(120),
+            deadline,
+            cancel,
+        );
+        self.loading = false;
+        loaded?;
+        self.session_id = session_id.to_string();
+        Ok(())
+    }
+
+    /// The replay record of a session that answered a real prompt.
+    fn persisted(&self) -> Option<Persisted> {
+        let last_prompt = self.last_prompt_at?;
+        let now = unix_now();
+        Some(Persisted {
+            session_id: self.session_id.clone(),
+            native_model: self.native_model.clone(),
+            system: self.system.clone(),
+            absorbed: self.absorbed.clone(),
+            reply_call_ids: self.reply_call_ids.clone(),
+            reply_text: self.reply_text.clone(),
+            last_used_unix: now.saturating_sub(self.last_used.elapsed().as_secs()),
+            last_prompt_unix: now.saturating_sub(last_prompt.elapsed().as_secs()),
+            owner_pid: std::process::id(),
+        })
     }
 
     /// Drain stale wire traffic, reset per-prompt state and send the
@@ -777,10 +1178,11 @@ impl LiveSession {
     /// of the pool: fixed marker text, empty tool inventory (native calls
     /// are denied anyway), bounded by `KEEPALIVE_WINDOW`. The reply is
     /// discarded; its usage goes to the debug trace under `keepalive:N`,
-    /// never into host accounting. Returns false on any failure — the
-    /// caller then checks `prompt_in_flight` and only closes a session
-    /// whose prompt never settled, the same rule as a failed real turn.
-    fn keepalive(&mut self) -> bool {
+    /// never into host accounting. Returns the upstream error on any
+    /// failure — the caller then checks `prompt_in_flight` and only closes
+    /// a session whose prompt never settled, the same rule as a failed
+    /// real turn.
+    fn keepalive(&mut self) -> Result<(), String> {
         let never = AtomicBool::new(false);
         let deadline = Instant::now() + KEEPALIVE_WINDOW;
         let next = self.keepalive_turns + 1;
@@ -797,7 +1199,7 @@ impl LiveSession {
                     Some(&r),
                     None,
                 );
-                true
+                Ok(())
             }
             Err(e) => {
                 crate::chat::trace_turn(
@@ -807,15 +1209,29 @@ impl LiveSession {
                     None,
                     Some(&e),
                 );
-                false
+                Err(e)
             }
         }
     }
 
     /// Best-effort teardown: `session/delete` (≤5s), stdin closed, ≤2s
     /// grace, then kill.
-    pub fn close(mut self) {
-        if !self.session_id.is_empty()
+    pub fn close(self) {
+        self.close_inner(true);
+    }
+
+    /// End the child but keep the upstream session: its record stays (or
+    /// was never written) for a later sidecar's [`reattach`].
+    pub(crate) fn abandon(self) {
+        self.close_inner(false);
+    }
+
+    fn close_inner(mut self, delete: bool) {
+        if delete {
+            unpersist(&self.session_id);
+        }
+        if delete
+            && !self.session_id.is_empty()
             && self
                 .send_request("session/delete", json!({"sessionId": self.session_id}))
                 .is_ok()
@@ -873,7 +1289,7 @@ impl LiveSession {
     }
 
     fn on_notification(&mut self, line: &Value) {
-        if line.get("method").and_then(Value::as_str) != Some("session/update") {
+        if self.loading || line.get("method").and_then(Value::as_str) != Some("session/update") {
             return;
         }
         let update = &line["params"]["update"];
@@ -901,14 +1317,13 @@ impl LiveSession {
                 self.text_boundary = true;
                 // First native call wins and ends the turn: the model
                 // reached for a native tool instead of the text funnel.
-                // execute/read redirect onto bash; anything else echoes
-                // back native__-prefixed so the host's "does not exist"
-                // error — which lists the real surface — feeds back to
-                // the model instead of dropping into a dead turn.
+                // execute/read/web calls redirect onto real tools;
+                // anything else lands on a self-explaining bash echo — a
+                // normal result, not a "does not exist" error card.
                 if self.redirected.is_empty() {
                     let call = match redirect_call(update, &self.names) {
                         Some(call) => call,
-                        None => blocked_call(update),
+                        None => blocked_call(update, &self.names),
                     };
                     self.redirected.push(call);
                     let _ = self.send(&json!({"jsonrpc": "2.0",

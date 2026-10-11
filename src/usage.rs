@@ -269,10 +269,13 @@ fn civil(z: i64) -> (i64, u32, u32) {
 
 /// Map the decoded `GetUserStatusResponse` into usage windows.
 ///
-/// Recovered layout (verified against the cached payload):
+/// Recovered layout (verified against the cached payload, field numbers
+/// in the binary's `PlanStatus` declaration order):
 /// - `13` plan block: `.1` = plan/team features msg, `.2`/`.3` = monthly
-///   period start/end timestamps, `.14` = weekly ACU limit, `.17`/`.18` =
-///   daily-window bounds, `.33` = devin_info
+///   period start/end timestamps, `.14` = daily_quota_remaining_percent,
+///   `.15` = weekly_quota_remaining_percent, `.16` = overage_balance_micros,
+///   `.17` = daily_quota_reset_at_unix, `.18` = weekly_quota_reset_at_unix
+///   (`.19`/`.20` acu_consumed/acu_limit are absent on unmetered plans)
 /// - `13.1` = plan features: `.2` plan_name, `.7` monthly flow credits,
 ///   `.8` monthly prompt credits, `.24` team features, `.33` devin_info
 fn map_usage(payload: &[u8]) -> Value {
@@ -280,19 +283,40 @@ fn map_usage(payload: &[u8]) -> Value {
     let mut notes = Vec::new();
 
     let plan_name = str_at(payload, &[13, 1, 2]);
-    // Weekly ACU limit (field 14) — Devin metered models draw from a
-    // weekly bucket; swe-2 family is unmetered. No used counter is
-    // published (enforcement is server-side), so the row renders as a
-    // 0→limit scale. Monthly plan ceilings stay out: they aren't the
-    // quota this card is for.
-    if let Some(limit) = varint_at(payload, &[13, 14]).filter(|v| *v > 0) {
-        windows.push(json!({
-            "id": "weekly_acu",
-            "label": "Weekly ACU",
-            "kind": "weekly",
-            "limit": limit,
-            "unit": "ACU",
-        }));
+    // The two quota windows the TUI's own quota line draws from: the
+    // server publishes what is *left* (percent) plus the reset instant;
+    // `used_percent` is the complement. A percent above 100 is an unset
+    // sentinel, not a window. Monthly plan ceilings stay out: they aren't
+    // the quota this card is for.
+    let quota = |remaining: u64, reset: u64, id: &str, label: &str, kind: &str, mins: u64| {
+        (remaining <= 100).then(|| {
+            let mut w = json!({
+                "id": id,
+                "label": label,
+                "kind": kind,
+                "duration_mins": mins,
+                "used_percent": (100 - remaining) as f64,
+            });
+            if reset > 0 {
+                w["resets_at"] = json!(iso(reset));
+            }
+            w
+        })
+    };
+    if let Some(left) = varint_at(payload, &[13, 14]) {
+        let reset = varint_at(payload, &[13, 17]).unwrap_or(0);
+        windows.extend(quota(left, reset, "daily", "Daily", "session", 24 * 60));
+    }
+    if let Some(left) = varint_at(payload, &[13, 15]) {
+        let reset = varint_at(payload, &[13, 18]).unwrap_or(0);
+        windows.extend(quota(
+            left,
+            reset,
+            "weekly",
+            "Weekly",
+            "weekly",
+            7 * 24 * 60,
+        ));
     }
     if let Some(hint) = str_at(payload, &[13, 1, 33, 12, 2]) {
         notes.push(hint);
@@ -335,7 +359,8 @@ mod tests {
 
     /// Synthetic GetUserStatusResponse with the recovered layout:
     /// plan block 13 { 1 { 2 plan_name, 7 flow credits, 8 prompt credits,
-    /// 33 { 12 { 2 hint } } }, 2/3 period stamps, 14 weekly ACU }.
+    /// 33 { 12 { 2 hint } } }, 2/3 period stamps, 14/15 daily/weekly
+    /// remaining percent, 17/18 their reset instants }.
     #[test]
     fn maps_plan_block() {
         let devin_info = field(12, &field(2, b"Ask your account admin to raise it"));
@@ -347,6 +372,9 @@ mod tests {
         plan.extend(field(2, &vfield(1, 1791122762)));
         plan.extend(field(3, &vfield(1, 1793801162)));
         plan.extend(vfield(14, 100));
+        plan.extend(vfield(15, 74));
+        plan.extend(vfield(17, 1791792000));
+        plan.extend(vfield(18, 1792310400));
         let mut payload = vfield(1, 1);
         payload.extend(field(13, &plan));
 
@@ -354,11 +382,14 @@ mod tests {
         assert_eq!(limits["plan"], "Max");
         let windows = limits["windows"].as_array().unwrap();
         let ids: Vec<&str> = windows.iter().map(|w| w["id"].as_str().unwrap()).collect();
-        assert!(ids.contains(&"weekly_acu"), "{ids:?}");
-        assert!(!ids.contains(&"plan_field_7"), "{ids:?}");
-        assert!(!ids.contains(&"plan_field_8"), "{ids:?}");
-        let acu = windows.iter().find(|w| w["id"] == "weekly_acu").unwrap();
-        assert_eq!(acu["limit"], 100);
+        assert_eq!(ids, vec!["daily", "weekly"], "{ids:?}");
+        let daily = &windows[0];
+        assert_eq!(daily["used_percent"], 0.0);
+        assert_eq!(daily["resets_at"], "2026-10-12T08:00:00Z");
+        let weekly = &windows[1];
+        assert_eq!(weekly["used_percent"], 26.0);
+        assert_eq!(weekly["kind"], "weekly");
+        assert_eq!(weekly["resets_at"], "2026-10-18T08:00:00Z");
         let note = limits["note"].as_str().unwrap();
         assert!(!note.contains("billing period"), "{note}");
         assert!(note.contains("Ask your account admin"), "{note}");

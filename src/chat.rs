@@ -14,9 +14,9 @@
 //!   `/devin tools` allowlist (default bash-only, [`crate::settings`]).
 //!   Models that
 //!   ignore the text funnel and reach for a native tool anyway are caught by
-//!   `tool_call` notifications: execute/read redirect onto `bash`, anything
-//!   else echoes back `native__`-prefixed so the host's unknown-tool error
-//!   lists the real surface instead of silently ending the turn (see
+//!   `tool_call` notifications: execute/read/web calls redirect onto `bash`
+//!   and the web tools, and the rest land on a self-explaining bash echo —
+//!   no "does not exist" error card ever renders (see
 //!   [`redirect_call`], [`blocked_call`]). A project-level `.devin/config.json`
 //!   deny list makes every native tool fail closed regardless.
 //! * `session/request_permission` is always answered `cancelled`: nothing a
@@ -308,15 +308,18 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
 fn funnel_contract(tool_specs: &[String]) -> String {
     let mut s = String::from(
         "You are the model behind another agent harness (\"gray\"). Your own built-in tools are \
-        DISABLED in this session: every call to them is denied and wastes the turn. Never call them.\n\
+        DISABLED in this session: file/process/web calls auto-redirect onto `bash` and the host's \
+        web tools, anything else returns an explanation instead of running — a native call never \
+        does what you asked. Never call them.\n\
         Instead, the harness executes tools for you. To call harness tools, end your reply with \
         exactly one fenced block:\n\n```gray_calls\n\
         [{\"name\": \"<tool name>\", \"arguments\": { ... }}]\n```\n\n\
         The array may hold several calls. Do not write anything after the block. \
         If no tool is needed, answer normally with no block. \
         Never call a tool just to wait, poll or pass a round (`true`, `:`, `sleep`, `echo`): \
-        to wait for a background job use its tool's own wait (bash `action: \"output\"` with \
-        `job_id` and `wait_ms`), otherwise reply with no block. \
+        a command that outlives its timeout keeps running as a background job — end your reply \
+        to be woken when it finishes, `tail` its log to peek, `kill -- -<pgid>` to stop it; \
+        otherwise reply with no block. \
         Later messages in this conversation come from the harness: tool results \
         arrive as `[Tool result id=…]` blocks and new user input as `[User]` blocks.",
     );
@@ -353,17 +356,27 @@ pub fn parse_calls_block(text: &str, names: &[String]) -> Option<(String, Vec<(S
     // explanation is prose about the funnel, not a call, so it stays in
     // the text where the host's leaked-markup nudge can answer it.
     let mut search_from = text.len();
-    let (start, candidate) = loop {
+    let (start, candidate, parsed) = loop {
         let idx = text[..search_from].rfind(FENCE)?;
         let after = &text[idx + FENCE.len()..];
         let info_ends = after.is_empty() || after.starts_with('\n');
-        let body = match after.find("```") {
-            Some(close) => &after[..close],
-            None => after,
-        }
-        .trim();
+        let body = after.trim_start();
         if info_ends && body.starts_with('[') {
-            break (idx, body);
+            // A JSON array is self-delimiting, so it is parsed before any
+            // closing fence is looked for: a fence inside one of its strings
+            // (a command grepping for the funnel's own marker) must not cut
+            // the block short. Only an array that fails to parse falls back
+            // to the fence-delimited text, for the guess path below.
+            let parsed = json_array_prefix(body);
+            let body = if parsed.is_some() {
+                body
+            } else {
+                after
+                    .find("```")
+                    .map_or(after, |close| &after[..close])
+                    .trim()
+            };
+            break (idx, body, parsed);
         }
         search_from = idx;
     };
@@ -376,7 +389,7 @@ pub fn parse_calls_block(text: &str, names: &[String]) -> Option<(String, Vec<(S
         })
         .or(names.first())
         .map_or("gray_calls", String::as_str);
-    let calls: Vec<(String, String)> = match json_array_prefix(candidate) {
+    let calls: Vec<(String, String)> = match parsed {
         Some(arr) => arr
             .iter()
             .map(|c| {
@@ -506,7 +519,10 @@ fn native_tool_name(update: &Value) -> Option<String> {
         .get("toolCallId")
         .and_then(Value::as_str)
         .and_then(|id| id.split_once(':').map(|(t, _)| t))
-        .filter(|t| t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .filter(|t| {
+            t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
         .map(String::from)
 }
 
@@ -708,18 +724,32 @@ fn write_redirect(input: &Value) -> Option<String> {
 }
 
 /// The call a native `tool_call` becomes when [`redirect_call`] can't map
-/// it onto bash (edit/fetch/other kinds, or a bash-less surface): the name
-/// the model reached for — the update's `title`, else `kind` — sanitized
-/// and `native__`-prefixed so it can never collide with a real tool. The
-/// host answers "Tool 'native__X' does not exist. Available: …", an error
-/// result that names the true surface and keeps the turn alive; a dropped
-/// native call is how turns end dead text-only.
-pub(crate) fn blocked_call(update: &Value) -> (String, String) {
+/// it: when `bash` is on the surface it lands on an echo that explains
+/// itself — "X is a disabled built-in tool — nothing ran" — so the turn
+/// stays alive, the transcript says why, and no error card ever renders.
+/// Bash-less surfaces keep the `native__` fold: the host's "does not
+/// exist" names the true surface instead of dropping the turn.
+pub(crate) fn blocked_call(update: &Value, names: &[String]) -> (String, String) {
     let raw = native_tool_name(update)
         .or_else(|| title_tool(update))
         .or_else(|| update.get("kind").and_then(Value::as_str).map(String::from))
-        .or_else(|| update.get("title").and_then(Value::as_str).map(String::from))
+        .or_else(|| {
+            update
+                .get("title")
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
         .unwrap_or_else(|| "tool_call".to_string());
+    if names.iter().any(|n| n == "bash") {
+        let msg = format!(
+            "{raw} is a disabled built-in tool in this harness — nothing ran. \
+             Do file/process work through bash, or use an advertised tool."
+        );
+        return (
+            "bash".to_string(),
+            json!({"command": format!("printf '%s\\n' {}", shell_quote(&msg))}).to_string(),
+        );
+    }
     (native_name(&raw), "{}".to_string())
 }
 
@@ -904,7 +934,16 @@ pub fn run_turn(
         format!("{}\n\n{}", turn.system, turn.content_line)
     };
     let chars = prompt_text.chars().count();
-    let (claimed, mut reason) = session::take(turn, cancel);
+    let (mut claimed, mut reason) = session::take(turn, cancel);
+    // Nothing live continues this turn: an orphaned session of a dead
+    // sidecar (a gray restart) may, loaded instead of re-billed.
+    let mut mode = "reuse";
+    if claimed.is_none() && reason != "keepalive_busy" {
+        claimed = session::reattach(turn, deadline, cancel);
+        if claimed.is_some() {
+            mode = "reload";
+        }
+    }
     let spawn_fresh = |reason: &str| match session::spawn(turn, deadline, cancel) {
         Ok(s) => Ok(s),
         Err(e) => {
@@ -920,24 +959,12 @@ pub fn run_turn(
                     return match s.await_prompt(id, deadline, cancel) {
                         Ok(r) => {
                             s.absorb(turn, &r);
-                            trace_turn(
-                                "reuse",
-                                &s.session_id,
-                                delta.chars().count(),
-                                Some(&r),
-                                None,
-                            );
+                            trace_turn(mode, &s.session_id, delta.chars().count(), Some(&r), None);
                             session::give_back(s);
                             Ok(r)
                         }
                         Err(e) => {
-                            trace_turn(
-                                "reuse",
-                                &s.session_id,
-                                delta.chars().count(),
-                                None,
-                                Some(&e),
-                            );
+                            trace_turn(mode, &s.session_id, delta.chars().count(), None, Some(&e));
                             if s.prompt_in_flight {
                                 // The prompt may still be live upstream
                                 // (dead wire, unsettled cancel): the
@@ -1019,8 +1046,9 @@ pub(crate) fn trace_turn(
     // Fresh spawns and failures always land in the persistent pool log:
     // each one is a whole-transcript re-bill, and without the reason a
     // cache miss can't be told apart from an eviction or a diverged prefix.
+    // Reloads land too — each is a re-bill avoided, the number to watch.
     // Reuse turns (the normal case) stay behind DEVIN_SUB_DEBUG.
-    let persist = mode.starts_with("fresh") || err.is_some();
+    let persist = mode.starts_with("fresh") || mode == "reload" || err.is_some();
     let debug = std::env::var_os("DEVIN_SUB_DEBUG").is_some();
     if !persist && !debug {
         return;
