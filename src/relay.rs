@@ -326,7 +326,12 @@ fn run_turn(
         .ok_or_else(|| "relay intent expired".to_string())?;
     let body: Value = serde_json::from_slice(raw)
         .map_err(|e| format!("relay body is not JSON ({} bytes): {e}", raw.len()))?;
-    let turn = crate::chat::prepare_turn(&body, &intent.model)?;
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|m| !m.is_empty())
+        .unwrap_or(&intent.model);
+    let turn = crate::chat::prepare_turn(&body, model)?;
     // A pooled session when this history continues one, else a fresh
     // spawn — either way native makes exactly one upstream request.
     let result = crate::chat::run_turn(&turn, cancel, Duration::from_secs(600))?;

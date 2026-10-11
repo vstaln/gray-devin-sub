@@ -714,6 +714,79 @@ pub fn take(
     result
 }
 
+pub(crate) fn prefix_divergence(turn: &PreparedTurn) -> Option<String> {
+    let pool = locked_pool();
+    let mut best: Option<(usize, usize)> = None;
+    for s in &pool.live {
+        if s.native_model != turn.native_model || s.system != turn.system {
+            continue;
+        }
+        if crate::chat::continuation(&s.absorbed, &s.reply_call_ids, &s.reply_text, &turn.input)
+            != Err("prefix")
+        {
+            continue;
+        }
+        let diverge_at = s
+            .absorbed
+            .iter()
+            .zip(turn.input.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or_else(|| s.absorbed.len().min(turn.input.len()));
+        if best.map(|(d, _)| diverge_at > d).unwrap_or(true) {
+            best = Some((diverge_at, s.absorbed.len()));
+        }
+    }
+    let (diverge_at, absorbed) = best?;
+    let role = turn
+        .input
+        .get(diverge_at)
+        .map(|v| {
+            v.get("role")
+                .and_then(Value::as_str)
+                .or_else(|| v.get("type").and_then(Value::as_str))
+                .unwrap_or("?")
+        })
+        .unwrap_or("end");
+    Some(format!(
+        "diverge_at={diverge_at},absorbed={absorbed},input={},role={role}",
+        turn.input.len()
+    ))
+}
+
+pub(crate) fn persisted_rejections(turn: &PreparedTurn) -> String {
+    let records = read_persisted();
+    if records.is_empty() {
+        return "persisted=0".to_string();
+    }
+    let now = unix_now();
+    let max_age = reload_max_age().as_secs();
+    let (mut owner_alive, mut too_old, mut model, mut system, mut no_continuation) = (0, 0, 0, 0, 0);
+    for p in &records {
+        if pid_alive(p.owner_pid) {
+            owner_alive += 1;
+        } else if now.saturating_sub(p.last_prompt_unix) > max_age {
+            too_old += 1;
+        } else if p.native_model != turn.native_model {
+            model += 1;
+        } else if p.system != turn.system {
+            system += 1;
+        } else if crate::chat::continuation(
+            &p.absorbed,
+            &p.reply_call_ids,
+            &p.reply_text,
+            &turn.input,
+        )
+        .is_err()
+        {
+            no_continuation += 1;
+        }
+    }
+    format!(
+        "persisted={},owner_alive={owner_alive},too_old={too_old},model={model},system={system},no_continuation={no_continuation}",
+        records.len()
+    )
+}
+
 /// Return a session to the pool after a successful turn or keepalive,
 /// evicting the least-recently-used session past `MAX_LIVE`.
 pub fn give_back(s: LiveSession) {
@@ -780,12 +853,27 @@ fn take_keepalive() -> Option<LiveSession> {
     }
     let pool = POOL.get()?;
     let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
-    let i = pool.live.iter_mut().position(|s| {
-        keepalive_due(
-            s.last_prompt_at,
-            s.last_used,
-            matches!(s.child.try_wait(), Ok(None)),
-        )
+    let due: Vec<bool> = pool
+        .live
+        .iter_mut()
+        .map(|s| {
+            keepalive_due(
+                s.last_prompt_at,
+                s.last_used,
+                matches!(s.child.try_wait(), Ok(None)),
+            )
+        })
+        .collect();
+    let i = (0..pool.live.len()).find(|&i| {
+        due[i] && {
+            let s = &pool.live[i];
+            !pool.live.iter().enumerate().any(|(j, o)| {
+                j != i
+                    && o.native_model == s.native_model
+                    && o.system == s.system
+                    && o.last_prompt_at > s.last_prompt_at
+            })
+        }
     })?;
     let s = pool.live.remove(i);
     pool.warming.push(Warming {
@@ -1198,6 +1286,7 @@ impl LiveSession {
                     KEEPALIVE_TEXT.len(),
                     Some(&r),
                     None,
+                    None,
                 );
                 Ok(())
             }
@@ -1208,6 +1297,7 @@ impl LiveSession {
                     KEEPALIVE_TEXT.len(),
                     None,
                     Some(&e),
+                    None,
                 );
                 Err(e)
             }

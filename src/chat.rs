@@ -986,7 +986,14 @@ pub fn run_turn(
     let spawn_fresh = |reason: &str| match session::spawn(turn, deadline, cancel) {
         Ok(s) => Ok(s),
         Err(e) => {
-            trace_turn(&format!("fresh:{reason}"), "-", chars, None, Some(&e));
+            trace_turn(
+                &format!("fresh:{reason}"),
+                "-",
+                chars,
+                None,
+                Some(&e),
+                fresh_diag(turn, reason).as_deref(),
+            );
             Err(e)
         }
     };
@@ -998,12 +1005,26 @@ pub fn run_turn(
                     return match s.await_prompt(id, deadline, cancel) {
                         Ok(r) => {
                             s.absorb(turn, &r);
-                            trace_turn(mode, &s.session_id, delta.chars().count(), Some(&r), None);
+                            trace_turn(
+                                mode,
+                                &s.session_id,
+                                delta.chars().count(),
+                                Some(&r),
+                                None,
+                                None,
+                            );
                             session::give_back(s);
                             Ok(r)
                         }
                         Err(e) => {
-                            trace_turn(mode, &s.session_id, delta.chars().count(), None, Some(&e));
+                            trace_turn(
+                                mode,
+                                &s.session_id,
+                                delta.chars().count(),
+                                None,
+                                Some(&e),
+                                None,
+                            );
                             if s.prompt_in_flight {
                                 // The prompt may still be live upstream
                                 // (dead wire, unsettled cancel): the
@@ -1034,13 +1055,14 @@ pub fn run_turn(
         }
         None => spawn_fresh(reason)?,
     };
+    let diag = fresh_diag(turn, reason);
     let mode = format!("fresh:{reason}");
     let id = match s.send_prompt(&prompt_text, &images_of(&turn.input), &turn.names) {
         Ok(id) => id,
         Err(e) => {
             // The prompt never reached the child (dead pipe): nothing to
             // pool, and no fresh fallback left — the turn fails.
-            trace_turn(&mode, &s.session_id, chars, None, Some(&e));
+            trace_turn(&mode, &s.session_id, chars, None, Some(&e), diag.as_deref());
             s.close();
             return Err(e);
         }
@@ -1048,12 +1070,12 @@ pub fn run_turn(
     match s.await_prompt(id, deadline, cancel) {
         Ok(r) => {
             s.absorb(turn, &r);
-            trace_turn(&mode, &s.session_id, chars, Some(&r), None);
+            trace_turn(&mode, &s.session_id, chars, Some(&r), None, diag.as_deref());
             session::give_back(s);
             Ok(r)
         }
         Err(e) => {
-            trace_turn(&mode, &s.session_id, chars, None, Some(&e));
+            trace_turn(&mode, &s.session_id, chars, None, Some(&e), diag.as_deref());
             if s.prompt_in_flight {
                 s.close();
             } else {
@@ -1071,6 +1093,14 @@ pub fn run_turn(
     }
 }
 
+fn fresh_diag(turn: &PreparedTurn, reason: &str) -> Option<String> {
+    match reason {
+        "prefix" => session::prefix_divergence(turn),
+        "no_session" => Some(session::persisted_rejections(turn)),
+        _ => None,
+    }
+}
+
 /// One line per turn when `DEVIN_SUB_DEBUG` is set: mode, session, prompt
 /// size and usage — never prompt content. Appends (mode 0600) to
 /// `<tempdir>/devin-sub-<pid>.log`. `pub(crate)` so the session pool's
@@ -1081,6 +1111,7 @@ pub(crate) fn trace_turn(
     prompt_chars: usize,
     r: Option<&TurnResult>,
     err: Option<&str>,
+    diag: Option<&str>,
 ) {
     // Fresh spawns and failures always land in the persistent pool log:
     // each one is a whole-transcript re-bill, and without the reason a
@@ -1112,9 +1143,13 @@ pub(crate) fn trace_turn(
             },
         ),
     };
-    let line = format!(
-        "{ts}\t{mode}\tsession={session_id}\tprompt_chars={prompt_chars}\tusage={usage}\tstop={stop}\n"
+    let mut line = format!(
+        "{ts}\t{mode}\tsession={session_id}\tprompt_chars={prompt_chars}\tusage={usage}\tstop={stop}"
     );
+    if let Some(d) = diag {
+        line.push_str(&format!("\tdiag={d}"));
+    }
+    line.push('\n');
     if persist {
         append_pool_log(&line);
     }
