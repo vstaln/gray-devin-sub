@@ -7,9 +7,6 @@ pub const RECORDS: [&str; 5] = [
 ];
 
 const LABEL: &str = "[Assistant]";
-/// A fabricated call record is recovered at finish time, not cut: its
-/// line's byte offset marks where visible output ends and the
-/// `[Tool call NAME id=ID]` + JSON-args records begin.
 const TOOL_CALL: &str = "[Tool call ";
 
 #[derive(Default, Clone, Debug)]
@@ -24,7 +21,6 @@ impl TurnGuard {
         self.cut
     }
 
-    /// Byte offset of the first fabricated `[Tool call` line, if any.
     pub fn salvage(&self) -> Option<usize> {
         self.salvage
     }

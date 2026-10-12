@@ -467,9 +467,6 @@ pub(crate) fn funnel_name(name: &str, names: &[String]) -> String {
     }
 }
 
-/// A leading self-delimiting JSON value and where it ended: the model may
-/// append native tool markup or hallucinated transcript turns after it,
-/// and both are noise to drop, not parse failures.
 fn json_value_prefix(s: &str) -> Option<(Value, usize)> {
     let mut stream = serde_json::Deserializer::from_str(s).into_iter::<Value>();
     let v = stream.next()?.ok()?;
@@ -484,8 +481,6 @@ fn json_array_prefix(s: &str) -> Option<Vec<Value>> {
     }
 }
 
-/// The next `[Tool call …]` header line: its inner text (`bash id=x]`)
-/// and the offset just past the line.
 fn tool_call_header(s: &str) -> Option<(&str, usize)> {
     let mut off = 0;
     for line in s.split_inclusive('\n') {
@@ -498,10 +493,6 @@ fn tool_call_header(s: &str) -> Option<(&str, usize)> {
     None
 }
 
-/// Salvage fabricated `[Tool call NAME id=ID]` transcript records — each
-/// header line followed by its JSON arguments — into real funnel calls.
-/// The model imitates the old history format and writes its call as a
-/// record instead of a gray_calls block; what it meant still runs.
 pub(crate) fn salvage_calls(text: &str, names: &[String]) -> Vec<(String, String)> {
     let mut calls = Vec::new();
     let mut rest = text;
