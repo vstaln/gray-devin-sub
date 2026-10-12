@@ -314,7 +314,10 @@ fn funnel_contract(tool_specs: &[String]) -> String {
         Instead, the harness executes tools for you. To call harness tools, end your reply with \
         exactly one fenced block:\n\n```gray_calls\n\
         [{\"name\": \"<tool name>\", \"arguments\": { ... }}]\n```\n\n\
-        The array may hold several calls. Do not write anything after the block. \
+        The array may hold several calls: put independent calls (several files to read, separate \
+        probes) in one block, since they cost one round together and read-only ones run \
+        concurrently, and only wait a turn when a call needs an earlier result. \
+        Do not write anything after the block. \
         If no tool is needed, answer normally with no block. \
         Never call a tool just to wait, poll or pass a round (`true`, `:`, `sleep`, `echo`): \
         a command that outlives its timeout keeps running as a background job — end your reply \
