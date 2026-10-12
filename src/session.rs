@@ -58,7 +58,7 @@
 //! that answered a prompt (kills the child, keeps the upstream session)
 //! instead of deleting them; only never-prompted ones are still deleted.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -71,8 +71,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::chat::{
-    CUT_NOTE, PreparedTurn, TurnResult, Usage, blocked_call, continuation, parse_calls_block,
-    rand_hex, redirect_call, salvage_calls, usage_from,
+    CUT_NOTE, PreparedTurn, TurnResult, Usage, batch_cut_note, blocked_call, continuation,
+    parse_calls_block, rand_hex, redirect_call, salvage_calls, usage_from,
 };
 use crate::guard::{TurnGuard, marker_name, strip_reasoning};
 use crate::setup;
@@ -145,13 +145,8 @@ const CLIENT_GONE: &str = "client disconnected";
 const EMPTY_END_TURN: &str = "devin acp returned an empty end_turn with no output — likely a usage-limit rejection; session kept pooled";
 
 /// Deny list written into both the project config and the user config the
-/// child sees: every native capability Devin exposes.
+/// child sees: every native capability Devin exposes outside `ASK_RULES`.
 const DENY_RULES: &[&str] = &[
-    "read",
-    "edit",
-    "grep",
-    "glob",
-    "exec",
     "Fetch(domain:*)",
     "mcp__*",
     // Asks the user for directory access — impossible over the relay
@@ -167,6 +162,10 @@ const DENY_RULES: &[&str] = &[
 /// the model retries past. When the host DOES advertise web_search the
 /// rule stays off and the funnel redirect keeps serving the call.
 const DENY_SEARCH_RULE: &str = "web_search";
+
+const ASK_RULES: &[&str] = &["read", "edit", "grep", "glob", "exec"];
+
+const BATCH_QUIET: Duration = Duration::from_millis(250);
 
 /// Process-wide staging: one scratch cwd + generated user config shared by
 /// every pooled child, created lazily on first spawn. The dirs are STABLE
@@ -224,7 +223,7 @@ impl AcpStage {
         }
         write_atomic(
             &proj.join("config.json"),
-            json!({"permissions": {"deny": deny}})
+            json!({"permissions": {"deny": deny, "ask": ASK_RULES}})
                 .to_string()
                 .as_bytes(),
         )
@@ -242,7 +241,7 @@ impl AcpStage {
                     "agents_standard": false, "cursor": false, "windsurf": false,
                     "claude": false, "copilot": false, "opencode": false, "zed": false,
                 },
-                "permissions": {"deny": deny, "allow": [], "ask": []},
+                "permissions": {"deny": deny, "allow": [], "ask": ASK_RULES},
             })
             .to_string()
             .as_bytes(),
@@ -342,6 +341,12 @@ pub struct LiveSession {
     thought: String,
     /// Native tool_call notifications redirected onto bash (name, args-json).
     redirected: Vec<(String, String)>,
+    dropped_siblings: usize,
+    prior_dropped: usize,
+    seen_calls: HashSet<String>,
+    pending_perms: Vec<Value>,
+    batch_quiet: Option<Instant>,
+    batch_flushed: bool,
     guard: TurnGuard,
     prior_cut: bool,
     /// Last `usage_update` snapshot for the in-flight prompt.
@@ -1050,6 +1055,12 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         thought: String::new(),
         text_boundary: false,
         redirected: Vec::new(),
+        dropped_siblings: 0,
+        prior_dropped: 0,
+        seen_calls: HashSet::new(),
+        pending_perms: Vec::new(),
+        batch_quiet: None,
+        batch_flushed: false,
         guard: TurnGuard::default(),
         prior_cut: false,
         usage: Usage::default(),
@@ -1162,6 +1173,11 @@ impl LiveSession {
         self.text_boundary = false;
         self.thought.clear();
         self.redirected.clear();
+        self.dropped_siblings = 0;
+        self.seen_calls.clear();
+        self.pending_perms.clear();
+        self.batch_quiet = None;
+        self.batch_flushed = false;
         self.guard = TurnGuard::default();
         self.usage = Usage::default();
         self.names = names.to_vec();
@@ -1378,6 +1394,11 @@ impl LiveSession {
     fn on_request(&mut self, line: &Value) -> Result<(), String> {
         let id = line.get("id").cloned().unwrap_or(Value::Null);
         match line.get("method").and_then(Value::as_str) {
+            Some("session/request_permission") if self.prompt_in_flight && !self.batch_flushed => {
+                self.pending_perms.push(id);
+                self.batch_quiet = Some(Instant::now() + BATCH_QUIET);
+                Ok(())
+            }
             Some("session/request_permission") => {
                 self.answer_request(&id, json!({"outcome": {"outcome": "cancelled"}}))
             }
@@ -1419,20 +1440,38 @@ impl LiveSession {
             }
             Some("tool_call") => {
                 self.text_boundary = true;
-                // First native call wins and ends the turn: the model
-                // reached for a native tool instead of the text funnel.
+                // The model reached for native tools instead of the text
+                // funnel. Every call of the step is collected (they arrive
+                // together, each parked on a held permission request) and
+                // the turn is cancelled once the batch goes quiet.
                 // execute/read/web calls redirect onto real tools;
                 // anything else lands on a self-explaining bash echo — a
                 // normal result, not a "does not exist" error card.
-                if self.redirected.is_empty() {
+                let id = update
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if !self.batch_flushed && self.seen_calls.insert(id) {
                     let call = match redirect_call(update, &self.names) {
                         Some(call) => call,
                         None => blocked_call(update, &self.names),
                     };
                     self.redirected.push(call);
-                    let _ = self.send(&json!({"jsonrpc": "2.0",
-                        "method": "session/cancel",
-                        "params": {"sessionId": self.session_id}}));
+                    self.batch_quiet = Some(Instant::now() + BATCH_QUIET);
+                }
+            }
+            Some("tool_call_update") => {
+                self.text_boundary = true;
+                let id = update
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if !self.redirected.is_empty()
+                    && !self.seen_calls.contains(id)
+                    && update.pointer("/_meta/cognition.ai~1canceled") == Some(&json!(true))
+                {
+                    self.dropped_siblings += 1;
                 }
             }
             Some("usage_update") => {
@@ -1469,7 +1508,28 @@ impl LiveSession {
         }
     }
 
+    fn flush_batch(&mut self) {
+        self.batch_quiet = None;
+        self.batch_flushed = true;
+        let _ = self.send(&json!({"jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": {"sessionId": self.session_id}}));
+        for id in std::mem::take(&mut self.pending_perms) {
+            let _ = self.answer_request(&id, json!({"outcome": {"outcome": "cancelled"}}));
+        }
+        if self.redirected.len() > 1 {
+            crate::chat::pool_event(
+                &format!("batch_native\tcalls={}", self.redirected.len()),
+                &self.session_id,
+            );
+        }
+    }
+
     pub(crate) fn note_cut(&mut self, delta: String) -> String {
+        let delta = match std::mem::take(&mut self.prior_dropped) {
+            0 => delta,
+            n => format!("{}\n\n{delta}", batch_cut_note(n)),
+        };
         if std::mem::take(&mut self.prior_cut) {
             format!("{CUT_NOTE}\n\n{delta}")
         } else {
@@ -1496,7 +1556,10 @@ impl LiveSession {
             if left.is_zero() {
                 return Err("Devin request timed out".into());
             }
-            match self.rx.recv_timeout(left.min(CANCEL_POLL)) {
+            let wait = self.batch_quiet.map_or(CANCEL_POLL, |q| {
+                q.saturating_duration_since(Instant::now()).min(CANCEL_POLL)
+            });
+            match self.rx.recv_timeout(left.min(wait)) {
                 Ok(line) => {
                     if line.get("method").is_some() && line.get("id").is_some() {
                         self.on_request(&line)?;
@@ -1510,6 +1573,9 @@ impl LiveSession {
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err("native stdout closed".into());
                 }
+            }
+            if self.batch_quiet.is_some_and(|q| Instant::now() >= q) {
+                self.flush_batch();
             }
         }
     }
@@ -1596,6 +1662,13 @@ impl LiveSession {
     /// Fold the accumulated reply into a TurnResult.
     fn finish(&mut self, stop_reason: &str) -> TurnResult {
         let turn_id = rand_hex(8);
+        if self.dropped_siblings > 0 && !self.keepalive_prompt {
+            self.prior_dropped = self.dropped_siblings;
+            crate::chat::pool_event(
+                &format!("batch_cut\tdropped={}", self.dropped_siblings),
+                &self.session_id,
+            );
+        }
         // Redirected native calls never mix with funnel calls: redirect wins.
         let salvage = self.guard.salvage();
         let mut text = self.text.trim().to_string();
@@ -1643,7 +1716,7 @@ impl LiveSession {
         let calls: Vec<(String, String, String)> = calls
             .into_iter()
             .enumerate()
-            .map(|(i, (name, args))| (format!("call_{turn_id}_{}", i + 1), name, args))
+            .map(|(i, (name, args))| (format!("call_{turn_id}_{}", i + 1), name, unstage(args)))
             .collect();
         let stop = match stop_reason {
             "max_tokens" => "incomplete:max_output_tokens".to_string(),
@@ -1659,6 +1732,17 @@ impl LiveSession {
             unseen: false,
         }
     }
+}
+
+fn unstage(args: String) -> String {
+    let Ok(cwd) = std::env::current_dir() else {
+        return args;
+    };
+    let cwd = cwd.to_string_lossy();
+    STAGE
+        .iter()
+        .filter_map(OnceLock::get)
+        .fold(args, |a, s| a.replace(&*s.work.to_string_lossy(), &cwd))
 }
 
 /// Map a JSON-RPC/CLI failure onto the host-facing error classes.

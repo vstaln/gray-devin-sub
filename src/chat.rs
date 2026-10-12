@@ -355,11 +355,16 @@ fn funnel_contract(tool_specs: &[String]) -> String {
         web tools, anything else returns an explanation instead of running — a native call never \
         does what you asked. Never call them.\n\
         Instead, the harness executes tools for you. To call harness tools, end your reply with \
-        exactly one fenced block:\n\n```gray_calls\n\
-        [{\"name\": \"<tool name>\", \"arguments\": { ... }}]\n```\n\n\
-        The array may hold several calls: put independent calls (several files to read, separate \
-        probes) in one block, since they cost one round together and read-only ones run \
-        concurrently, and only wait a turn when a call needs an earlier result. \
+        exactly one fenced block holding every call for this round, for example:\n\n```gray_calls\n\
+        [{\"name\": \"bash\", \"arguments\": {\"command\": \"rg -n parse_config src\"}},\n \
+        {\"name\": \"bash\", \"arguments\": {\"command\": \"sed -n 1,80p src/config.rs\"}},\n \
+        {\"name\": \"bash\", \"arguments\": {\"command\": \"git log --oneline -5 -- src/config.rs\"}}]\n```\n\n\
+        Batch by default. Before writing the block, list everything you can already look up \
+        without waiting for a result (files to read, searches, logs, status checks) and give \
+        each its own call in this one block: they run concurrently and cost one round together. \
+        Defer a call only when it needs an earlier call's output. Prefer several separate calls \
+        over one long `&&`/`;`-chained command; chain only steps that depend on each other \
+        (`cd dir && make`). \
         Do not write anything after the block. \
         If no tool is needed, answer normally with no block. \
         Never call a tool just to wait, poll or pass a round (`true`, `:`, `sleep`, `echo`): \
@@ -926,6 +931,15 @@ fn assistant_side(item: &Value) -> bool {
 /// Prepended to a continuation delta whose previous reply never reached
 /// the host.
 pub(crate) const UNDELIVERED_NOTE: &str = "[Harness note] Your previous reply was interrupted by the user and never delivered; none of its tool calls ran.";
+
+pub(crate) fn batch_cut_note(dropped: usize) -> String {
+    format!(
+        "[Harness note] Your previous step issued {} tool calls at once; one hit a native tool that \
+        is rejected upstream, which cancelled the other {dropped} before the harness saw them, so \
+        they did NOT run. Re-issue the ones you still need in one gray_calls block.",
+        dropped + 1
+    )
+}
 
 pub(crate) const CUT_NOTE: &str = "[Harness note] Your previous reply was cut where you started writing a transcript record yourself; everything from that point on was discarded, never delivered, and none of it ran. Write exactly one assistant turn.";
 
