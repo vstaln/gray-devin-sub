@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="943.2" height="184" viewBox="0 0 943.2 184" role="img" aria-label="gray plugin check">
+<title>gray plugin check</title>
+<rect x="0.5" y="0.5" width="942.2" height="183" rx="10" ry="10" fill="#1a1b26" stroke="#414868"/>
+<path d="M0.5,10 A9.5,9.5 0 0 1 10,0.5 H933.2 A9.5,9.5 0 0 1 942.7,10 V34 H0.5 Z" fill="#24283b"/>
+<circle cx="18" cy="17" r="6" fill="#ff5f56"/>
+<circle cx="37" cy="17" r="6" fill="#ffbd2e"/>
+<circle cx="56" cy="17" r="6" fill="#27c93f"/>
+<text x="471.6" y="21.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, &#x27;Segoe UI&#x27;, Helvetica, Arial, sans-serif" font-size="13" fill="#9aa5ce">gray plugin check</text>
+<g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, &#x27;Liberation Mono&#x27;, &#x27;DejaVu Sans Mono&#x27;, monospace" font-size="14">
+<text x="18.00" y="59.50" textLength="8.40" lengthAdjust="spacing" fill="#9ece6a" xml:space="preserve" font-weight="bold">$</text>
+<text x="26.40" y="59.50" textLength="613.20" lengthAdjust="spacing" fill="#c0caf5" xml:space="preserve"> gray plugin check ./target/release/devin-sub                            </text>
+<text x="18.00" y="77.50" textLength="940.80" lengthAdjust="spacing" fill="#c0caf5" xml:space="preserve">PASS manifest — name=&quot;devin-sub&quot; version=&quot;0.2.1&quot; tools=0 commands=[&quot;/devin&quot;, &quot;/fusion&quot;] protocol=Some(&quot;1.2&quot;)    </text>
+<text x="18.00" y="95.50" textLength="940.80" lengthAdjust="spacing" fill="#c0caf5" xml:space="preserve">PASS argv-manifest — argv manifest agrees with wire (name=true, protocol present=true)                          </text>
+<text x="18.00" y="113.50" textLength="940.80" lengthAdjust="spacing" fill="#c0caf5" xml:space="preserve">PASS command/run — /devin declined (empty) in 4.574844ms                                                        </text>
+<text x="18.00" y="131.50" textLength="940.80" lengthAdjust="spacing" fill="#c0caf5" xml:space="preserve">PASS command/run — /fusion → model picker on fusion in 644.326µs                                                </text>
+<text x="18.00" y="149.50" textLength="940.80" lengthAdjust="spacing" fill="#c0caf5" xml:space="preserve">PASS notify — turn_end notify returned in 49.261µs                                                              </text>
+<text x="18.00" y="167.50" textLength="940.80" lengthAdjust="spacing" fill="#c0caf5" xml:space="preserve">PASS shutdown — teardown took 5.28663ms                                                                         </text>
+</g>
+</svg>

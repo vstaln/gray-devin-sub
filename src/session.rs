@@ -359,6 +359,11 @@ pub struct LiveSession {
     /// past turns, not this prompt's stream, and must not fold into the
     /// per-prompt state or trigger the native-call cancel.
     loading: bool,
+    /// The host session this conversation runs under (the `session-id`
+    /// header): stamped into the persisted record so the same
+    /// conversation's next sidecar can claim it across a process
+    /// boundary. The last absorbing turn owns it.
+    pub(crate) gray_session: String,
 }
 
 /// Replay state of a pooled session as persisted for [`reattach`]:
@@ -375,6 +380,11 @@ pub(crate) struct Persisted {
     pub last_used_unix: u64,
     pub last_prompt_unix: u64,
     pub owner_pid: u32,
+    /// The gray session-id this record was written for; empty for
+    /// records written before the field existed (they then match only
+    /// by the owner-pid rule, exactly as before).
+    #[serde(default)]
+    pub gray_session: String,
 }
 
 fn unix_now() -> u64 {
@@ -484,11 +494,22 @@ fn pid_alive(pid: u32) -> bool {
     pid == std::process::id() || Path::new(&format!("/proc/{pid}")).exists()
 }
 
+/// Whether a record's owner gate bars this turn from claiming it. A live
+/// owner refuses every conversation but the one the record was written
+/// for: a respawned sidecar of the same gray session is the rightful heir
+/// (a handoff window where the dying owner already detached, or a
+/// recycled pid that only looks alive), and `session/load`'s own lock is
+/// the backstop when the owner truly still holds the session.
+fn owner_blocks(p: &Persisted, turn: &PreparedTurn, alive: &dyn Fn(u32) -> bool) -> bool {
+    alive(p.owner_pid) && (p.gray_session.is_empty() || p.gray_session != turn.gray_session)
+}
+
 /// Persisted sessions this turn could reattach to, newest upstream
 /// contact first, each with the delta it would be prompted with: records
-/// no live sidecar owns (`alive(owner_pid)` false), younger than
-/// `max_age`, with this turn's model and system text, that this turn's
-/// history strictly continues. Pure over its inputs so tests can drive it.
+/// no live sidecar owns (`alive(owner_pid)` false) or that this same
+/// conversation's record, younger than `max_age`, with this turn's model
+/// and system text, that this turn's history strictly continues. Pure
+/// over its inputs so tests can drive it.
 pub(crate) fn reload_candidates(
     records: Vec<Persisted>,
     turn: &PreparedTurn,
@@ -498,7 +519,7 @@ pub(crate) fn reload_candidates(
 ) -> Vec<(Persisted, String)> {
     let mut out: Vec<(Persisted, String)> = records
         .into_iter()
-        .filter(|p| !alive(p.owner_pid))
+        .filter(|p| !owner_blocks(p, turn, alive))
         .filter(|p| now_unix.saturating_sub(p.last_prompt_unix) <= max_age.as_secs())
         .filter(|p| p.native_model == turn.native_model && p.system == turn.system)
         .filter_map(|p| {
@@ -527,9 +548,16 @@ pub fn reattach(
         return None;
     }
     let candidates = reload_candidates(read_persisted(), turn, unix_now(), max_age, &pid_alive);
+    let held = held_session_ids();
     for (record, delta) in candidates {
         if cancel.load(Ordering::SeqCst) {
             return None;
+        }
+        // Held by a child of this sidecar (pooled, warming, or mid-prompt):
+        // its `session/load` is a guaranteed `session_locked`, so the
+        // attempt would only burn a child spawn and mislabel the log.
+        if held.contains(&record.session_id) {
+            continue;
         }
         let stage = stage(!turn.names.iter().any(|n| n == "web_search")).ok()?;
         let mut s = spawn_child(turn, stage).ok()?;
@@ -548,6 +576,7 @@ pub fn reattach(
                 s.last_prompt_at = Some(back(record.last_prompt_unix));
                 // Ours now: a concurrent sidecar must see a live owner.
                 persist(&s);
+                borrow(&s);
                 return Some((s, delta));
             }
             Err(e) => {
@@ -574,10 +603,35 @@ struct Warming {
     system: String,
 }
 
+/// A session checked out of the pool for a real prompt in flight: not in
+/// `live`, not warming, but still held open by a child of this process.
+/// Tracking it lets `take` wait for it to come back instead of spawning a
+/// fresh child (a cold `session/new` re-bills the whole transcript), and
+/// tells `reattach` its record's `session/load` would fail
+/// `session_locked`.
+struct Borrowed {
+    session_id: String,
+    native_model: String,
+    system: String,
+    gray_session: String,
+}
+
+impl Borrowed {
+    fn of(s: &LiveSession) -> Self {
+        Self {
+            session_id: s.session_id.clone(),
+            native_model: s.native_model.clone(),
+            system: s.system.clone(),
+            gray_session: s.gray_session.clone(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Pool {
     live: Vec<LiveSession>,
     warming: Vec<Warming>,
+    borrowed: Vec<Borrowed>,
 }
 
 impl Pool {
@@ -590,6 +644,53 @@ impl Pool {
             .iter()
             .any(|w| w.native_model == turn.native_model && w.system == turn.system)
     }
+
+    /// Whether a checked-out session belongs to `turn`'s conversation:
+    /// exact `gray_session` match when both sides know it, else the
+    /// model+system stand-in (an unrelated conversation sharing both
+    /// waits out the window, same tradeoff as `warming_for`).
+    fn borrowed_for(&self, turn: &PreparedTurn) -> bool {
+        self.borrowed.iter().any(|b| {
+            if !b.gray_session.is_empty() && !turn.gray_session.is_empty() {
+                b.gray_session == turn.gray_session
+            } else {
+                b.native_model == turn.native_model && b.system == turn.system
+            }
+        })
+    }
+}
+
+/// Mark `s` checked out for a prompt (see [`Borrowed`]).
+fn borrow(s: &LiveSession) {
+    locked_pool().borrowed.push(Borrowed::of(s));
+}
+
+/// Release a checkout mark; wakes `take` waiters when one existed. Called
+/// on every path that ends a borrow: `give_back`, `close`, `abandon`.
+fn unborrow(session_id: &str) {
+    if session_id.is_empty() {
+        return;
+    }
+    let mut pool = locked_pool();
+    if pool.borrowed.iter().any(|b| b.session_id == session_id) {
+        pool.borrowed.retain(|b| b.session_id != session_id);
+        drop(pool);
+        POOL_CHANGED.notify_all();
+    }
+}
+
+/// Session ids this process holds open right now — pooled, warming, or
+/// checked out. `session/load` on any of them fails `session_locked`, so
+/// `reattach` must skip their records (a dead child's session closed with
+/// it and stays claimable).
+fn held_session_ids() -> HashSet<String> {
+    let pool = locked_pool();
+    pool.live
+        .iter()
+        .map(|s| s.session_id.clone())
+        .chain(pool.warming.iter().map(|w| w.session_id.clone()))
+        .chain(pool.borrowed.iter().map(|b| b.session_id.clone()))
+        .collect()
 }
 
 /// The process-wide session pool.
@@ -685,10 +786,14 @@ fn find(live: &[LiveSession], turn: &PreparedTurn) -> Result<(usize, String), &'
 }
 
 /// Take the pooled session this turn continues (see [`find`]), plus the
-/// delta to prompt with. While a session that could answer it is out for
-/// a keepalive, wait for it to come back — up to `KEEPALIVE_WINDOW`, or
-/// until `cancel` — rather than miss and re-bill the whole transcript on a
-/// fresh child. On a miss the second item is the reason.
+/// delta to prompt with. While a session that could answer it is out —
+/// for a keepalive or checked out mid-prompt — wait for it to come back,
+/// up to `KEEPALIVE_WINDOW`, or until `cancel`, rather than miss and
+/// re-bill the whole transcript on a fresh child. A second request for
+/// one conversation while its session still answers the first (a client
+/// timeout retry, an interrupted resend) lands here: waiting turns a
+/// cold `session/new` into a warm continuation. On a miss the second
+/// item is the reason.
 pub fn take(
     turn: &PreparedTurn,
     cancel: &AtomicBool,
@@ -700,11 +805,16 @@ pub fn take(
         loop {
             dead.extend(reap(&mut pool.live));
             let reason = match find(&pool.live, turn) {
-                Ok((i, delta)) => break (Some((pool.live.remove(i), delta)), "reuse"),
+                Ok((i, delta)) => {
+                    let s = pool.live.remove(i);
+                    pool.borrowed.push(Borrowed::of(&s));
+                    break (Some((s, delta)), "reuse");
+                }
                 Err(reason) => reason,
             };
             let left = deadline.saturating_duration_since(Instant::now());
-            if !pool.warming_for(turn) || cancel.load(Ordering::SeqCst) {
+            if !(pool.warming_for(turn) || pool.borrowed_for(turn)) || cancel.load(Ordering::SeqCst)
+            {
                 break (None, reason);
             }
             if left.is_zero() {
@@ -771,7 +881,7 @@ pub(crate) fn persisted_rejections(turn: &PreparedTurn) -> String {
     let (mut owner_alive, mut too_old, mut model, mut system, mut no_continuation) =
         (0, 0, 0, 0, 0);
     for p in &records {
-        if pid_alive(p.owner_pid) {
+        if owner_blocks(p, turn, &pid_alive) {
             owner_alive += 1;
         } else if now.saturating_sub(p.last_prompt_unix) > max_age {
             too_old += 1;
@@ -804,6 +914,7 @@ pub fn give_back(s: LiveSession) {
         let mut pool = locked_pool();
         let mut dead = reap(&mut pool.live);
         pool.warming.retain(|w| w.session_id != s.session_id);
+        pool.borrowed.retain(|b| b.session_id != s.session_id);
         pool.live.push(s);
         if pool.live.len() > MAX_LIVE {
             let lru = pool
@@ -852,37 +963,25 @@ fn keepalive_due(last_prompt_at: Option<Instant>, last_used: Instant, alive: boo
         && last_used.elapsed() <= keepalive_idle_max()
 }
 
-/// Remove the first keepalive-due session from the pool. Out of the pool
-/// is exclusive use — exactly the serialization `take` gives a real
-/// turn — so no real prompt can overlap a keepalive on the same child; it
-/// is listed as warming so a host turn arriving meanwhile waits for it.
+/// Remove the first keepalive-due session from the pool — every due
+/// session gets warmed (the sweep loops until none remain): warming only
+/// the newest per (model,system) starved respawned lineages and second
+/// conversations into cold reloads. Out of the pool is exclusive use —
+/// exactly the serialization `take` gives a real turn — so no real
+/// prompt can overlap a keepalive on the same child; it is listed as
+/// warming so a host turn arriving meanwhile waits for it.
 fn take_keepalive() -> Option<LiveSession> {
     if keepalive_paused() {
         return None;
     }
     let pool = POOL.get()?;
     let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
-    let due: Vec<bool> = pool
-        .live
-        .iter_mut()
-        .map(|s| {
-            keepalive_due(
-                s.last_prompt_at,
-                s.last_used,
-                matches!(s.child.try_wait(), Ok(None)),
-            )
-        })
-        .collect();
-    let i = (0..pool.live.len()).find(|&i| {
-        due[i] && {
-            let s = &pool.live[i];
-            !pool.live.iter().enumerate().any(|(j, o)| {
-                j != i
-                    && o.native_model == s.native_model
-                    && o.system == s.system
-                    && o.last_prompt_at > s.last_prompt_at
-            })
-        }
+    let i = pool.live.iter_mut().position(|s| {
+        keepalive_due(
+            s.last_prompt_at,
+            s.last_used,
+            matches!(s.child.try_wait(), Ok(None)),
+        )
     })?;
     let s = pool.live.remove(i);
     pool.warming.push(Warming {
@@ -968,6 +1067,7 @@ pub fn spawn(
         s.close();
         return Err(e);
     }
+    borrow(&s);
     Ok(s)
 }
 
@@ -1067,6 +1167,7 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         names: turn.names.clone(),
         keepalive_prompt: false,
         loading: false,
+        gray_session: turn.gray_session.clone(),
     };
     Ok(s)
 }
@@ -1150,6 +1251,7 @@ impl LiveSession {
             last_used_unix: now.saturating_sub(self.last_used.elapsed().as_secs()),
             last_prompt_unix: now.saturating_sub(last_prompt.elapsed().as_secs()),
             owner_pid: std::process::id(),
+            gray_session: self.gray_session.clone(),
         })
     }
 
@@ -1238,6 +1340,9 @@ impl LiveSession {
     /// echo: gray's history carries no assistant items for it, so the next
     /// request's echo zone is empty too.
     pub(crate) fn absorb(&mut self, turn: &PreparedTurn, r: &TurnResult) {
+        if !turn.gray_session.is_empty() {
+            self.gray_session = turn.gray_session.clone();
+        }
         self.system = turn.system.clone();
         self.absorbed = turn.input.clone();
         self.reply_call_ids = if r.unseen {
@@ -1265,6 +1370,9 @@ impl LiveSession {
     /// The host's identical retry still misses by design — nothing
     /// extends `absorbed` — and respawns, exactly like today.
     pub(crate) fn absorb_failed(&mut self, turn: &PreparedTurn) {
+        if !turn.gray_session.is_empty() {
+            self.gray_session = turn.gray_session.clone();
+        }
         self.system = turn.system.clone();
         self.absorbed = turn.input.clone();
         self.reply_call_ids = Vec::new();
@@ -1340,6 +1448,7 @@ impl LiveSession {
     }
 
     fn close_inner(mut self, delete: bool) {
+        unborrow(&self.session_id);
         if delete {
             unpersist(&self.session_id);
         }

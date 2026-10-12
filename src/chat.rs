@@ -46,6 +46,11 @@ pub struct PreparedTurn {
     pub input: Vec<Value>,
     pub names: Vec<String>,
     pub native_model: String,
+    /// The host session this turn belongs to (the `session-id` header):
+    /// stamped into persisted pool records so a respawned sidecar of the
+    /// same conversation can claim them across a process boundary. Empty
+    /// when the host sent none.
+    pub gray_session: String,
 }
 
 /// Normalize a tool input schema: strip top-level `oneOf`/`allOf`/`anyOf`
@@ -343,6 +348,7 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
         input,
         names,
         native_model: crate::catalog::native_model(model, effort),
+        gray_session: String::new(),
     })
 }
 

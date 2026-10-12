@@ -4,26 +4,74 @@
 <h1 align="center">gray-devin-sub</h1>
 <p align="center">Run gray on a Devin subscription through the official <code>devin acp</code> CLI.</p>
 <p align="center">
-  <a href="https://github.com/vstaln/gray-devin-sub/blob/main/LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
-  <img alt="gray plugin" src="https://img.shields.io/badge/gray-plugin-7aa2f7.svg">
-  <img alt="rust" src="https://img.shields.io/badge/built%20with-rust-orange.svg">
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <a href="https://gray.alignment.id"><img alt="gray plugin" src="https://img.shields.io/badge/gray-plugin-7aa2f7.svg"></a>
+  <a href="https://www.rust-lang.org"><img alt="built with Rust" src="https://img.shields.io/badge/built%20with-rust-orange.svg"></a>
+  <a href="https://github.com/vstaln/gray-devin-sub/releases"><img alt="latest release" src="https://img.shields.io/github/v/release/vstaln/gray-devin-sub"></a>
 </p>
 
 A protocol-1.2 provider sidecar that puts a **Devin subscription** behind
 Gray's standard OpenAI-Responses transport: Gray keeps host-owned tools,
 approvals, and compaction; Devin's CLI answers model requests.
 
-## Why this is ToS-safe
+## Screenshot
+
+`/fusion` opens gray's model picker focused on the Fusion row — pick a lead
+and a sidekick model for Fusion turns:
+
+![/fusion opens the model picker on the Fusion row](assets/screenshot.svg)
+
+## Install
+
+From the gray plugin hub:
+
+```sh
+gray plugin install devin
+```
+
+From source (needs a Rust toolchain):
+
+```sh
+cargo install --path .
+gray plugin install ~/.cargo/bin/devin-sub
+```
+
+## Usage
+
+Provider plugin: it declares no tools. Reference the provider as `devin-sub:devin-subscription` in your
+Gray config (see `gray-antigravity-sub`'s README for the full
+config shape — this sidecar is a drop-in sibling).
+
+Slash commands (from the manifest):
+
+- `/fusion` opens the model picker on the Fusion row; hosts without
+  model-picker support print a text fallback instead.
+- `/devin` is the operator surface. A bare `/devin` answers nothing, so the
+  host falls back to its provider-login shortcut (the model picker on Devin's
+  rows). `/devin tools …` runs the tool-policy command; any other argument
+  prints usage plus the current policy.
+
+## Configuration
+
+Requires the Devin CLI on `PATH` and `devin auth login` already done.
+Override the binary with `GRAY_DEVIN_SUB_COMMAND` if needed.
+
+Set `DEVIN_SUB_DEBUG=1` to append one line per turn (reuse/fresh reason,
+ACP session id, prompt chars, usage) to
+`$TMPDIR/devin-sub-<pid>.log` — no prompt content.
+
+## How it works
+
+### Why this is ToS-safe
 
 The sidecar talks to Devin exclusively through the **official
 `devin acp` command** — Devin's documented Agent Client Protocol
 integration, the same path editors like Zed and JetBrains use.
 There is no token handling anywhere: authentication lives entirely inside
 the Devin CLI (`devin auth login`); the sidecar never reads credentials
-files, never captures tokens, and refuses to run when a conflicting
-`DEVIN_*` environment variable would reroute the login.
+files, never captures tokens, and strips conflicting `DEVIN_*` variables (`DEVIN_MODEL`, `DEVIN_PERMISSION_MODE`, `DEVIN_SANDBOX`, `DEVIN_REFUSAL_FALLBACK`) from the child process, so the sidecar's own model and permission flags always win.
 
-## How a turn works
+### How a turn works
 
 1. `provider/chat` opens a per-turn loopback relay and hands the host a
    one-shot bearer URL. The relay admits exactly one POST — the
@@ -55,25 +103,23 @@ files, never captures tokens, and refuses to run when a conflicting
 `session/request_permission` is always answered `cancelled` — a harness
 turn never waits on an interactive prompt.
 
-Set `DEVIN_SUB_DEBUG=1` to append one line per turn (reuse/fresh reason,
-ACP session id, prompt chars, usage) to
-`$TMPDIR/devin-sub-<pid>.log` — no prompt content.
+<details>
+<summary>Conformance</summary>
 
-## Build & install
+`gray plugin check` output for this build:
 
-```sh
-cargo build --release
-install -m755 target/release/devin-sub ~/.local/bin/gray-devin-sub
-GRAY_PLUGIN_PATH=$HOME/.local/bin/gray-devin-sub gray install plugin devin-sub
-```
+![gray plugin check output](assets/conformance.svg)
 
-Then reference the provider as `devin-sub:devin-subscription` in your
-Gray config (see `gray-antigravity-sub`'s README for the full
-config shape — this sidecar is a drop-in sibling).
+</details>
 
-Requires the Devin CLI on `PATH` and `devin auth login` already done.
-Override the binary with `GRAY_DEVIN_SUB_COMMAND` if needed.
+## License
 
----
-Part of the [gray](https://github.com/vstaln/gray) plugin ecosystem —
-the open-source AI agent harness. <https://gray.alignment.id>
+MIT. See [LICENSE](LICENSE).
+
+## Links
+
+- Gray: <https://gray.alignment.id>
+- Gray source: <https://github.com/vstaln/gray>
+- Plugin hub: <https://gray.alignment.id/plugins/devin/>
+
+Part of the [gray](https://github.com/vstaln/gray) plugin ecosystem — the open-source AI agent harness.

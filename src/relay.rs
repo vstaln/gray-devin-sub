@@ -175,6 +175,7 @@ fn handle_conn(
     let request_line = lines.next().unwrap_or("").to_string();
     let mut len = 0usize;
     let mut auth = String::new();
+    let mut session_id = String::new();
     for line in lines {
         let line = line.trim_end();
         if line.is_empty() {
@@ -187,6 +188,8 @@ fn handle_conn(
             len = v.trim().parse().unwrap_or(0);
         } else if name.eq_ignore_ascii_case("authorization") {
             auth = v.trim().to_string();
+        } else if name.eq_ignore_ascii_case("session-id") {
+            session_id = v.trim().to_string();
         }
     }
     let header_end = head
@@ -241,7 +244,7 @@ fn handle_conn(
         let bearer = bearer.to_string();
         let cancel = cancel.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(run_turn(&intents, &bearer, &body, &cancel));
+            let _ = tx.send(run_turn(&intents, &bearer, &session_id, &body, &cancel));
         });
     }
     match wait_turn(&rx, s, &cancel, HEADER_GRACE) {
@@ -315,6 +318,7 @@ fn handle_conn(
 fn run_turn(
     intents: &Intents,
     bearer: &str,
+    session_id: &str,
     raw: &[u8],
     cancel: &Arc<AtomicBool>,
 ) -> Result<Vec<u8>, String> {
@@ -331,7 +335,8 @@ fn run_turn(
         .and_then(Value::as_str)
         .filter(|m| !m.is_empty())
         .unwrap_or(&intent.model);
-    let turn = crate::chat::prepare_turn(&body, model)?;
+    let mut turn = crate::chat::prepare_turn(&body, model)?;
+    turn.gray_session = session_id.to_string();
     // A pooled session when this history continues one, else a fresh
     // spawn — either way native makes exactly one upstream request.
     let result = crate::chat::run_turn(&turn, cancel, Duration::from_secs(600))?;

@@ -125,6 +125,7 @@ fn stub_session() -> LiveSession {
         names: Vec::new(),
         keepalive_prompt: false,
         loading: false,
+        gray_session: String::new(),
     }
 }
 
@@ -138,6 +139,7 @@ fn keepalive_turns_do_not_break_continuation_matching() {
         input: vec![json!({"role": "user", "content": "hi"})],
         names: Vec::new(),
         native_model: "model".to_string(),
+        gray_session: String::new(),
     };
     let r = TurnResult {
         text: "answer".to_string(),
@@ -209,6 +211,7 @@ fn a_turn_waits_for_its_session_to_return_from_a_keepalive() {
         input,
         names: Vec::new(),
         native_model: model.to_string(),
+        gray_session: String::new(),
     };
     let history = vec![json!({"role": "user", "content": "hi"})];
     let first = turn(model, history.clone());
@@ -264,6 +267,71 @@ fn a_turn_waits_for_its_session_to_return_from_a_keepalive() {
     let _ = s.child.wait();
 }
 
+/// The recache regression: a request landing while its conversation's
+/// session is checked out mid-prompt used to fall straight to a cold
+/// `session/new` — and its `session/load` on the same record was a
+/// guaranteed `session_locked`. The borrow mark now makes `take` wait
+/// for `give_back` and continue warm; a different conversation sharing
+/// model+system still returns immediately.
+#[test]
+fn take_waits_for_a_checked_out_session() {
+    let model = "model-borrowed-wait";
+    let history = vec![json!({"role": "user", "content": "hi"})];
+    let mut first = turn(model, history.clone());
+    first.gray_session = "conv-a".to_string();
+    let mut s = stub_session();
+    s.session_id = "s-borrowed-wait".to_string();
+    s.native_model = model.to_string();
+    s.absorb(&first, &answered("answer"));
+    give_back(s);
+
+    // Turn A of the conversation checks the session out.
+    let mut in_a = history;
+    in_a.push(json!({"role": "assistant", "content": "answer"}));
+    in_a.push(json!({"role": "user", "content": "turn-a"}));
+    let mut ta = turn(model, in_a.clone());
+    ta.gray_session = "conv-a".to_string();
+    let never = AtomicBool::new(false);
+    let (claimed, _) = take(&ta, &never);
+    let mut s = claimed.expect("live session claimable").0;
+    assert!(locked_pool().borrowed_for(&ta));
+
+    // A different conversation sharing model+system does not wait on it.
+    let mut other = turn(model, in_a);
+    other.gray_session = "conv-b".to_string();
+    let started = Instant::now();
+    let (claimed, reason) = take(&other, &never);
+    assert!(claimed.is_none());
+    assert_eq!(reason, "no_session");
+    assert!(started.elapsed() < Duration::from_millis(250));
+
+    // Same conversation, still checked out: the request waits for
+    // give_back and reuses the returned session warm.
+    s.absorb(&ta, &answered("answer-a"));
+    let mut in_b = ta.input.clone();
+    in_b.push(json!({"role": "assistant", "content": "answer-a"}));
+    in_b.push(json!({"role": "user", "content": "more"}));
+    let mut tb = turn(model, in_b);
+    tb.gray_session = "conv-a".to_string();
+    let back = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        give_back(s);
+    });
+    let started = Instant::now();
+    let (claimed, _) = take(&tb, &never);
+    back.join().unwrap();
+    let (mut s, delta) = claimed.expect("turn missed while its session was checked out");
+    assert!(started.elapsed() >= Duration::from_millis(250));
+    assert_eq!(s.session_id, "s-borrowed-wait");
+    assert_eq!(delta, "[User]\nmore");
+    assert!(locked_pool().borrowed_for(&tb));
+
+    // Closing the borrowed session releases the mark for its
+    // conversation (give_back does the same on the warm path).
+    s.close();
+    assert!(!locked_pool().borrowed_for(&tb));
+}
+
 #[test]
 fn keepalive_due_bounds_warming() {
     let active = Instant::now();
@@ -298,6 +366,7 @@ fn turn(model: &str, input: Vec<Value>) -> PreparedTurn {
         input,
         names: Vec::new(),
         native_model: model.to_string(),
+        gray_session: String::new(),
     }
 }
 
@@ -617,6 +686,7 @@ fn record(session_id: &str, model: &str, owner_pid: u32, last_prompt_unix: u64) 
         last_used_unix: last_prompt_unix,
         last_prompt_unix,
         owner_pid,
+        gray_session: String::new(),
     }
 }
 
@@ -711,6 +781,38 @@ fn reload_candidates_take_only_orphaned_fresh_matching_continuations() {
             .collect::<Vec<_>>(),
         ["newer", "older"]
     );
+}
+
+#[test]
+fn a_same_conversation_record_is_claimable_under_a_live_owner() {
+    let now = 10_000;
+    let max_age = Duration::from_secs(30 * 60);
+    let alive = |pid: u32| pid == 1;
+    let mut next = turn("m", continued());
+    next.gray_session = "gray-1".to_string();
+
+    // Same gray session whose owner pid still looks alive (a dying
+    // sidecar's handoff window, or a recycled pid): the record is the
+    // rightful heir's to claim.
+    let mut same = record("a", "m", 1, now - 60);
+    same.gray_session = "gray-1".to_string();
+    let got = reload_candidates(vec![same], &next, now, max_age, &alive);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0.session_id, "a");
+
+    // A different live-owned conversation still refuses.
+    let mut other = record("b", "m", 1, now - 60);
+    other.gray_session = "gray-2".to_string();
+    assert!(reload_candidates(vec![other], &next, now, max_age, &alive).is_empty());
+
+    // A record written before the field existed can't be claimed past a
+    // live owner, and an unidentified turn can't claim a live-owned one.
+    let legacy = record("c", "m", 1, now - 60);
+    assert!(reload_candidates(vec![legacy], &next, now, max_age, &alive).is_empty());
+    let mut anon_record = record("d", "m", 1, now - 60);
+    anon_record.gray_session = "gray-1".to_string();
+    let anon_turn = turn("m", continued());
+    assert!(reload_candidates(vec![anon_record], &anon_turn, now, max_age, &alive).is_empty());
 }
 
 #[test]
