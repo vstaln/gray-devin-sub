@@ -139,10 +139,10 @@ fn item_kind(item: &Value) -> &str {
     }
 }
 
-/// Render one Responses `input` item to transcript text. Tool calls and
-/// results render as explicit records so the model can reference them;
-/// reasoning carriers restore nothing on a fresh session but their text
-/// still carries the prior answer.
+/// Render one Responses `input` item to transcript text. Tool calls render
+/// as gray_calls blocks and results as explicit records so the model can
+/// reference them; reasoning carriers restore nothing on a fresh session
+/// but their text still carries the prior answer.
 fn render_item(item: &Value) -> Option<String> {
     let kind = item_kind(item);
     match kind {
@@ -159,12 +159,7 @@ fn render_item(item: &Value) -> Option<String> {
             };
             Some(format!("[{who}]\n{text}"))
         }
-        "function_call" => {
-            let name = item.get("name").and_then(Value::as_str).unwrap_or("?");
-            let args = item.get("arguments").and_then(Value::as_str).unwrap_or("");
-            let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
-            Some(format!("[Tool call {name} id={call_id}]\n{args}"))
-        }
+        "function_call" => Some(format!("[Assistant]\n{}", calls_block(&[item]))),
         "function_call_output" => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
             let out = item
@@ -199,13 +194,61 @@ fn render_item(item: &Value) -> Option<String> {
     }
 }
 
+fn call_object(item: &Value) -> String {
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("?");
+    let args = match item.get("arguments") {
+        Some(Value::String(raw)) => {
+            serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.clone()))
+        }
+        Some(v) => v.clone(),
+        None => json!({}),
+    };
+    format!(
+        "{{\"name\":{},\"arguments\":{}}}",
+        Value::String(name.to_string()),
+        args
+    )
+}
+
+fn calls_block(calls: &[&Value]) -> String {
+    let body = calls
+        .iter()
+        .map(|c| call_object(c))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!("```gray_calls\n[{body}]\n```")
+}
+
 /// Render a Responses `input` array to transcript text.
 fn render_items(items: &[Value]) -> String {
-    items
-        .iter()
-        .filter_map(render_item)
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    let mut records: Vec<String> = Vec::new();
+    let mut open_assistant = false;
+    let mut i = 0;
+    while i < items.len() {
+        let item = &items[i];
+        if item_kind(item) == "function_call" {
+            let mut calls = vec![item];
+            while i + 1 < items.len() && item_kind(&items[i + 1]) == "function_call" {
+                i += 1;
+                calls.push(&items[i]);
+            }
+            let block = calls_block(&calls);
+            match records.last_mut() {
+                Some(last) if open_assistant => {
+                    last.push_str("\n\n");
+                    last.push_str(&block);
+                }
+                _ => records.push(format!("[Assistant]\n{block}")),
+            }
+            open_assistant = false;
+        } else if let Some(r) = render_item(item) {
+            open_assistant = item_kind(item) == "message"
+                && item.get("role").and_then(Value::as_str) == Some("assistant");
+            records.push(r);
+        }
+        i += 1;
+    }
+    records.join("\n\n")
 }
 
 /// Translate an OpenAI Responses body into one funnel turn.
@@ -408,12 +451,7 @@ pub fn parse_calls_block(text: &str, names: &[String]) -> Option<(String, Vec<(S
                 // `names` can't run even when the host owns such a tool —
                 // fold to `native__…` so the "does not exist" error
                 // teaches the real surface instead of silently executing.
-                let name = if names.iter().any(|n| n == name) {
-                    name.to_string()
-                } else {
-                    denamespace(name, names).unwrap_or_else(|| native_name(name))
-                };
-                (name, args.to_string())
+                (funnel_name(name, names), args.to_string())
             })
             .collect(),
         None => vec![(guess.to_string(), candidate.to_string())],
@@ -421,14 +459,75 @@ pub fn parse_calls_block(text: &str, names: &[String]) -> Option<(String, Vec<(S
     Some((text[..start].trim_end().to_string(), calls))
 }
 
-/// A leading self-delimiting JSON array, ignoring whatever follows: the
-/// model may append native tool markup or hallucinated transcript turns
-/// after the array, and both are noise to drop, not parse failures.
+pub(crate) fn funnel_name(name: &str, names: &[String]) -> String {
+    if names.iter().any(|n| n == name) {
+        name.to_string()
+    } else {
+        denamespace(name, names).unwrap_or_else(|| native_name(name))
+    }
+}
+
+/// A leading self-delimiting JSON value and where it ended: the model may
+/// append native tool markup or hallucinated transcript turns after it,
+/// and both are noise to drop, not parse failures.
+fn json_value_prefix(s: &str) -> Option<(Value, usize)> {
+    let mut stream = serde_json::Deserializer::from_str(s).into_iter::<Value>();
+    let v = stream.next()?.ok()?;
+    Some((v, stream.byte_offset()))
+}
+
+/// A leading self-delimiting JSON array, ignoring whatever follows.
 fn json_array_prefix(s: &str) -> Option<Vec<Value>> {
-    serde_json::Deserializer::from_str(s)
-        .into_iter::<Vec<Value>>()
-        .next()?
-        .ok()
+    match json_value_prefix(s)? {
+        (Value::Array(a), _) => Some(a),
+        _ => None,
+    }
+}
+
+/// The next `[Tool call …]` header line: its inner text (`bash id=x]`)
+/// and the offset just past the line.
+fn tool_call_header(s: &str) -> Option<(&str, usize)> {
+    let mut off = 0;
+    for line in s.split_inclusive('\n') {
+        let head = line.trim_start_matches([' ', '\t']);
+        if let Some(inner) = head.strip_prefix("[Tool call ") {
+            return Some((inner.trim_end(), off + line.len()));
+        }
+        off += line.len();
+    }
+    None
+}
+
+/// Salvage fabricated `[Tool call NAME id=ID]` transcript records — each
+/// header line followed by its JSON arguments — into real funnel calls.
+/// The model imitates the old history format and writes its call as a
+/// record instead of a gray_calls block; what it meant still runs.
+pub(crate) fn salvage_calls(text: &str, names: &[String]) -> Vec<(String, String)> {
+    let mut calls = Vec::new();
+    let mut rest = text;
+    while let Some((header, end)) = tool_call_header(rest) {
+        let name = header
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(']');
+        rest = &rest[end..];
+        if name.is_empty() {
+            continue;
+        }
+        let mut body = rest.trim_start();
+        if let Some(fenced) = body.strip_prefix("```") {
+            body = fenced.strip_prefix("json").unwrap_or(fenced).trim_start();
+        }
+        match json_value_prefix(body) {
+            Some((args, used)) => {
+                calls.push((funnel_name(name, names), args.to_string()));
+                rest = &body[used..];
+            }
+            None => calls.push((funnel_name(name, names), "{}".to_string())),
+        }
+    }
+    calls
 }
 
 /// Undo the slips models make inside JSON strings: raw control characters

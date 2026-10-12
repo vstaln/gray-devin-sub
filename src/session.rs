@@ -72,7 +72,7 @@ use serde_json::{Value, json};
 
 use crate::chat::{
     CUT_NOTE, PreparedTurn, TurnResult, Usage, blocked_call, continuation, parse_calls_block,
-    rand_hex, redirect_call, usage_from,
+    rand_hex, redirect_call, salvage_calls, usage_from,
 };
 use crate::guard::{TurnGuard, marker_name, strip_reasoning};
 use crate::setup;
@@ -1597,16 +1597,46 @@ impl LiveSession {
     fn finish(&mut self, stop_reason: &str) -> TurnResult {
         let turn_id = rand_hex(8);
         // Redirected native calls never mix with funnel calls: redirect wins.
+        let salvage = self.guard.salvage();
         let mut text = self.text.trim().to_string();
         let calls: Vec<(String, String)> = if !self.redirected.is_empty() {
+            if let Some(at) = salvage {
+                text = self.text[..at].trim().to_string();
+            }
             self.redirected.clone()
         } else {
-            match parse_calls_block(&self.text, &self.names) {
+            let head = salvage.map_or(self.text.as_str(), |at| &self.text[..at]);
+            match parse_calls_block(head, &self.names) {
                 Some((before, calls)) => {
                     text = before.trim().to_string();
                     calls
                 }
-                None => Vec::new(),
+                None => match salvage {
+                    Some(at) => {
+                        let calls = salvage_calls(&self.text[at..], &self.names);
+                        text = self.text[..at].trim().to_string();
+                        if calls.is_empty() {
+                            crate::chat::pool_event(
+                                &format!("turn_cut:Tool_call\tat={at}"),
+                                &self.session_id,
+                            );
+                            eprintln!(
+                                "devin-sub: reply cut at fabricated Tool_call record (offset {at}); nothing salvageable"
+                            );
+                        } else {
+                            crate::chat::pool_event(
+                                &format!("turn_salvage\tcalls={}", calls.len()),
+                                &self.session_id,
+                            );
+                            eprintln!(
+                                "devin-sub: salvaged {} fabricated Tool_call record(s) (offset {at})",
+                                calls.len()
+                            );
+                        }
+                        calls
+                    }
+                    None => Vec::new(),
+                },
             }
         };
         let text = strip_reasoning(&text).trim().to_string();

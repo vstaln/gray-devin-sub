@@ -1,23 +1,32 @@
-pub const RECORDS: [&str; 6] = [
+pub const RECORDS: [&str; 5] = [
     "[User]",
     "[Assistant]",
     "[Assistant reasoning]",
     "[System]",
-    "[Tool call ",
     "[Tool result ",
 ];
 
 const LABEL: &str = "[Assistant]";
+/// A fabricated call record is recovered at finish time, not cut: its
+/// line's byte offset marks where visible output ends and the
+/// `[Tool call NAME id=ID]` + JSON-args records begin.
+const TOOL_CALL: &str = "[Tool call ";
 
 #[derive(Default, Clone, Debug)]
 pub struct TurnGuard {
     scanned: usize,
     cut: Option<&'static str>,
+    salvage: Option<usize>,
 }
 
 impl TurnGuard {
     pub fn cut(&self) -> Option<&'static str> {
         self.cut
+    }
+
+    /// Byte offset of the first fabricated `[Tool call` line, if any.
+    pub fn salvage(&self) -> Option<usize> {
+        self.salvage
     }
 
     pub fn feed(&mut self, text: &mut String) -> Option<&'static str> {
@@ -41,6 +50,9 @@ impl TurnGuard {
                 text.truncate(self.scanned);
                 self.cut = Some(*m);
                 return self.cut;
+            }
+            if self.salvage.is_none() && head.starts_with(TOOL_CALL) {
+                self.salvage = Some(self.scanned);
             }
             if !complete {
                 return None;
