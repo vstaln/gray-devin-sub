@@ -126,8 +126,9 @@ fn legacy_family_ids_resolve_by_effort() {
     // Old configs saved the folded family id; effort picks the tier.
     assert_eq!(resolve_native(&rows, "swe-2", Some("max")), "swe-2-max");
     assert_eq!(resolve_native(&rows, "swe-2", Some("high")), "swe-2-high");
-    // No matching tier (or none asked) → the routable header slug.
-    assert_eq!(resolve_native(&rows, "swe-2", Some("low")), "swe-2");
+    // An unoffered tier clamps to the closest declared one; none asked
+    // → the routable header slug.
+    assert_eq!(resolve_native(&rows, "swe-2", Some("low")), "swe-2-high");
     assert_eq!(
         resolve_native(&rows, "claude-opus-5-5", None),
         "claude-opus-5.5"
@@ -144,6 +145,73 @@ fn legacy_family_ids_resolve_by_effort() {
     // Unknown ids (and the Fusion header slug) pass through.
     assert_eq!(resolve_native(&rows, "fusion", Some("high")), "fusion");
     assert_eq!(resolve_native(&rows, "nope", None), "nope");
+}
+
+#[test]
+fn unoffered_effort_clamps_to_closest_tier() {
+    let rows = parse_list(SAMPLE);
+    // swe-2 declares only {high, max}: over- and under-asks clamp
+    // inward instead of dropping to the base route.
+    assert_eq!(
+        resolve_native(&rows, "swe-2", Some("xhigh")),
+        "swe-2-max"
+    );
+    assert_eq!(
+        resolve_native(&rows, "swe-2", Some("medium")),
+        "swe-2-high"
+    );
+    assert_eq!(
+        resolve_native(&rows, "swe-2", Some("minimal")),
+        "swe-2-high"
+    );
+    assert_eq!(resolve_native(&rows, "swe-2", Some("off")), "swe-2-high");
+    // Exact tiers still win; none asked still falls back to the slug.
+    assert_eq!(resolve_native(&rows, "swe-2", Some("max")), "swe-2-max");
+    assert_eq!(resolve_native(&rows, "swe-2", None), "swe-2");
+    // A tier word outside EFFORT_ORDER can't be placed → header slug.
+    assert_eq!(resolve_native(&rows, "swe-2", Some("turbo")), "swe-2");
+}
+
+#[test]
+fn effort_clamp_ties_upward_and_skips_fast() {
+    let rows = parse_list(
+        "Wide (wide)\n  wide-low  Wide Low\n  wide-high  Wide High\n\
+         Speed (speed)\n  speed-medium  Speed Medium\n  speed-max-fast  Speed Max Fast\n\
+         Solo (solo)\n  solo-medium  Solo Medium\n",
+    );
+    // {low, high} + medium is equidistant → the higher tier wins.
+    assert_eq!(
+        resolve_native(&rows, "wide", Some("medium")),
+        "wide-high"
+    );
+    assert_eq!(resolve_native(&rows, "wide", Some("xhigh")), "wide-high");
+    assert_eq!(
+        resolve_native(&rows, "wide", Some("minimal")),
+        "wide-low"
+    );
+    // `none` is `off`: clamps to the lowest offered tier.
+    assert_eq!(resolve_native(&rows, "wide", Some("none")), "wide-low");
+    // The fast lane never satisfies an effort pin — max is fast-only,
+    // so `max` clamps down to the non-fast medium.
+    assert_eq!(
+        resolve_native(&rows, "speed", Some("max")),
+        "speed-medium"
+    );
+    // A single-tier family clamps every request onto that member.
+    assert_eq!(resolve_native(&rows, "solo", Some("max")), "solo-medium");
+    assert_eq!(
+        resolve_native(&rows, "solo", Some("minimal")),
+        "solo-medium"
+    );
+    // Non-group ids are untouched: the lone `adaptive` row and unknown
+    // ids pass through whatever the effort says.
+    let rows = parse_list(SAMPLE);
+    assert_eq!(
+        resolve_native(&rows, "adaptive", Some("max")),
+        "adaptive"
+    );
+    assert_eq!(resolve_native(&rows, "nope", Some("max")), "nope");
+    assert_eq!(resolve_native(&rows, "swe", Some("max")), "swe");
 }
 
 #[test]
