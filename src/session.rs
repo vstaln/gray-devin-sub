@@ -364,6 +364,17 @@ pub struct LiveSession {
     /// conversation's next sidecar can claim it across a process
     /// boundary. The last absorbing turn owns it.
     pub(crate) gray_session: String,
+    /// The stage variant this child's config baked in, derived in
+    /// `spawn_child` from the spawn turn's `names` — the same expression
+    /// the callers pass to [`stage`]. Persisted so [`rewarm`] mounts the
+    /// same stage: a different cwd is a different system prefix and a
+    /// cold cache.
+    deny_search: bool,
+    /// Re-pooled from a persisted record after a sidecar restart: the
+    /// first real prompt is the load's proof — a wire failure there
+    /// means a stale record, so the turn falls back to a fresh child
+    /// instead of failing. Cleared once any prompt settles.
+    pub(crate) rewarmed: bool,
 }
 
 /// Replay state of a pooled session as persisted for [`reattach`]:
@@ -385,6 +396,12 @@ pub(crate) struct Persisted {
     /// by the owner-pid rule, exactly as before).
     #[serde(default)]
     pub gray_session: String,
+    /// The stage variant the owner spawned this session on. `None` on
+    /// records written before the field — still resumable via
+    /// [`reattach`] (the live turn's `names` pick a stage) but not
+    /// rewammable: the wrong stage's cwd is a cold cache.
+    #[serde(default)]
+    pub deny_search: Option<bool>,
 }
 
 fn unix_now() -> u64 {
@@ -593,6 +610,124 @@ pub fn reattach(
         }
     }
     None
+}
+
+/// Spawn an idle child for one persisted record: `session/load` of the
+/// orphaned session and nothing else — the transcript is already
+/// upstream, so no prompt follows. The child must complete the load
+/// handshake inside 30s: a refused or stale load pools nothing and the
+/// record stays a plain cold-start point for [`reattach`].
+fn spawn_idle(p: &Persisted, deny_search: bool) -> Option<LiveSession> {
+    let stage = stage(deny_search).ok()?;
+    // A synthetic turn carries the record's fixed spawn state. `names`
+    // holds a marker `web_search` entry so `spawn_child`'s `deny_search`
+    // derivation lands on the same stage the original session ran on.
+    let turn = PreparedTurn {
+        system: p.system.clone(),
+        content_line: String::new(),
+        input: Vec::new(),
+        names: if deny_search {
+            Vec::new()
+        } else {
+            vec!["web_search".to_string()]
+        },
+        native_model: p.native_model.clone(),
+        gray_session: p.gray_session.clone(),
+    };
+    let never = AtomicBool::new(false);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut s = spawn_child(&turn, stage).ok()?;
+    if let Err(e) = s.load(&p.session_id, &stage.work, deadline, &never) {
+        let gone = e.to_lowercase().contains("not found");
+        crate::chat::pool_event(
+            if gone { "rewarm:gone" } else { "rewarm:failed" },
+            &p.session_id,
+        );
+        if gone {
+            unpersist(&p.session_id);
+        }
+        s.abandon();
+        return None;
+    }
+    // Restore the strict-continuation fields and backdate both clocks by
+    // the record's age, exactly as `reattach` does: the next turn
+    // matches the session like a still-pooled one and the keepalive
+    // cadence resumes where the dead sidecar left off.
+    let now = unix_now();
+    let back = |t: u64| {
+        Instant::now()
+            .checked_sub(Duration::from_secs(now.saturating_sub(t)))
+            .unwrap_or_else(Instant::now)
+    };
+    s.absorbed = p.absorbed.clone();
+    s.reply_call_ids = p.reply_call_ids.clone();
+    s.reply_text = p.reply_text.clone();
+    s.last_used = back(p.last_used_unix);
+    s.last_prompt_at = Some(back(p.last_prompt_unix));
+    s.rewarmed = true;
+    Some(s)
+}
+
+/// Re-pool sessions persisted before a restart while a live owner would
+/// still be keepalive-warming them. The pool dies with the sidecar, and
+/// each orphaned session's ~5min upstream cache entry lapses before its
+/// next turn — loaded back idle here, the sessions rejoin the pool and
+/// the sweep resumes warming them on schedule. Bound by `MAX_LIVE`,
+/// freshest record first; a record whose owner still lives, that
+/// predates `deny_search`, or whose `session/load` is refused is skipped
+/// and stays a cold-start point for [`reattach`]. Runs once at startup
+/// on a background thread; silent on failure by design.
+pub fn rewarm() {
+    let window = keepalive_idle_max();
+    // Keepalives disabled: nothing would renew the loaded sessions, so
+    // eager pooling buys no warmth the lazy `reattach` path lacks.
+    if window.is_zero() {
+        return;
+    }
+    let now = unix_now();
+    let mut records = read_persisted();
+    records.sort_by_key(|p| std::cmp::Reverse(p.last_prompt_unix));
+    for p in records {
+        // Bound by live plus in-flight loads, and stop at the window
+        // edge — freshest-first means every later record is older still.
+        let free = {
+            let pool = locked_pool();
+            MAX_LIVE.saturating_sub(pool.live.len() + pool.warming.len())
+        };
+        if free == 0 || now.saturating_sub(p.last_prompt_unix) > window.as_secs() {
+            break;
+        }
+        // No continuation state to match a future turn against, or a
+        // live owner still holding the session (`session/load` would
+        // fail `session_locked`): resumable, not rewammable.
+        if p.absorbed.is_empty() || pid_alive(p.owner_pid) {
+            continue;
+        }
+        // No recorded stage variant (pre-`deny_search` record): the
+        // wrong cwd would mount a cold cache — leave it to `reattach`,
+        // which picks the stage from the live turn's `names`.
+        let Some(deny_search) = p.deny_search else {
+            continue;
+        };
+        // List the load as warming so a matching turn waits for it
+        // instead of racing its own `session/load` or a cold spawn.
+        locked_pool().warming.push(Warming {
+            session_id: p.session_id.clone(),
+            native_model: p.native_model.clone(),
+            system: p.system.clone(),
+        });
+        match spawn_idle(&p, deny_search) {
+            // `give_back` persists the record under this pid (claiming
+            // it), drops the warming marker, pools and wakes waiters.
+            Some(s) => give_back(s),
+            None => {
+                locked_pool()
+                    .warming
+                    .retain(|w| w.session_id != p.session_id);
+                POOL_CHANGED.notify_all();
+            }
+        }
+    }
 }
 
 /// A session out of the pool for a keepalive: enough to tell whether a
@@ -1168,6 +1303,8 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         keepalive_prompt: false,
         loading: false,
         gray_session: turn.gray_session.clone(),
+        deny_search: !turn.names.iter().any(|n| n == "web_search"),
+        rewarmed: false,
     };
     Ok(s)
 }
@@ -1252,6 +1389,7 @@ impl LiveSession {
             last_prompt_unix: now.saturating_sub(last_prompt.elapsed().as_secs()),
             owner_pid: std::process::id(),
             gray_session: self.gray_session.clone(),
+            deny_search: Some(self.deny_search),
         })
     }
 
@@ -1302,6 +1440,9 @@ impl LiveSession {
         cancel: &AtomicBool,
     ) -> Result<TurnResult, String> {
         let (result, unseen) = self.prompt_result(id, deadline, cancel)?;
+        // A settled prompt proves a re-pooled session: failures past
+        // here are turn failures, not stale records.
+        self.rewarmed = false;
         // `result.usage` wins when present and non-zero; a cancelled turn
         // carries none, so the last usage_update snapshot stands in.
         if let Some(u) = result.get("usage").and_then(usage_from) {

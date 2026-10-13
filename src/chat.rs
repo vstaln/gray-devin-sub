@@ -1120,54 +1120,65 @@ pub fn run_turn(
             let delta = s.note_cut(delta);
             let images = images_of(&turn.input[s.absorbed.len()..]);
             match s.send_prompt(&delta, &images, &turn.names) {
-                Ok(id) => {
-                    return match s.await_prompt(id, deadline, cancel) {
-                        Ok(r) => {
-                            s.absorb(turn, &r);
-                            trace_turn(
-                                mode,
-                                &s.session_id,
-                                delta.chars().count(),
-                                Some(&r),
-                                None,
-                                None,
-                            );
+                Ok(id) => match s.await_prompt(id, deadline, cancel) {
+                    Ok(r) => {
+                        s.absorb(turn, &r);
+                        trace_turn(
+                            mode,
+                            &s.session_id,
+                            delta.chars().count(),
+                            Some(&r),
+                            None,
+                            None,
+                        );
+                        session::give_back(s);
+                        return Ok(r);
+                    }
+                    Err(e) => {
+                        trace_turn(
+                            mode,
+                            &s.session_id,
+                            delta.chars().count(),
+                            None,
+                            Some(&e),
+                            None,
+                        );
+                        if s.rewarmed {
+                            // The re-pooled child's first prompt never
+                            // settled — a stale record, not a dead
+                            // conversation: the request is still
+                            // answerable on a fresh child.
+                            s.close();
+                            reason = "rewarm_dead";
+                            spawn_fresh(reason)?
+                        } else if s.prompt_in_flight {
+                            // The prompt may still be live upstream
+                            // (dead wire, unsettled cancel): the
+                            // session can't be trusted.
+                            s.close();
+                            return Err(e);
+                        } else {
+                            // The failed prompt settled upstream —
+                            // the session's absorb state is exactly
+                            // what matched this turn, so the host's
+                            // identical retry re-prompts the same
+                            // delta on the warm session instead of
+                            // re-billing the whole transcript.
                             session::give_back(s);
-                            Ok(r)
+                            return Err(e);
                         }
-                        Err(e) => {
-                            trace_turn(
-                                mode,
-                                &s.session_id,
-                                delta.chars().count(),
-                                None,
-                                Some(&e),
-                                None,
-                            );
-                            if s.prompt_in_flight {
-                                // The prompt may still be live upstream
-                                // (dead wire, unsettled cancel): the
-                                // session can't be trusted.
-                                s.close();
-                            } else {
-                                // The failed prompt settled upstream —
-                                // the session's absorb state is exactly
-                                // what matched this turn, so the host's
-                                // identical retry re-prompts the same
-                                // delta on the warm session instead of
-                                // re-billing the whole transcript.
-                                session::give_back(s);
-                            }
-                            Err(e)
-                        }
-                    };
-                }
+                    }
+                },
                 Err(_) => {
                     // The prompt never reached the child (dead pipe): close
                     // it and replay the whole transcript on a fresh session
                     // — the request is still answerable.
+                    reason = if s.rewarmed {
+                        "rewarm_dead"
+                    } else {
+                        "send_failed"
+                    };
                     s.close();
-                    reason = "send_failed";
                     spawn_fresh(reason)?
                 }
             }
