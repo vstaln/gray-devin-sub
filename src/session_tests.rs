@@ -126,6 +126,8 @@ fn stub_session() -> LiveSession {
         keepalive_prompt: false,
         loading: false,
         gray_session: String::new(),
+        deny_search: false,
+        rewarmed: false,
     }
 }
 
@@ -687,6 +689,7 @@ fn record(session_id: &str, model: &str, owner_pid: u32, last_prompt_unix: u64) 
         last_prompt_unix,
         owner_pid,
         gray_session: String::new(),
+        deny_search: Some(false),
     }
 }
 
