@@ -323,7 +323,7 @@ fn take_waits_for_a_checked_out_session() {
     let started = Instant::now();
     let (claimed, _) = take(&tb, &never);
     back.join().unwrap();
-    let (mut s, delta) = claimed.expect("turn missed while its session was checked out");
+    let (s, delta) = claimed.expect("turn missed while its session was checked out");
     assert!(started.elapsed() >= Duration::from_millis(250));
     assert_eq!(s.session_id, "s-borrowed-wait");
     assert_eq!(delta, "[User]\nmore");

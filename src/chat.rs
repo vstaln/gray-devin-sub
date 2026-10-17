@@ -1402,7 +1402,7 @@ pub fn fold_result(r: &TurnResult) -> Result<Vec<u8>, String> {
     let reasoning_tokens = if r.usage.reasoning_tokens > 0 {
         r.usage.reasoning_tokens
     } else {
-        (r.thought.len() + 3) / 4
+        r.thought.len().div_ceil(4)
     };
     let reasoning_tokens = reasoning_tokens.min(r.usage.output_tokens);
     let usage_val = json!({"input_tokens": r.usage.input_tokens,
