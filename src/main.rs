@@ -101,6 +101,11 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Re-pool sessions persisted before this restart while a live owner
+    // would still be keepalive-warming them — their ~5min upstream cache
+    // entries lapse otherwise. Best-effort, background.
+    std::thread::spawn(devin_sub::session::rewarm);
+
     let relays: Relays = Arc::new(Mutex::new(HashMap::new()));
     let mut lines =
         tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(tokio::io::stdin()));

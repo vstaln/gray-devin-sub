@@ -173,6 +173,7 @@ pub fn collapse(entries: Vec<ModelEntry>) -> Vec<ProviderModel> {
                         })
                         .collect(),
                     slots: Vec::new(),
+                    price_cliff_tokens: None,
                 });
             }
             continue;
@@ -185,6 +186,7 @@ pub fn collapse(entries: Vec<ModelEntry>) -> Vec<ProviderModel> {
                 reasoning_efforts: Vec::new(),
                 variants: Vec::new(),
                 slots: Vec::new(),
+                price_cliff_tokens: None,
             });
         }
     }
@@ -256,6 +258,7 @@ fn fusion_row(
                 options: sidekicks,
             },
         ],
+        price_cliff_tokens: None,
     }
 }
 

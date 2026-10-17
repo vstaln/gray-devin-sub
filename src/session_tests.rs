@@ -27,7 +27,8 @@ fn web_search_is_denied_only_off_the_advertised_surface() {
     .unwrap();
     let deny = proj["permissions"]["deny"].as_array().unwrap();
     assert!(!deny.iter().any(|r| r == "web_search"));
-    assert!(deny.iter().any(|r| r == "exec"));
+    let ask = proj["permissions"]["ask"].as_array().unwrap();
+    assert!(ask.iter().any(|r| r == "exec"));
 }
 
 fn stderr(lines: &[&str]) -> Arc<Mutex<VecDeque<String>>> {
@@ -126,6 +127,8 @@ fn stub_session() -> LiveSession {
         keepalive_prompt: false,
         loading: false,
         gray_session: String::new(),
+        deny_search: false,
+        rewarmed: false,
     }
 }
 
@@ -320,7 +323,7 @@ fn take_waits_for_a_checked_out_session() {
     let started = Instant::now();
     let (claimed, _) = take(&tb, &never);
     back.join().unwrap();
-    let (mut s, delta) = claimed.expect("turn missed while its session was checked out");
+    let (s, delta) = claimed.expect("turn missed while its session was checked out");
     assert!(started.elapsed() >= Duration::from_millis(250));
     assert_eq!(s.session_id, "s-borrowed-wait");
     assert_eq!(delta, "[User]\nmore");
@@ -687,6 +690,7 @@ fn record(session_id: &str, model: &str, owner_pid: u32, last_prompt_unix: u64) 
         last_prompt_unix,
         owner_pid,
         gray_session: String::new(),
+        deny_search: Some(false),
     }
 }
 
