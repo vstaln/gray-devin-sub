@@ -447,9 +447,12 @@ pub fn plain_groups(entries: &[ModelEntry]) -> Vec<PlainGroup<'_>> {
 /// the request's effort says. A folded row id that isn't itself routable
 /// (`swe-2`, from older configs or hosts that don't read `variants`)
 /// resolves to its non-fast member pinned to the request's effort
-/// (`swe-2` + `max` → `swe-2-max`, `gpt-6-sol` + `off` → `gpt-6-sol-none`);
-/// otherwise it falls back to the header slug — the documented routable
-/// family name — which lets Devin pick the family's default tier. `fusion`
+/// (`swe-2` + `max` → `swe-2-max`, `gpt-6-sol` + `off` → `gpt-6-sol-none`),
+/// or the closest declared tier when the family doesn't offer it —
+/// `swe-2` + `xhigh` → `swe-2-max`, never the default tier an over-ask
+/// would silently under-deliver. Otherwise it falls back to the header
+/// slug — the documented routable family name — which lets Devin pick
+/// the family's default tier. `fusion`
 /// with no resolved pairing is the Fusion header slug and passes through.
 pub fn native_model(model: &str, effort: Option<&str>) -> String {
     let Ok(entries) = entries() else {
@@ -467,15 +470,40 @@ pub fn resolve_native(entries: &[ModelEntry], model: &str, effort: Option<&str>)
         return model.to_string();
     };
     let want = effort.map(|t| if t == "none" { "off" } else { t });
-    if let Some(t) = want
-        && let Some((m, _, _)) = group
+    if let Some(t) = want {
+        if let Some((m, _, _)) = group
             .members
             .iter()
             .find(|(_, e, fast)| !fast && e.as_deref() == Some(t))
-    {
-        return m.id.clone();
+        {
+            return m.id.clone();
+        }
+        if let Some(m) = closest_effort(&group, t) {
+            return m.id.clone();
+        }
     }
     group.slug().unwrap_or(model).to_string()
+}
+
+/// The non-fast member whose declared effort is nearest `want` in
+/// [`EFFORT_ORDER`], preferring the higher tier on a tie — an over-ask
+/// must not silently under-deliver. `None` when `want` names no known
+/// tier or the group declares no efforts, leaving the base-route
+/// fallback in place.
+fn closest_effort<'a>(group: &PlainGroup<'a>, want: &str) -> Option<&'a ModelEntry> {
+    let w = EFFORT_ORDER.iter().position(|t| *t == want)?;
+    group
+        .members
+        .iter()
+        .filter(|(_, _, fast)| !fast)
+        .filter_map(|(m, e, _)| {
+            EFFORT_ORDER
+                .iter()
+                .position(|t| Some(*t) == e.as_deref())
+                .map(|i| (*m, i))
+        })
+        .min_by_key(|(_, i)| (i.abs_diff(w), std::cmp::Reverse(*i)))
+        .map(|(m, _)| m)
 }
 
 pub fn context_window(model: &str) -> Option<u32> {
