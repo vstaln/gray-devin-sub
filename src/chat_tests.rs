@@ -247,6 +247,7 @@ fn fold_emits_complete_function_call_items() {
             output_tokens: 5,
             cached_tokens: 3,
             cache_write_tokens: 4,
+            reasoning_tokens: 0,
         },
         stop: "tool_use".to_string(),
         unseen: false,

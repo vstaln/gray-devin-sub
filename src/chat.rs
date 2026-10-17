@@ -1033,11 +1033,13 @@ pub fn usage_from(v: &Value) -> Option<Usage> {
         output_tokens: get("outputTokens"),
         cached_tokens: get("cachedReadTokens"),
         cache_write_tokens: get("cachedWriteTokens"),
+        reasoning_tokens: get("thoughtTokens"),
     };
     if usage.input_tokens == 0
         && usage.output_tokens == 0
         && usage.cached_tokens == 0
         && usage.cache_write_tokens == 0
+        && usage.reasoning_tokens == 0
     {
         None
     } else {
@@ -1068,6 +1070,8 @@ pub struct Usage {
     /// Prompt tokens written to the cache (`cachedWriteTokens`); like
     /// `cached_tokens`, already counted inside `input_tokens`.
     pub cache_write_tokens: usize,
+    /// `thoughtTokens` from the ACP end-turn usage, when the model reports it.
+    pub reasoning_tokens: usize,
 }
 
 /// Run one turn: prompt a pooled continuation session with only the delta
@@ -1395,11 +1399,18 @@ pub fn fold_result(r: &TurnResult) -> Result<Vec<u8>, String> {
                     "call_id": id, "name": name, "arguments": args}}),
         );
     }
+    let reasoning_tokens = if r.usage.reasoning_tokens > 0 {
+        r.usage.reasoning_tokens
+    } else {
+        r.thought.len().div_ceil(4)
+    };
+    let reasoning_tokens = reasoning_tokens.min(r.usage.output_tokens);
     let usage_val = json!({"input_tokens": r.usage.input_tokens,
         "output_tokens": r.usage.output_tokens,
         "total_tokens": r.usage.input_tokens + r.usage.output_tokens,
         "input_tokens_details": {"cached_tokens": r.usage.cached_tokens,
-            "cache_creation_tokens": r.usage.cache_write_tokens}});
+            "cache_creation_tokens": r.usage.cache_write_tokens},
+        "output_tokens_details": {"reasoning_tokens": reasoning_tokens}});
     let (status, incomplete) = match r.stop.as_str() {
         "incomplete:max_output_tokens" => ("incomplete", json!({"reason": "max_output_tokens"})),
         s => (s, Value::Null),

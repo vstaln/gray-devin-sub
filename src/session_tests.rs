@@ -27,7 +27,8 @@ fn web_search_is_denied_only_off_the_advertised_surface() {
     .unwrap();
     let deny = proj["permissions"]["deny"].as_array().unwrap();
     assert!(!deny.iter().any(|r| r == "web_search"));
-    assert!(deny.iter().any(|r| r == "exec"));
+    let ask = proj["permissions"]["ask"].as_array().unwrap();
+    assert!(ask.iter().any(|r| r == "exec"));
 }
 
 fn stderr(lines: &[&str]) -> Arc<Mutex<VecDeque<String>>> {
