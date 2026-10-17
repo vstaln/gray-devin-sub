@@ -152,14 +152,8 @@ fn unoffered_effort_clamps_to_closest_tier() {
     let rows = parse_list(SAMPLE);
     // swe-2 declares only {high, max}: over- and under-asks clamp
     // inward instead of dropping to the base route.
-    assert_eq!(
-        resolve_native(&rows, "swe-2", Some("xhigh")),
-        "swe-2-max"
-    );
-    assert_eq!(
-        resolve_native(&rows, "swe-2", Some("medium")),
-        "swe-2-high"
-    );
+    assert_eq!(resolve_native(&rows, "swe-2", Some("xhigh")), "swe-2-max");
+    assert_eq!(resolve_native(&rows, "swe-2", Some("medium")), "swe-2-high");
     assert_eq!(
         resolve_native(&rows, "swe-2", Some("minimal")),
         "swe-2-high"
@@ -180,23 +174,14 @@ fn effort_clamp_ties_upward_and_skips_fast() {
          Solo (solo)\n  solo-medium  Solo Medium\n",
     );
     // {low, high} + medium is equidistant → the higher tier wins.
-    assert_eq!(
-        resolve_native(&rows, "wide", Some("medium")),
-        "wide-high"
-    );
+    assert_eq!(resolve_native(&rows, "wide", Some("medium")), "wide-high");
     assert_eq!(resolve_native(&rows, "wide", Some("xhigh")), "wide-high");
-    assert_eq!(
-        resolve_native(&rows, "wide", Some("minimal")),
-        "wide-low"
-    );
+    assert_eq!(resolve_native(&rows, "wide", Some("minimal")), "wide-low");
     // `none` is `off`: clamps to the lowest offered tier.
     assert_eq!(resolve_native(&rows, "wide", Some("none")), "wide-low");
     // The fast lane never satisfies an effort pin — max is fast-only,
     // so `max` clamps down to the non-fast medium.
-    assert_eq!(
-        resolve_native(&rows, "speed", Some("max")),
-        "speed-medium"
-    );
+    assert_eq!(resolve_native(&rows, "speed", Some("max")), "speed-medium");
     // A single-tier family clamps every request onto that member.
     assert_eq!(resolve_native(&rows, "solo", Some("max")), "solo-medium");
     assert_eq!(
@@ -206,10 +191,7 @@ fn effort_clamp_ties_upward_and_skips_fast() {
     // Non-group ids are untouched: the lone `adaptive` row and unknown
     // ids pass through whatever the effort says.
     let rows = parse_list(SAMPLE);
-    assert_eq!(
-        resolve_native(&rows, "adaptive", Some("max")),
-        "adaptive"
-    );
+    assert_eq!(resolve_native(&rows, "adaptive", Some("max")), "adaptive");
     assert_eq!(resolve_native(&rows, "nope", Some("max")), "nope");
     assert_eq!(resolve_native(&rows, "swe", Some("max")), "swe");
 }
