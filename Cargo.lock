@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "gray-devin-sub"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "gray-core",
