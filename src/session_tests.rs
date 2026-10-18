@@ -117,6 +117,7 @@ fn stub_session() -> LiveSession {
         dropped_siblings: 0,
         prior_dropped: 0,
         seen_calls: std::collections::HashSet::new(),
+        seen_update_kinds: std::collections::HashSet::new(),
         pending_perms: Vec::new(),
         batch_quiet: None,
         batch_flushed: false,
