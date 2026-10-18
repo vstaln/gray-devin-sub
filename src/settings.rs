@@ -2,8 +2,7 @@
 //!
 //! Default is bash-only: a harness may carry far more (search, discord,
 //! device tools, …) but a Devin turn sees — and may call — only `bash`
-//! plus `handoff` (always allowed: gray sends it exactly while a fusion
-//! selection's framing tells the lead the tool exists).
+//! plus whatever the policy file lists — nothing is force-allowed.
 //! `/devin tools …` in the REPL (the sidecar's `command/run`) and
 //! `devin-sub tools …` in a shell are the same operation on the same file,
 //! `<gray home>/devin-sub/tools.json`. `chat::prepare_turn` re-reads it on
@@ -40,10 +39,9 @@ impl Default for ToolPolicy {
 }
 
 impl ToolPolicy {
-    /// `name` may run upstream: it's listed, the policy is `all`, or it's
-    /// `handoff` — hiding it would strand a call the lead framing promises.
+    /// `name` may run upstream only if it's listed or the policy is `all`.
     pub fn allows(&self, name: &str) -> bool {
-        self.allow.contains(ALL) || self.allow.contains(name) || name == "handoff"
+        self.allow.contains(ALL) || self.allow.contains(name)
     }
 
     /// The persisted policy, or the bash-only default. Never errors: a
