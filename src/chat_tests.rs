@@ -201,37 +201,28 @@ fn redirect_search_maps_to_host_web_search() {
 }
 
 #[test]
-fn redirect_grep_runs_local_rg_not_web_search() {
+fn redirect_named_call_never_folds_into_web_search() {
     // devin's `grep` arrives as kind:"search" carrying a {query, path}
-    // pattern payload — it must run rg, never fold into web_search.
+    // pattern payload — the payload is a ripgrep pattern, so a web fold
+    // returns Tavily results for a local lookup (observed live).
     let u = json!({"kind": "search", "toolCallId": "grep:1#ab12",
         "rawInput": {"query": "useSeatHolders", "path": "/repo/components"}});
     let names = vec!["bash".to_string(), "web_search".to_string()];
-    let (name, args) = redirect_call(&u, &names).unwrap();
-    assert_eq!(name, "bash");
-    let parsed: Value = serde_json::from_str(&args).unwrap();
-    assert_eq!(
-        parsed["command"],
-        "rg -n -- 'useSeatHolders' '/repo/components'"
-    );
+    // unadvertised: resolves to nothing, and blocked_call echoes honestly
+    assert!(redirect_call(&u, &names).is_none());
     // a surface that advertises grep gets the call verbatim
     let names = vec!["bash".to_string(), "grep".to_string(), "web_search".to_string()];
-    let (name, _) = redirect_call(&u, &names).unwrap();
-    assert_eq!(name, "grep");
-}
-
-#[test]
-fn redirect_named_grep_in_other_kind_stays_local() {
-    // kind:"other" + a named tool whose {query} payload would otherwise
-    // be shape-guessed into web_search.
+    assert_eq!(redirect_call(&u, &names).unwrap().0, "grep");
+    // an anonymous {query} frame still guesses web, unchanged
+    let u = json!({"kind": "search", "rawInput": {"query": "x y"}});
+    assert_eq!(redirect_call(&u, &names).unwrap().0, "web_search");
+    // kind:"other" + a named tool whose {query} shape would otherwise be
+    // guessed into web_search — same rule
     let u = json!({"kind": "other",
         "_meta": {"cognition.ai/inferenceToolName": "grep"},
         "rawInput": {"query": "foo", "path": "/repo"}});
     let names = vec!["bash".to_string(), "web_search".to_string()];
-    let (name, args) = redirect_call(&u, &names).unwrap();
-    assert_eq!(name, "bash");
-    let parsed: Value = serde_json::from_str(&args).unwrap();
-    assert_eq!(parsed["command"], "rg -n -- 'foo' '/repo'");
+    assert!(redirect_call(&u, &names).is_none());
 }
 
 #[test]

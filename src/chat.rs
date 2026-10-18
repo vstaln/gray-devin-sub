@@ -650,16 +650,18 @@ pub(crate) fn redirect_call(update: &Value, names: &[String]) -> Option<(String,
         // Devin reports BOTH web search and web fetch as `kind: "fetch"`
         // (verified: search carries `rawInput.query` and
         // `_meta["cognition.ai/inferenceToolName"] = "web_search"`, fetch
-        // carries `rawInput.url` and `"webfetch"`), so classify by payload,
-        // not kind — except ACP's "search" kind is broader than web search:
-        // devin's local `grep` arrives here too, carrying a {query, path}
-        // pattern payload. When the frame names a non-web tool, the name
-        // decides; only anonymous or web-named calls belong to web_redirect.
-        "search" | "fetch" => match named_tool(update) {
-            Some(tool) if !is_web_name(&tool) => resolve_tool(&tool, update, input, names)
-                .or_else(|| local_search_call(&tool, input, names)),
-            _ => web_redirect(update, input, names),
-        },
+        // carries `rawInput.url` and `"webfetch"`), and reports its local
+        // `grep` as `kind: "search"` with the same {query}-shaped payload —
+        // so `kind` is a hint, never a verdict. A frame that names a tool
+        // resolves by that name (web names included); the payload guess is
+        // for anonymous frames only.
+        "search" | "fetch" => {
+            match native_tool_name(update).or_else(|| title_tool(update)) {
+                Some(_) => name_call(update, input, names)
+                    .or_else(|| title_call(update, input, names)),
+                None => web_redirect(update, input, names),
+            }
+        }
         // kind:"other" is the grab-bag: MCP-bridge and native-tool calls
         // whose title ("Calling bash from harness") still names the tool
         // the model meant even when rawInput doesn't carry tool_name.
@@ -701,14 +703,14 @@ fn shape_call(update: &Value, input: &Value, names: &[String]) -> Option<(String
         return args.and_then(|a| bash_args(a, has("bash")));
     }
     if input.get("url").is_some() || input.get("query").is_some() {
-        // A {url|query} payload only means a web call when the frame names
-        // nothing else: devin's `grep` reaches this arm named "grep" with a
-        // {query, path} pattern payload — folding it into web_search by
-        // shape alone turns a local ripgrep into a Tavily query.
-        return match named_tool(update) {
-            Some(tool) if !is_web_name(&tool) => local_search_call(&tool, input, names),
-            _ => web_redirect(update, input, names),
-        };
+        // Shape guessing is for anonymous frames: a named call that reached
+        // this point failed to resolve — folding it into web_search on
+        // payload alone turns e.g. devin's `grep` ({query, path} — a
+        // ripgrep pattern, not a web query) into a Tavily search.
+        if native_tool_name(update).is_some() || title_tool(update).is_some() {
+            return None;
+        }
+        return web_redirect(update, input, names);
     }
     None
 }
@@ -840,56 +842,6 @@ fn mcp_redirect(input: &Value, names: &[String]) -> Option<(String, String)> {
         .iter()
         .any(|n| n == tool)
         .then(|| (tool.to_string(), args.to_string()))
-}
-
-/// The tool a native update was reaching for, whichever field carries it:
-/// `_meta.inferenceToolName` / `toolCallId` first, then the title.
-fn named_tool(update: &Value) -> Option<String> {
-    native_tool_name(update).or_else(|| title_tool(update))
-}
-
-/// Web tool names in either devin's or the host's spelling: a call naming
-/// one of these is genuinely a web call; any other named call is not.
-fn is_web_name(tool: &str) -> bool {
-    matches!(tool, "web_search" | "web_fetch" | "webfetch" | "search" | "fetch")
-}
-
-/// devin's local-search tools when the surface doesn't advertise them —
-/// `grep`/`glob`/`find_file_by_name` run on bash as rg/find. Their {query}
-/// payload is a pattern, not a web query; sending it to web_search is a
-/// misroute (observed: grep returned Tavily results).
-fn local_search_call(tool: &str, input: &Value, names: &[String]) -> Option<(String, String)> {
-    let cmd = match tool {
-        "grep" => {
-            let pat = input
-                .get("pattern")
-                .or_else(|| input.get("query"))
-                .and_then(Value::as_str)?;
-            let path = input.get("path").and_then(Value::as_str).unwrap_or(".");
-            let ci = match input.get("case_insensitive").and_then(Value::as_bool) {
-                Some(true) => " -i",
-                _ => "",
-            };
-            format!("rg -n{ci} -- {} {}", shell_quote(pat), shell_quote(path))
-        }
-        "glob" | "find" | "find_file_by_name" => {
-            let pat = input
-                .get("pattern")
-                .or_else(|| input.get("glob_pattern"))
-                .and_then(Value::as_str)?;
-            let path = input.get("path").and_then(Value::as_str).unwrap_or(".");
-            format!(
-                "find {} -name {} -type f",
-                shell_quote(path),
-                shell_quote(pat)
-            )
-        }
-        _ => return None,
-    };
-    names
-        .iter()
-        .any(|n| n == "bash")
-        .then(|| ("bash".to_string(), json!({"command": cmd}).to_string()))
 }
 
 /// Native web search/fetch → the host's own tools when the policy allows
