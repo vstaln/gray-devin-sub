@@ -780,3 +780,25 @@ fn funnel_parse_repairs_raw_newlines_and_shell_escapes() {
     let args: Value = serde_json::from_str(&calls[0].1).unwrap();
     assert_eq!(args["command"], "echo \\$HOME\n\tgrep '\\d+'");
 }
+
+#[test]
+fn funnel_parse_inserts_a_dropped_closing_brace() {
+    // The arguments object closed but the call object didn't: `}]` where
+    // `}}]` was meant. The round runs instead of failing as one raw call.
+    let text = "rerunning\n```gray_calls\n[{\"name\": \"bash\", \"arguments\": {\"command\": \"cargo test\", \"timeout\": 900}]\n```";
+    let (before, calls) = parse_calls_block(text, &["bash".to_string()]).unwrap();
+    assert_eq!(before, "rerunning");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "bash");
+    let args: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+    assert_eq!(args["command"], "cargo test");
+    assert_eq!(args["timeout"], 900);
+}
+
+#[test]
+fn funnel_parse_closes_an_array_left_open_before_the_fence() {
+    let text = "```gray_calls\n[{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}\n```\nmore prose";
+    let (_, calls) = parse_calls_block(text, &["bash".to_string()]).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+    assert_eq!(args["command"], "ls");
+}

@@ -430,15 +430,18 @@ pub fn parse_calls_block(text: &str, names: &[String]) -> Option<(String, Vec<(S
             // (a command grepping for the funnel's own marker) must not cut
             // the block short. Only an array that fails to parse falls back
             // to the fence-delimited text, for the guess path below.
-            let parsed = json_array_prefix(body).or_else(|| json_array_prefix(&repair_json(body)));
-            let body = if parsed.is_some() {
-                body
-            } else {
-                after
-                    .find("```")
-                    .map_or(after, |close| &after[..close])
-                    .trim()
-            };
+            let fenced = after
+                .find("```")
+                .map_or(after, |close| &after[..close])
+                .trim();
+            let parsed = json_array_prefix(body)
+                .or_else(|| json_array_prefix(&repair_json(body)))
+                .or_else(|| {
+                    [body, fenced].into_iter().find_map(|s| {
+                        close_brackets(&repair_json(s)).and_then(|s| json_array_prefix(&s))
+                    })
+                });
+            let body = if parsed.is_some() { body } else { fenced };
             break (idx, body, parsed);
         }
         search_from = idx;
@@ -530,6 +533,54 @@ pub(crate) fn salvage_calls(text: &str, names: &[String]) -> Vec<(String, String
         }
     }
     calls
+}
+
+/// Insert the closers a model dropped: a `]` or `}` that doesn't match the
+/// innermost open bracket first closes what is still open inside it, and an
+/// array left open at the end gets its closers appended. `None` when nothing
+/// needed fixing, a closer has nothing to close, or the text ends inside a
+/// string — the slip is then not a missing bracket.
+fn close_brackets(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut stack: Vec<char> = Vec::new();
+    let (mut in_str, mut escaped, mut fixed) = (false, false, false);
+    for (i, c) in s.char_indices() {
+        if in_str {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '[' => stack.push(']'),
+            '{' => stack.push('}'),
+            ']' | '}' => {
+                while stack.last().is_some_and(|&want| want != c) {
+                    out.extend(stack.pop());
+                    fixed = true;
+                }
+                stack.pop()?;
+                if stack.is_empty() {
+                    out.push(c);
+                    out.push_str(&s[i + c.len_utf8()..]);
+                    return fixed.then_some(out);
+                }
+            }
+            _ => {}
+        }
+        out.push(c);
+    }
+    if in_str || stack.is_empty() {
+        return None;
+    }
+    out.extend(stack.into_iter().rev());
+    Some(out)
 }
 
 /// Undo the slips models make inside JSON strings: raw control characters
