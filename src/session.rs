@@ -228,13 +228,15 @@ impl AcpStage {
                 .as_bytes(),
         )
         .map_err(|e| format!("staging config: {e}"))?;
-        // User config: no MCP servers, rules, skills, subagents, auto-update
-        // or notifications — but credentials still load.
+        // User config: no MCP servers, rules, skills, auto-update
+        // or notifications — but credentials still load. Subagents stay
+        // enabled: the tool exists natively and disabling it leaves the
+        // model reaching for a tool that is not there.
         write_atomic(
             &cfg.join("config.json"),
             json!({
                 "version": 1,
-                "subagents_enabled": false,
+                "subagents_enabled": true,
                 "auto_update": false,
                 "notify": "never",
                 "read_config_from": {
@@ -344,6 +346,7 @@ pub struct LiveSession {
     dropped_siblings: usize,
     prior_dropped: usize,
     seen_calls: HashSet<String>,
+    seen_update_kinds: HashSet<String>,
     pending_perms: Vec<Value>,
     batch_quiet: Option<Instant>,
     batch_flushed: bool,
@@ -1293,6 +1296,7 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         dropped_siblings: 0,
         prior_dropped: 0,
         seen_calls: HashSet::new(),
+        seen_update_kinds: HashSet::new(),
         pending_perms: Vec::new(),
         batch_quiet: None,
         batch_flushed: false,
@@ -1734,6 +1738,18 @@ impl LiveSession {
             }
             _ => {
                 self.text_boundary = true;
+                // Fusion pairings can emit kinds we don't model (e.g.
+                // sidekick activity). Log each distinct kind once per
+                // session so nothing vanishes silently.
+                let k = kind.unwrap_or("<missing>");
+                if self.seen_update_kinds.insert(k.to_string()) {
+                    let mut s = update.to_string();
+                    if s.len() > 200 {
+                        s.truncate(200);
+                        s.push('\u{2026}');
+                    }
+                    eprintln!("devin-sub: unhandled sessionUpdate kind={k} update={s}");
+                }
             }
         }
     }

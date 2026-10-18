@@ -201,6 +201,31 @@ fn redirect_search_maps_to_host_web_search() {
 }
 
 #[test]
+fn redirect_named_call_never_folds_into_web_search() {
+    // devin's `grep` arrives as kind:"search" carrying a {query, path}
+    // pattern payload — the payload is a ripgrep pattern, so a web fold
+    // returns Tavily results for a local lookup (observed live).
+    let u = json!({"kind": "search", "toolCallId": "grep:1#ab12",
+        "rawInput": {"query": "useSeatHolders", "path": "/repo/components"}});
+    let names = vec!["bash".to_string(), "web_search".to_string()];
+    // unadvertised: resolves to nothing, and blocked_call echoes honestly
+    assert!(redirect_call(&u, &names).is_none());
+    // a surface that advertises grep gets the call verbatim
+    let names = vec!["bash".to_string(), "grep".to_string(), "web_search".to_string()];
+    assert_eq!(redirect_call(&u, &names).unwrap().0, "grep");
+    // an anonymous {query} frame still guesses web, unchanged
+    let u = json!({"kind": "search", "rawInput": {"query": "x y"}});
+    assert_eq!(redirect_call(&u, &names).unwrap().0, "web_search");
+    // kind:"other" + a named tool whose {query} shape would otherwise be
+    // guessed into web_search — same rule
+    let u = json!({"kind": "other",
+        "_meta": {"cognition.ai/inferenceToolName": "grep"},
+        "rawInput": {"query": "foo", "path": "/repo"}});
+    let names = vec!["bash".to_string(), "web_search".to_string()];
+    assert!(redirect_call(&u, &names).is_none());
+}
+
+#[test]
 fn redirect_edit_maps_to_python_replace() {
     let u = json!({"kind": "edit", "rawInput": {"file_path": "/tmp/f.txt",
         "old_string": "a'b", "new_string": "c"}});
@@ -779,4 +804,26 @@ fn funnel_parse_repairs_raw_newlines_and_shell_escapes() {
     let (_, calls) = parse_calls_block(&text, &["bash".to_string()]).unwrap();
     let args: Value = serde_json::from_str(&calls[0].1).unwrap();
     assert_eq!(args["command"], "echo \\$HOME\n\tgrep '\\d+'");
+}
+
+#[test]
+fn funnel_parse_inserts_a_dropped_closing_brace() {
+    // The arguments object closed but the call object didn't: `}]` where
+    // `}}]` was meant. The round runs instead of failing as one raw call.
+    let text = "rerunning\n```gray_calls\n[{\"name\": \"bash\", \"arguments\": {\"command\": \"cargo test\", \"timeout\": 900}]\n```";
+    let (before, calls) = parse_calls_block(text, &["bash".to_string()]).unwrap();
+    assert_eq!(before, "rerunning");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "bash");
+    let args: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+    assert_eq!(args["command"], "cargo test");
+    assert_eq!(args["timeout"], 900);
+}
+
+#[test]
+fn funnel_parse_closes_an_array_left_open_before_the_fence() {
+    let text = "```gray_calls\n[{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}\n```\nmore prose";
+    let (_, calls) = parse_calls_block(text, &["bash".to_string()]).unwrap();
+    let args: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+    assert_eq!(args["command"], "ls");
 }

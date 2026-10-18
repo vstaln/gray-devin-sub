@@ -430,15 +430,18 @@ pub fn parse_calls_block(text: &str, names: &[String]) -> Option<(String, Vec<(S
             // (a command grepping for the funnel's own marker) must not cut
             // the block short. Only an array that fails to parse falls back
             // to the fence-delimited text, for the guess path below.
-            let parsed = json_array_prefix(body).or_else(|| json_array_prefix(&repair_json(body)));
-            let body = if parsed.is_some() {
-                body
-            } else {
-                after
-                    .find("```")
-                    .map_or(after, |close| &after[..close])
-                    .trim()
-            };
+            let fenced = after
+                .find("```")
+                .map_or(after, |close| &after[..close])
+                .trim();
+            let parsed = json_array_prefix(body)
+                .or_else(|| json_array_prefix(&repair_json(body)))
+                .or_else(|| {
+                    [body, fenced].into_iter().find_map(|s| {
+                        close_brackets(&repair_json(s)).and_then(|s| json_array_prefix(&s))
+                    })
+                });
+            let body = if parsed.is_some() { body } else { fenced };
             break (idx, body, parsed);
         }
         search_from = idx;
@@ -532,6 +535,54 @@ pub(crate) fn salvage_calls(text: &str, names: &[String]) -> Vec<(String, String
     calls
 }
 
+/// Insert the closers a model dropped: a `]` or `}` that doesn't match the
+/// innermost open bracket first closes what is still open inside it, and an
+/// array left open at the end gets its closers appended. `None` when nothing
+/// needed fixing, a closer has nothing to close, or the text ends inside a
+/// string — the slip is then not a missing bracket.
+fn close_brackets(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut stack: Vec<char> = Vec::new();
+    let (mut in_str, mut escaped, mut fixed) = (false, false, false);
+    for (i, c) in s.char_indices() {
+        if in_str {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '[' => stack.push(']'),
+            '{' => stack.push('}'),
+            ']' | '}' => {
+                while stack.last().is_some_and(|&want| want != c) {
+                    out.extend(stack.pop());
+                    fixed = true;
+                }
+                stack.pop()?;
+                if stack.is_empty() {
+                    out.push(c);
+                    out.push_str(&s[i + c.len_utf8()..]);
+                    return fixed.then_some(out);
+                }
+            }
+            _ => {}
+        }
+        out.push(c);
+    }
+    if in_str || stack.is_empty() {
+        return None;
+    }
+    out.extend(stack.into_iter().rev());
+    Some(out)
+}
+
 /// Undo the slips models make inside JSON strings: raw control characters
 /// (a heredoc's literal newlines and tabs) get escaped, and escapes JSON
 /// doesn't define (a shell dollar, a regex digit class) keep their
@@ -599,9 +650,18 @@ pub(crate) fn redirect_call(update: &Value, names: &[String]) -> Option<(String,
         // Devin reports BOTH web search and web fetch as `kind: "fetch"`
         // (verified: search carries `rawInput.query` and
         // `_meta["cognition.ai/inferenceToolName"] = "web_search"`, fetch
-        // carries `rawInput.url` and `"webfetch"`), so classify by payload,
-        // not kind.
-        "search" | "fetch" => web_redirect(update, input, names),
+        // carries `rawInput.url` and `"webfetch"`), and reports its local
+        // `grep` as `kind: "search"` with the same {query}-shaped payload —
+        // so `kind` is a hint, never a verdict. A frame that names a tool
+        // resolves by that name (web names included); the payload guess is
+        // for anonymous frames only.
+        "search" | "fetch" => {
+            match native_tool_name(update).or_else(|| title_tool(update)) {
+                Some(_) => name_call(update, input, names)
+                    .or_else(|| title_call(update, input, names)),
+                None => web_redirect(update, input, names),
+            }
+        }
         // kind:"other" is the grab-bag: MCP-bridge and native-tool calls
         // whose title ("Calling bash from harness") still names the tool
         // the model meant even when rawInput doesn't carry tool_name.
@@ -643,6 +703,13 @@ fn shape_call(update: &Value, input: &Value, names: &[String]) -> Option<(String
         return args.and_then(|a| bash_args(a, has("bash")));
     }
     if input.get("url").is_some() || input.get("query").is_some() {
+        // Shape guessing is for anonymous frames: a named call that reached
+        // this point failed to resolve — folding it into web_search on
+        // payload alone turns e.g. devin's `grep` ({query, path} — a
+        // ripgrep pattern, not a web query) into a Tavily search.
+        if native_tool_name(update).is_some() || title_tool(update).is_some() {
+            return None;
+        }
         return web_redirect(update, input, names);
     }
     None
