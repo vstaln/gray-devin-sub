@@ -201,6 +201,40 @@ fn redirect_search_maps_to_host_web_search() {
 }
 
 #[test]
+fn redirect_grep_runs_local_rg_not_web_search() {
+    // devin's `grep` arrives as kind:"search" carrying a {query, path}
+    // pattern payload — it must run rg, never fold into web_search.
+    let u = json!({"kind": "search", "toolCallId": "grep:1#ab12",
+        "rawInput": {"query": "useSeatHolders", "path": "/repo/components"}});
+    let names = vec!["bash".to_string(), "web_search".to_string()];
+    let (name, args) = redirect_call(&u, &names).unwrap();
+    assert_eq!(name, "bash");
+    let parsed: Value = serde_json::from_str(&args).unwrap();
+    assert_eq!(
+        parsed["command"],
+        "rg -n -- 'useSeatHolders' '/repo/components'"
+    );
+    // a surface that advertises grep gets the call verbatim
+    let names = vec!["bash".to_string(), "grep".to_string(), "web_search".to_string()];
+    let (name, _) = redirect_call(&u, &names).unwrap();
+    assert_eq!(name, "grep");
+}
+
+#[test]
+fn redirect_named_grep_in_other_kind_stays_local() {
+    // kind:"other" + a named tool whose {query} payload would otherwise
+    // be shape-guessed into web_search.
+    let u = json!({"kind": "other",
+        "_meta": {"cognition.ai/inferenceToolName": "grep"},
+        "rawInput": {"query": "foo", "path": "/repo"}});
+    let names = vec!["bash".to_string(), "web_search".to_string()];
+    let (name, args) = redirect_call(&u, &names).unwrap();
+    assert_eq!(name, "bash");
+    let parsed: Value = serde_json::from_str(&args).unwrap();
+    assert_eq!(parsed["command"], "rg -n -- 'foo' '/repo'");
+}
+
+#[test]
 fn redirect_edit_maps_to_python_replace() {
     let u = json!({"kind": "edit", "rawInput": {"file_path": "/tmp/f.txt",
         "old_string": "a'b", "new_string": "c"}});
