@@ -85,6 +85,7 @@ fn fallback_stderr_remains_redacted() {
 /// stdin and controllable clocks — no handshake needed to exercise pool
 /// bookkeeping. Tests kill the child before returning.
 fn stub_session() -> LiveSession {
+    #[cfg(unix)]
     let mut child = Command::new("sleep")
         .arg("60")
         .stdin(Stdio::piped())
@@ -92,6 +93,14 @@ fn stub_session() -> LiveSession {
         .stderr(Stdio::null())
         .spawn()
         .expect("sleep");
+    #[cfg(windows)]
+    let mut child = Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Start-Sleep", "-Seconds", "60"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("powershell");
     let stdin = child.stdin.take().expect("stdin");
     let (_tx, rx) = std::sync::mpsc::channel::<Value>();
     LiveSession {

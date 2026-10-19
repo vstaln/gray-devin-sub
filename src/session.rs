@@ -511,7 +511,18 @@ pub fn prune_persisted() {
 /// unknown counts as dead and Devin's own session lock is the backstop
 /// (a load of a session held by a live sidecar fails `session_locked`).
 fn pid_alive(pid: u32) -> bool {
-    pid == std::process::id() || Path::new(&format!("/proc/{pid}")).exists()
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 /// Whether a record's owner gate bars this turn from claiming it. A live
