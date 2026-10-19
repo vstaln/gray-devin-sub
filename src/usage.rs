@@ -15,8 +15,10 @@
 //! omitted, so a missing field is "unset", not zero.
 
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
+use base64::Engine;
+use prost::Message;
 use serde_json::{Value, json};
 
 use gray_plugin::ProviderRpcError;
@@ -26,13 +28,6 @@ use gray_plugin::ProviderRpcError;
 const REFRESH_AFTER: Duration = Duration::from_secs(30 * 60);
 /// Cap on the refresh command itself.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 fn cache_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")
@@ -71,7 +66,7 @@ pub fn handle() -> Result<Value, ProviderRpcError> {
             "no Devin CLI user-status cache; run `devin auth status` once".into(),
         ));
     };
-    if now_secs().saturating_sub(mtime) > REFRESH_AFTER.as_secs() {
+    if crate::setup::unix_secs().saturating_sub(mtime) > REFRESH_AFTER.as_secs() {
         refresh();
     }
     let Some((path, _)) = latest_cache() else {
@@ -81,32 +76,17 @@ pub fn handle() -> Result<Value, ProviderRpcError> {
     };
     let payload = read_payload(&path)
         .ok_or_else(|| ProviderRpcError::Unavailable("unreadable user-status cache".into()))?;
-    let limits = map_usage(&payload);
-    Ok(limits)
+    let status = Status::decode(&*payload)
+        .map_err(|_| ProviderRpcError::Unavailable("undecodable user-status payload".into()))?;
+    Ok(map_usage(&status))
 }
 
-/// `devin auth status` re-fetches user status when online; the spawned
-/// child gets a hard timeout so a hung refresh can't stall `/usage`.
+/// `devin auth status` re-fetches user status when online; a hard
+/// timeout keeps a hung refresh from stalling `/usage`.
 fn refresh() {
-    let mut child = match std::process::Command::new("devin")
-        .args(["auth", "status"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let deadline = std::time::Instant::now() + REFRESH_TIMEOUT;
-    while std::time::Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
-            Err(_) => break,
-        }
+    if let Some(binary) = crate::setup::resolve_command() {
+        let _ = crate::setup::run_captured(&binary, &["auth", "status"], REFRESH_TIMEOUT);
     }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// `{version, identity_digest, fetched_at_secs, payload}` — payload is
@@ -114,159 +94,58 @@ fn refresh() {
 fn read_payload(path: &std::path::Path) -> Option<Vec<u8>> {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     let b64 = v.get("payload").and_then(Value::as_str)?;
-    b64_decode(b64)
+    base64::engine::general_purpose::STANDARD.decode(b64).ok()
 }
 
-fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let mut acc = 0u32;
-    let mut n = 0;
-    for c in s.bytes() {
-        let Some(v) = T.iter().position(|&t| t == c) else {
-            if c == b'=' {
-                break;
-            }
-            continue;
-        };
-        acc = (acc << 6) | v as u32;
-        n += 1;
-        if n == 4 {
-            out.extend_from_slice(&acc.to_be_bytes()[1..]);
-            acc = 0;
-            n = 0;
-        }
-    }
-    // Tail group: 3 sextets = 18 bits → top 2 bytes; 2 sextets = 12 bits
-    // → top 1 byte. The sextets sit in acc's low bits, so shift the
-    // partial-byte padding off before slicing.
-    if n == 3 {
-        out.extend_from_slice(&(acc >> 2).to_be_bytes()[2..]);
-    } else if n == 2 {
-        out.push((acc >> 4) as u8);
-    }
-    Some(out)
-}
-
-// ---- minimal proto wire reader -----------------------------------------
+// ---- recovered GetUserStatus layout (unknown fields skipped) ---------
 
 /// Walk a protobuf message by field-number path, returning the raw field
 /// bytes for length-delimited fields or the varint for varint fields.
-#[derive(Clone, Copy)]
-enum Field<'a> {
-    Varint(u64),
-    Bytes(&'a [u8]),
+#[derive(Clone, PartialEq, Message)]
+struct Status {
+    /// Plan block: windows live directly on it, names under `.features`.
+    #[prost(message, tag = "13")]
+    plan: Option<Plan>,
 }
 
-fn each_field<'a>(b: &'a [u8], mut f: impl FnMut(u64, Field<'a>)) {
-    fn varint(b: &[u8], i: &mut usize) -> Option<u64> {
-        let mut n = 0u64;
-        let mut s = 0;
-        loop {
-            let byte = *b.get(*i)?;
-            n |= ((byte & 0x7f) as u64) << s;
-            s += 7;
-            *i += 1;
-            if byte & 0x80 == 0 {
-                return Some(n);
-            }
-            if s > 63 {
-                return None;
-            }
-        }
-    }
-    let mut i = 0usize;
-    while i < b.len() {
-        let Some(tag) = varint(b, &mut i) else { break };
-        let (num, wt) = (tag >> 3, tag & 7);
-        match wt {
-            0 => {
-                let Some(v) = varint(b, &mut i) else { break };
-                f(num, Field::Varint(v));
-            }
-            5 => {
-                let Some(v) = b.get(i..i + 4) else { break };
-                f(num, Field::Bytes(v));
-                i += 4;
-            }
-            1 => {
-                let Some(v) = b.get(i..i + 8) else { break };
-                f(num, Field::Bytes(v));
-                i += 8;
-            }
-            2 => {
-                let Some(len) = varint(b, &mut i) else { break };
-                let Some(v) = b.get(i..i + len as usize) else {
-                    break;
-                };
-                f(num, Field::Bytes(v));
-                i += len as usize;
-            }
-            _ => break,
-        }
-    }
+#[derive(Clone, PartialEq, Message)]
+struct Plan {
+    #[prost(message, tag = "1")]
+    features: Option<Features>,
+    #[prost(uint64, optional, tag = "14")]
+    daily_remaining: Option<u64>,
+    #[prost(uint64, optional, tag = "15")]
+    weekly_remaining: Option<u64>,
+    #[prost(uint64, optional, tag = "17")]
+    daily_reset: Option<u64>,
+    #[prost(uint64, optional, tag = "18")]
+    weekly_reset: Option<u64>,
 }
 
-fn varint_at(b: &[u8], path: &[u64]) -> Option<u64> {
-    let (&head, rest) = path.split_first()?;
-    let mut hit = None;
-    each_field(b, |num, f| {
-        if num != head || hit.is_some() {
-            return;
-        }
-        match (rest.is_empty(), f) {
-            (true, Field::Varint(v)) => hit = Some(v),
-            (false, Field::Bytes(inner)) => hit = varint_at(inner, rest),
-            _ => {}
-        }
-    });
-    hit
+#[derive(Clone, PartialEq, Message)]
+struct Features {
+    #[prost(string, optional, tag = "2")]
+    plan_name: Option<String>,
+    #[prost(message, tag = "33")]
+    devin_info: Option<DevinInfo>,
 }
 
-fn bytes_at<'a>(b: &'a [u8], path: &[u64]) -> Option<&'a [u8]> {
-    let (&head, rest) = path.split_first()?;
-    let mut hit = None;
-    each_field(b, |num, f| {
-        if num != head || hit.is_some() {
-            return;
-        }
-        match (rest.is_empty(), f) {
-            (true, Field::Bytes(v)) => hit = Some(v),
-            (false, Field::Bytes(inner)) => hit = bytes_at(inner, rest),
-            _ => {}
-        }
-    });
-    hit
+#[derive(Clone, PartialEq, Message)]
+struct DevinInfo {
+    #[prost(message, tag = "12")]
+    hint: Option<Hint>,
 }
 
-fn str_at(b: &[u8], path: &[u64]) -> Option<String> {
-    let raw = bytes_at(b, path)?;
-    std::str::from_utf8(raw).ok().map(str::to_string)
+#[derive(Clone, PartialEq, Message)]
+struct Hint {
+    #[prost(string, optional, tag = "2")]
+    text: Option<String>,
 }
 
 fn iso(secs: u64) -> String {
-    let days = (secs / 86400) as i64;
-    let tod = secs % 86400;
-    let (y, m, d) = civil(days);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        tod / 3600,
-        tod % 3600 / 60,
-        tod % 60
-    )
-}
-
-fn civil(z: i64) -> (i64, u32, u32) {
-    let z = z + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+        .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_default()
 }
 
 /// Map the decoded `GetUserStatusResponse` into usage windows.
@@ -280,11 +159,14 @@ fn civil(z: i64) -> (i64, u32, u32) {
 ///   (`.19`/`.20` acu_consumed/acu_limit are absent on unmetered plans)
 /// - `13.1` = plan features: `.2` plan_name, `.7` monthly flow credits,
 ///   `.8` monthly prompt credits, `.24` team features, `.33` devin_info
-fn map_usage(payload: &[u8]) -> Value {
+fn map_usage(status: &Status) -> Value {
     let mut windows = Vec::new();
     let mut notes = Vec::new();
 
-    let plan_name = str_at(payload, &[13, 1, 2]);
+    let plan = status.plan.as_ref();
+    let plan_name = plan
+        .and_then(|p| p.features.as_ref())
+        .and_then(|f| f.plan_name.clone());
     // The two quota windows the TUI's own quota line draws from: the
     // server publishes what is *left* (percent) plus the reset instant;
     // `used_percent` is the complement. A percent above 100 is an unset
@@ -305,22 +187,32 @@ fn map_usage(payload: &[u8]) -> Value {
             w
         })
     };
-    if let Some(left) = varint_at(payload, &[13, 14]) {
-        let reset = varint_at(payload, &[13, 17]).unwrap_or(0);
-        windows.extend(quota(left, reset, "daily", "Daily", "session", 24 * 60));
-    }
-    if let Some(left) = varint_at(payload, &[13, 15]) {
-        let reset = varint_at(payload, &[13, 18]).unwrap_or(0);
+    if let Some(left) = plan.and_then(|p| p.daily_remaining) {
         windows.extend(quota(
             left,
-            reset,
+            plan.and_then(|p| p.daily_reset).unwrap_or(0),
+            "daily",
+            "Daily",
+            "session",
+            24 * 60,
+        ));
+    }
+    if let Some(left) = plan.and_then(|p| p.weekly_remaining) {
+        windows.extend(quota(
+            left,
+            plan.and_then(|p| p.weekly_reset).unwrap_or(0),
             "weekly",
             "Weekly",
             "weekly",
             7 * 24 * 60,
         ));
     }
-    if let Some(hint) = str_at(payload, &[13, 1, 33, 12, 2]) {
+    if let Some(hint) = plan
+        .and_then(|p| p.features.as_ref())
+        .and_then(|f| f.devin_info.as_ref())
+        .and_then(|d| d.hint.as_ref())
+        .and_then(|h| h.text.clone())
+    {
         notes.push(hint);
     }
 
@@ -329,7 +221,7 @@ fn map_usage(payload: &[u8]) -> Value {
         "title": "Devin",
         "plan": plan_name.unwrap_or_else(|| "unknown".into()),
         "windows": windows,
-        "checked_at": iso(now_secs()),
+        "checked_at": iso(crate::setup::unix_secs()),
         "note": if notes.is_empty() { Value::Null } else { json!(notes.join(" · ")) },
     })
 }
@@ -380,7 +272,8 @@ mod tests {
         let mut payload = vfield(1, 1);
         payload.extend(field(13, &plan));
 
-        let limits = map_usage(&payload);
+        let status = Status::decode(&*payload).expect("wire bytes must decode");
+        let limits = map_usage(&status);
         assert_eq!(limits["plan"], "Max");
         let windows = limits["windows"].as_array().unwrap();
         let ids: Vec<&str> = windows.iter().map(|w| w["id"].as_str().unwrap()).collect();
@@ -399,16 +292,8 @@ mod tests {
 
     #[test]
     fn empty_payload_still_available() {
-        let limits = map_usage(&[]);
+        let limits = map_usage(&Status::default());
         assert_eq!(limits["available"], true);
         assert_eq!(limits["windows"].as_array().unwrap().len(), 0);
-    }
-
-    #[test]
-    fn b64_roundtrip() {
-        // payload blobs decode; trailing '=' padding terminates.
-        let raw = b"hello proto";
-        let enc = "aGVsbG8gcHJvdG8=";
-        assert_eq!(b64_decode(enc).unwrap(), raw);
     }
 }

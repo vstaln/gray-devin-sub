@@ -21,6 +21,75 @@ pub const INSTALL_HINT: &str = "`devin` not found on PATH. Install the Devin CLI
 pub const LOGIN_HINT: &str =
     "Devin CLI is installed but not logged in. Run `devin auth login`, then retry.";
 
+pub fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// Spawn `binary args`, drain both pipes on reader threads (a big listing
+/// deadlocks the child on a full pipe if drained after wait), kill on
+/// timeout. Returns (success, stdout, stderr).
+pub fn run_captured(
+    binary: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<(bool, String, String), String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(binary)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .envs(child_env())
+        .env("BROWSER", "/bin/true")
+        .env("DISPLAY", "")
+        .env("WAYLAND_DISPLAY", "")
+        .spawn()
+        .map_err(|e| format!("{binary}: {e}"))?;
+    fn drain(pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let mut p = pipe;
+            let _ = p.read_to_string(&mut s);
+            s
+        })
+    }
+    let out = child
+        .stdout
+        .take()
+        .map(drain)
+        .unwrap_or_else(|| std::thread::spawn(String::new));
+    let err = child
+        .stderr
+        .take()
+        .map(drain)
+        .unwrap_or_else(|| std::thread::spawn(String::new));
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out.join();
+                let _ = err.join();
+                return Err(format!("{binary} timed out"));
+            }
+            Err(e) => return Err(format!("{binary}: {e}")),
+        }
+    };
+    Ok((
+        status.map(|s| s.success()).unwrap_or(false),
+        out.join().unwrap_or_default(),
+        err.join().unwrap_or_default(),
+    ))
+}
+
 fn env_override() -> Option<String> {
     std::env::var("GRAY_DEVIN_SUB_COMMAND")
         .ok()
@@ -94,46 +163,15 @@ pub fn auth_status_output() -> (LoginState, Option<String>) {
     let Some(binary) = resolve_command() else {
         return (LoginState::Unknown, None);
     };
-    let mut child = match std::process::Command::new(&binary)
-        .args(["auth", "status"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .envs(child_env())
-        .env("BROWSER", "/bin/true")
-        .env("DISPLAY", "")
-        .env("WAYLAND_DISPLAY", "")
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return (LoginState::Unknown, None),
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break Some(s),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Ok(None) => break None,
-            Err(_) => break None,
-        }
-    };
-    let Some(status) = status else {
-        let _ = child.kill();
-        let _ = child.wait();
+    let Ok((ok, out, err)) = run_captured(
+        &binary,
+        &["auth", "status"],
+        std::time::Duration::from_secs(8),
+    ) else {
         return (LoginState::Unknown, None);
     };
-    let mut buf = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        use std::io::Read;
-        let _ = out.read_to_string(&mut buf);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        use std::io::Read;
-        let _ = err.read_to_string(&mut buf);
-    }
-    (auth_status_verdict(status.success(), &buf), Some(buf))
+    let buf = format!("{out}{err}");
+    (auth_status_verdict(ok, &buf), Some(buf))
 }
 
 /// Probe login state with `devin auth status` (8s cap; output captured and

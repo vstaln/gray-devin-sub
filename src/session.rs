@@ -9,8 +9,8 @@
 //! conversation, changed system text, diverged prefix) spawns a fresh
 //! `devin acp` + `session/new`.
 //!
-//! Pool rules: at most `MAX_LIVE` live children; a session leaves the pool
-//! for the duration of its turn (exclusive use) and returns on success —
+//! Pool rules: a session leaves the pool for the duration of its turn
+//! (exclusive use) and returns on success —
 //! including a client-disconnected turn whose prompt still settled: the
 //! reply was never delivered (the relay buffers a whole turn), so the
 //! session records an empty echo and the next request continues it with
@@ -22,8 +22,9 @@
 //! failure leaving a prompt in flight (dead wire, an unsettled cancel)
 //! closes the session — it is never pooled in a state the next turn
 //! can't trust. Sessions idle past `IDLE_TTL` or whose child
-//! exited are reaped on every pool access and by a 60s background sweep;
-//! [`shutdown`] closes everything.
+//! exited are detached on every pool access and by a 60s background
+//! sweep — the upstream session and record survive, so a later turn can
+//! [`reattach`] instead of re-billing. [`shutdown`] closes everything.
 //!
 //! Devin's upstream prompt cache is per-ACP-session with a ~5min TTL: a
 //! pooled child idles while gray's own model runs its tools, and the next
@@ -43,7 +44,7 @@
 //! next real turn simply appends after it. `last_used` (the `IDLE_TTL`
 //! user-activity clock) is likewise untouched — a warmed session still
 //! dies on schedule — and keepalives stop once user idleness passes
-//! `keepalive_idle_max()`, where the reaper takes over anyway.
+//! `KEEPALIVE_IDLE_MAX`, where the reaper takes over anyway.
 //!
 //! The pool is per sidecar process, but the upstream session is not: it
 //! survives in Devin's own store, `devin acp` can `session/load` it, and
@@ -77,8 +78,9 @@ use crate::chat::{
 use crate::guard::{TurnGuard, marker_name, strip_reasoning};
 use crate::setup;
 
-/// Pool bound: at most this many live `devin acp` children.
-const MAX_LIVE: usize = 4;
+/// At most this many orphaned records get mounted back at startup:
+/// only the freshest few could still hold a warm upstream cache.
+const REWARM_MAX: usize = 8;
 /// A pooled session idle this long is closed on the next pool access.
 /// Keepalives run until then, so this is also how long a paused
 /// conversation stays cache-warm: at 15min, coming back after a coffee
@@ -93,33 +95,18 @@ const KEEPALIVE_SWEEP: Duration = Duration::from_secs(30);
 /// hits a warm prefix.
 const KEEPALIVE_AFTER: Duration = Duration::from_secs(4 * 60);
 /// Keep warming only while the user is plausibly mid-break. The tradeoff
-/// is arithmetic: each keepalive is a billed upstream prompt, so warming
-/// the full `IDLE_TTL` costs ~14 prompts per pooled session — more than
-/// the single cold-cache re-bill it saves on a late return. `IDLE_TTL`
-/// still governs the pool: a session past this cap stays pooled and a
-/// return turn just re-warms on contact. `DEVIN_SUB_KEEPALIVE_MIN`
-/// overrides (minutes; `0` disables keepalives entirely).
-fn keepalive_idle_max() -> Duration {
-    std::env::var("DEVIN_SUB_KEEPALIVE_MIN")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .map(|m| m * 60)
-        .unwrap_or(Duration::from_secs(20 * 60))
-}
+/// is arithmetic: each keepalive is a billed upstream prompt, and past
+/// ~30min idle the odds of a return in the next TTL window are too low
+/// to keep paying them (pi uses the same horizon). `IDLE_TTL` still
+/// governs the pool: a session past this cap stays pooled and a return
+/// turn just re-warms on contact.
+const KEEPALIVE_IDLE_MAX: Duration = Duration::from_secs(30 * 60);
 /// How long after its last upstream prompt a persisted session of a dead
-/// sidecar is still worth reattaching. Its owner kept it keepalive-warm
-/// up to `keepalive_idle_max()` and the cache outlives the last prompt
-/// by ~5min; past that a `session/load` costs what `session/new` costs (a
-/// cold prefill) plus the history replay, so there is nothing to gain.
-/// `DEVIN_SUB_RELOAD_MAX_MIN` overrides (minutes; `0` disables reattach).
-fn reload_max_age() -> Duration {
-    std::env::var("DEVIN_SUB_RELOAD_MAX_MIN")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|m| Duration::from_secs(m * 60))
-        .unwrap_or(Duration::from_secs(30 * 60))
-}
+/// sidecar is still worth reattaching. Past the ~5min cache TTL a
+/// `session/load` cold-prefills like `session/new`, but it still sends
+/// only the delta and keeps the continuation alive — so this bound only
+/// prunes record files.
+const RELOAD_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// One keepalive prompt must settle inside this window; a session that
 /// can't is closed as untrusted, the same rule as a failed real turn.
 const KEEPALIVE_WINDOW: Duration = Duration::from_secs(60);
@@ -314,6 +301,11 @@ pub struct LiveSession {
     reply_call_ids: Vec<String>,
     /// The (trimmed) text emitted in that answer.
     reply_text: String,
+    /// The settled reply itself, kept in memory only: gray's warmer
+    /// replays byte-identical requests while the user idles — a stored
+    /// reply answers them without a billed upstream prompt. Never
+    /// persisted: a respawn's `session/load` replays history anyway.
+    last_reply: Option<TurnResult>,
     /// User-activity clock for the `IDLE_TTL` reaper: bumped by `absorb`
     /// only. A keepalive must never touch it or a warmed session would
     /// never die.
@@ -408,10 +400,7 @@ pub(crate) struct Persisted {
 }
 
 fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default()
+    crate::setup::unix_secs()
 }
 
 /// `<gray home>/devin-sub/pool`, the persisted replay records.
@@ -496,10 +485,10 @@ fn read_persisted() -> Vec<Persisted> {
     out
 }
 
-/// Delete records older than [`reload_max_age`] (plus the sweep slack a
+/// Delete records older than [`RELOAD_MAX_AGE`] (plus the sweep slack a
 /// dead owner can't provide). Called once per sidecar start.
 pub fn prune_persisted() {
-    let cutoff = unix_now().saturating_sub(reload_max_age().as_secs() + IDLE_TTL.as_secs());
+    let cutoff = unix_now().saturating_sub(RELOAD_MAX_AGE.as_secs() + IDLE_TTL.as_secs());
     for p in read_persisted() {
         if p.last_prompt_unix < cutoff {
             unpersist(&p.session_id);
@@ -554,9 +543,19 @@ pub(crate) fn reload_candidates(
         .filter(|p| now_unix.saturating_sub(p.last_prompt_unix) <= max_age.as_secs())
         .filter(|p| p.native_model == turn.native_model && p.system == turn.system)
         .filter_map(|p| {
-            let delta =
-                continuation(&p.absorbed, &p.reply_call_ids, &p.reply_text, &turn.input).ok()?;
-            Some((p, delta))
+            if let Ok(delta) =
+                continuation(&p.absorbed, &p.reply_call_ids, &p.reply_text, &turn.input)
+            {
+                return Some((p, delta));
+            }
+            // Same conversation, rewritten history: load its own session
+            // and prompt only the new tail (see `find`'s lenient pass).
+            if !p.gray_session.is_empty() && p.gray_session == turn.gray_session {
+                if let Some(delta) = crate::chat::tail_delta(&turn.input) {
+                    return Some((p, delta));
+                }
+            }
+            None
         })
         .collect();
     out.sort_by_key(|e| std::cmp::Reverse(e.0.last_prompt_unix));
@@ -574,11 +573,13 @@ pub fn reattach(
     deadline: Instant,
     cancel: &AtomicBool,
 ) -> Option<(LiveSession, String)> {
-    let max_age = reload_max_age();
-    if max_age.is_zero() {
-        return None;
-    }
-    let candidates = reload_candidates(read_persisted(), turn, unix_now(), max_age, &pid_alive);
+    let candidates = reload_candidates(
+        read_persisted(),
+        turn,
+        unix_now(),
+        RELOAD_MAX_AGE,
+        &pid_alive,
+    );
     let held = held_session_ids();
     for (record, delta) in candidates {
         if cancel.load(Ordering::SeqCst) {
@@ -686,29 +687,22 @@ fn spawn_idle(p: &Persisted, deny_search: bool) -> Option<LiveSession> {
 /// still be keepalive-warming them. The pool dies with the sidecar, and
 /// each orphaned session's ~5min upstream cache entry lapses before its
 /// next turn — loaded back idle here, the sessions rejoin the pool and
-/// the sweep resumes warming them on schedule. Bound by `MAX_LIVE`,
+/// the sweep resumes warming them on schedule. Bound by `REWARM_MAX`,
 /// freshest record first; a record whose owner still lives, that
 /// predates `deny_search`, or whose `session/load` is refused is skipped
 /// and stays a cold-start point for [`reattach`]. Runs once at startup
 /// on a background thread; silent on failure by design.
 pub fn rewarm() {
-    let window = keepalive_idle_max();
-    // Keepalives disabled: nothing would renew the loaded sessions, so
-    // eager pooling buys no warmth the lazy `reattach` path lacks.
-    if window.is_zero() {
-        return;
-    }
     let now = unix_now();
     let mut records = read_persisted();
     records.sort_by_key(|p| std::cmp::Reverse(p.last_prompt_unix));
+    let mut mounted = 0;
     for p in records {
-        // Bound by live plus in-flight loads, and stop at the window
-        // edge — freshest-first means every later record is older still.
-        let free = {
-            let pool = locked_pool();
-            MAX_LIVE.saturating_sub(pool.live.len() + pool.warming.len())
-        };
-        if free == 0 || now.saturating_sub(p.last_prompt_unix) > window.as_secs() {
+        // Cap the mounted count, and stop at the warming-window edge —
+        // freshest-first means every later record is older still.
+        if mounted >= REWARM_MAX
+            || now.saturating_sub(p.last_prompt_unix) > KEEPALIVE_IDLE_MAX.as_secs()
+        {
             break;
         }
         // No continuation state to match a future turn against, or a
@@ -733,7 +727,10 @@ pub fn rewarm() {
         match spawn_idle(&p, deny_search) {
             // `give_back` persists the record under this pid (claiming
             // it), drops the warming marker, pools and wakes waiters.
-            Some(s) => give_back(s),
+            Some(s) => {
+                mounted += 1;
+                give_back(s);
+            }
             None => {
                 locked_pool()
                     .warming
@@ -861,7 +858,7 @@ fn locked_pool() -> MutexGuard<'static, Pool> {
                     reap(&mut pool.live)
                 };
                 for s in dead {
-                    s.close();
+                    s.abandon();
                 }
             }
         });
@@ -878,8 +875,9 @@ fn locked_pool() -> MutexGuard<'static, Pool> {
     pool.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Pull dead/idle sessions out of a locked pool (caller closes them after
-/// releasing the lock — `close` can block a few seconds on `session/delete`).
+/// Pull dead/idle sessions out of a locked pool (caller abandons them after
+/// releasing the lock — the upstream session and record survive, so a later
+/// turn can [`reattach`] instead of re-billing the transcript).
 fn reap(pool: &mut Vec<LiveSession>) -> Vec<LiveSession> {
     let mut dead = Vec::new();
     let mut i = 0;
@@ -931,6 +929,23 @@ fn find(live: &[LiveSession], turn: &PreparedTurn) -> Result<(usize, String), &'
             reason = miss;
         }
     }
+    // No strict continuation. If the miss is this same conversation's
+    // own session (its transcript was rewritten — compaction, a cut), it
+    // still holds the earlier turns upstream: prompt only the new
+    // non-assistant tail instead of re-billing a fresh transcript.
+    if !turn.gray_session.is_empty() {
+        for (i, s) in live.iter().enumerate() {
+            if s.native_model != turn.native_model
+                || s.system != turn.system
+                || s.gray_session != turn.gray_session
+            {
+                continue;
+            }
+            if let Some(delta) = crate::chat::tail_delta(&turn.input) {
+                return Ok((i, delta));
+            }
+        }
+    }
     Err(reason)
 }
 
@@ -943,6 +958,35 @@ fn find(live: &[LiveSession], turn: &PreparedTurn) -> Result<(usize, String), &'
 /// timeout retry, an interrupted resend) lands here: waiting turns a
 /// cold `session/new` into a warm continuation. On a miss the second
 /// item is the reason.
+/// A byte-identical replay of a request a pooled session already
+/// answered (gray's cache warmer resends the last request while the user
+/// idles): return the recorded reply with zeroed usage — no upstream
+/// prompt, no spawn, no delta. `continuation()` can't match it (a replay
+/// adds nothing to the input), so without this every warm replay spawned
+/// a fresh child and re-billed the transcript.
+pub fn replay(turn: &PreparedTurn) -> Option<TurnResult> {
+    let mut pool = locked_pool();
+    let s = pool.live.iter_mut().find(|s| {
+        s.native_model == turn.native_model
+            && s.system == turn.system
+            && s.absorbed == turn.input
+            && s.last_reply.is_some()
+    })?;
+    let mut r = s.last_reply.clone()?;
+    if r.unseen {
+        // A reply the client never saw is now being delivered: record
+        // its echo so the next real turn's continuation still matches.
+        s.record_seen_reply(&r);
+        if let Some(stored) = s.last_reply.as_mut() {
+            stored.unseen = false;
+        }
+        persist(s);
+    }
+    r.usage = Usage::default();
+    r.unseen = false;
+    Some(r)
+}
+
 pub fn take(
     turn: &PreparedTurn,
     cancel: &AtomicBool,
@@ -976,111 +1020,25 @@ pub fn take(
         }
     };
     for s in dead {
-        s.close();
+        s.abandon();
     }
     result
 }
 
-pub(crate) fn prefix_divergence(turn: &PreparedTurn) -> Option<String> {
-    let pool = locked_pool();
-    let mut best: Option<(usize, usize)> = None;
-    for s in &pool.live {
-        if s.native_model != turn.native_model || s.system != turn.system {
-            continue;
-        }
-        if crate::chat::continuation(&s.absorbed, &s.reply_call_ids, &s.reply_text, &turn.input)
-            != Err("prefix")
-        {
-            continue;
-        }
-        let diverge_at = s
-            .absorbed
-            .iter()
-            .zip(turn.input.iter())
-            .position(|(a, b)| a != b)
-            .unwrap_or_else(|| s.absorbed.len().min(turn.input.len()));
-        if best.map(|(d, _)| diverge_at > d).unwrap_or(true) {
-            best = Some((diverge_at, s.absorbed.len()));
-        }
-    }
-    let (diverge_at, absorbed) = best?;
-    let role = turn
-        .input
-        .get(diverge_at)
-        .map(|v| {
-            v.get("role")
-                .and_then(Value::as_str)
-                .or_else(|| v.get("type").and_then(Value::as_str))
-                .unwrap_or("?")
-        })
-        .unwrap_or("end");
-    Some(format!(
-        "diverge_at={diverge_at},absorbed={absorbed},input={},role={role}",
-        turn.input.len()
-    ))
-}
-
-pub(crate) fn persisted_rejections(turn: &PreparedTurn) -> String {
-    let records = read_persisted();
-    if records.is_empty() {
-        return "persisted=0".to_string();
-    }
-    let now = unix_now();
-    let max_age = reload_max_age().as_secs();
-    let (mut owner_alive, mut too_old, mut model, mut system, mut no_continuation) =
-        (0, 0, 0, 0, 0);
-    for p in &records {
-        if owner_blocks(p, turn, &pid_alive) {
-            owner_alive += 1;
-        } else if now.saturating_sub(p.last_prompt_unix) > max_age {
-            too_old += 1;
-        } else if p.native_model != turn.native_model {
-            model += 1;
-        } else if p.system != turn.system {
-            system += 1;
-        } else if crate::chat::continuation(
-            &p.absorbed,
-            &p.reply_call_ids,
-            &p.reply_text,
-            &turn.input,
-        )
-        .is_err()
-        {
-            no_continuation += 1;
-        }
-    }
-    format!(
-        "persisted={},owner_alive={owner_alive},too_old={too_old},model={model},system={system},no_continuation={no_continuation}",
-        records.len()
-    )
-}
-
-/// Return a session to the pool after a successful turn or keepalive,
-/// evicting the least-recently-used session past `MAX_LIVE`.
+/// Return a session to the pool after a successful turn or keepalive.
 pub fn give_back(s: LiveSession) {
     persist(&s);
     let mut dead = {
         let mut pool = locked_pool();
-        let mut dead = reap(&mut pool.live);
+        let dead = reap(&mut pool.live);
         pool.warming.retain(|w| w.session_id != s.session_id);
         pool.borrowed.retain(|b| b.session_id != s.session_id);
         pool.live.push(s);
-        if pool.live.len() > MAX_LIVE {
-            let lru = pool
-                .live
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, s)| s.last_used)
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            crate::chat::pool_event("evict:max_live", &pool.live[lru].session_id);
-            dead.push(pool.live.remove(lru));
-        }
         dead
     };
     POOL_CHANGED.notify_all();
     for s in dead.drain(..) {
-        s.close();
+        s.abandon();
     }
 }
 
@@ -1109,7 +1067,7 @@ fn keepalive_paused() -> bool {
 fn keepalive_due(last_prompt_at: Option<Instant>, last_used: Instant, alive: bool) -> bool {
     alive
         && last_prompt_at.is_some_and(|t| t.elapsed() > KEEPALIVE_AFTER)
-        && last_used.elapsed() <= keepalive_idle_max()
+        && last_used.elapsed() <= KEEPALIVE_IDLE_MAX
 }
 
 /// Remove the first keepalive-due session from the pool — every due
@@ -1141,8 +1099,7 @@ fn take_keepalive() -> Option<LiveSession> {
     Some(s)
 }
 
-/// Warm every due session, one at a time. A settled keepalive returns
-/// through `give_back` so `MAX_LIVE` still bounds the pool; a failure
+/// Warm every due session, one at a time. A failure
 /// that leaves a prompt in flight closes the session — it is never
 /// pooled in a state the next turn can't trust. Either way it stops
 /// being listed as warming.
@@ -1296,6 +1253,7 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         absorbed: Vec::new(),
         reply_call_ids: Vec::new(),
         reply_text: String::new(),
+        last_reply: None,
         last_used: Instant::now(),
         last_prompt_at: None,
         keepalive_turns: 0,
@@ -1501,19 +1459,21 @@ impl LiveSession {
         }
         self.system = turn.system.clone();
         self.absorbed = turn.input.clone();
-        self.reply_call_ids = if r.unseen {
-            Vec::new()
+        if r.unseen {
+            self.reply_call_ids = Vec::new();
+            self.reply_text = String::new();
         } else {
-            r.calls.iter().map(|(id, _, _)| id.clone()).collect()
-        };
-        self.reply_text = if r.unseen {
-            String::new()
-        } else {
-            r.text.trim().to_string()
-        };
+            self.record_seen_reply(r);
+        }
+        self.last_reply = Some(r.clone());
         let now = Instant::now();
         self.last_used = now;
         self.last_prompt_at = Some(now);
+    }
+
+    fn record_seen_reply(&mut self, r: &TurnResult) {
+        self.reply_call_ids = r.calls.iter().map(|(id, _, _)| id.clone()).collect();
+        self.reply_text = r.text.trim().to_string();
     }
 
     /// Record a failed turn whose prompt still settled upstream: the
@@ -1533,6 +1493,7 @@ impl LiveSession {
         self.absorbed = turn.input.clone();
         self.reply_call_ids = Vec::new();
         self.reply_text = String::new();
+        self.last_reply = None;
         let now = Instant::now();
         self.last_used = now;
         self.last_prompt_at = Some(now);

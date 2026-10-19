@@ -92,14 +92,8 @@ fn file_path() -> Option<PathBuf> {
     gray_core::paths::gray_home().map(|h| h.join("devin-sub").join("tools.json"))
 }
 
-/// Tool names are ASCII identifiers the host's schema already constrains;
-/// the policy file honors the same bound so junk can never name a tool.
 fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 50
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    crate::chat::valid_tool_name(name)
 }
 
 /// The `/devin` command body: `tools` runs the policy command, anything

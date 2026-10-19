@@ -211,7 +211,11 @@ fn redirect_named_call_never_folds_into_web_search() {
     // unadvertised: resolves to nothing, and blocked_call echoes honestly
     assert!(redirect_call(&u, &names).is_none());
     // a surface that advertises grep gets the call verbatim
-    let names = vec!["bash".to_string(), "grep".to_string(), "web_search".to_string()];
+    let names = vec![
+        "bash".to_string(),
+        "grep".to_string(),
+        "web_search".to_string(),
+    ];
     assert_eq!(redirect_call(&u, &names).unwrap().0, "grep");
     // an anonymous {query} frame still guesses web, unchanged
     let u = json!({"kind": "search", "rawInput": {"query": "x y"}});
