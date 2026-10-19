@@ -58,12 +58,6 @@ impl TurnGuard {
     }
 }
 
-pub fn cut_transcript(text: &str) -> (String, Option<&'static str>) {
-    let mut out = text.to_string();
-    let cut = TurnGuard::default().feed(&mut out);
-    (out, cut)
-}
-
 pub fn strip_reasoning(text: &str) -> String {
     let mut out = text.to_string();
     for (open, close) in [("<think>", "</think>"), ("<thinking>", "</thinking>")] {

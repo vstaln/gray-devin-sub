@@ -72,14 +72,18 @@ pub fn normalize_input_schema(schema: &Value) -> Value {
     out
 }
 
-fn check_tool_name(name: &str, seen: &std::collections::HashSet<String>) -> Result<(), String> {
-    if name.len() > 50
-        || name.is_empty()
-        || !name
+/// ASCII identifier bound the host's schema constrains tool names to —
+/// `settings`' allowlist honors the same rule so junk never names a tool.
+pub(crate) fn valid_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 50
+        && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        || seen.contains(name)
-    {
+}
+
+fn check_tool_name(name: &str, seen: &std::collections::HashSet<String>) -> Result<(), String> {
+    if !valid_tool_name(name) || seen.contains(name) {
         return Err(format!(
             "tool names must be unique ASCII identifiers of at most 50 characters: {name:?}"
         ));
@@ -655,13 +659,10 @@ pub(crate) fn redirect_call(update: &Value, names: &[String]) -> Option<(String,
         // so `kind` is a hint, never a verdict. A frame that names a tool
         // resolves by that name (web names included); the payload guess is
         // for anonymous frames only.
-        "search" | "fetch" => {
-            match native_tool_name(update).or_else(|| title_tool(update)) {
-                Some(_) => name_call(update, input, names)
-                    .or_else(|| title_call(update, input, names)),
-                None => web_redirect(update, input, names),
-            }
-        }
+        "search" | "fetch" => match native_tool_name(update).or_else(|| title_tool(update)) {
+            Some(_) => name_call(update, input, names).or_else(|| title_call(update, input, names)),
+            None => web_redirect(update, input, names),
+        },
         // kind:"other" is the grab-bag: MCP-bridge and native-tool calls
         // whose title ("Calling bash from harness") still names the tool
         // the model meant even when rawInput doesn't carry tool_name.
@@ -1078,6 +1079,41 @@ pub(crate) fn continuation(
     Ok(delta)
 }
 
+/// Diverged-history fallback: the trailing run of non-assistant items —
+/// the only content a session that already holds this conversation's
+/// earlier turns still needs to see. Used when `continuation` missed but
+/// the candidate is provably this same conversation (`gray_session`
+/// match): its transcript was rewritten (compaction, a cut), so nothing
+/// past the last assistant item can already be upstream. `None` when the
+/// tail is empty or renders empty.
+pub(crate) fn tail_delta(input: &[Value]) -> Option<String> {
+    let start = input
+        .iter()
+        .rposition(|item| assistant_side(item))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let delta = render_items(&input[start..]);
+    (!delta.trim().is_empty()).then_some(delta)
+}
+
+/// How many leading `input` items a claimed session has already seen:
+/// `absorbed.len()` on a strict continuation, else the start of the
+/// trailing non-assistant tail `tail_delta` prompts with. Keeps image
+/// extraction on exactly the items the delta covers — and never indexes
+/// past `input.len()` when a rewritten history is shorter than the
+/// session's absorbed one.
+pub(crate) fn continuation_skip(absorbed: &[Value], input: &[Value]) -> usize {
+    if input.len() > absorbed.len() && input.starts_with(absorbed) {
+        absorbed.len()
+    } else {
+        input
+            .iter()
+            .rposition(|item| assistant_side(item))
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    }
+}
+
 /// Usage snapshot from a `usage_update` notification's `update` object or
 /// a prompt result's `usage` value: plain key first, then Cognition's flat
 /// `_meta["cognition.ai/<key>"]`, then the nested `_meta["cognition.ai"]
@@ -1115,6 +1151,7 @@ pub fn usage_from(v: &Value) -> Option<Usage> {
 }
 
 /// What one `devin acp` session produced.
+#[derive(Clone)]
 pub struct TurnResult {
     pub text: String,
     /// Accumulated agent_thought_chunk text (emitted as reasoning summary).
@@ -1162,6 +1199,10 @@ pub fn run_turn(
         format!("{}\n\n{}", turn.system, turn.content_line)
     };
     let chars = prompt_text.chars().count();
+    if let Some(r) = session::replay(turn) {
+        trace_turn("replay", "-", chars, Some(&r), None, None);
+        return Ok(r);
+    }
     let (mut claimed, mut reason) = session::take(turn, cancel);
     // Nothing live continues this turn: an orphaned session of a dead
     // sidecar (a gray restart) may, loaded instead of re-billed.
@@ -1175,21 +1216,14 @@ pub fn run_turn(
     let spawn_fresh = |reason: &str| match session::spawn(turn, deadline, cancel) {
         Ok(s) => Ok(s),
         Err(e) => {
-            trace_turn(
-                &format!("fresh:{reason}"),
-                "-",
-                chars,
-                None,
-                Some(&e),
-                fresh_diag(turn, reason).as_deref(),
-            );
+            trace_turn(&format!("fresh:{reason}"), "-", chars, None, Some(&e), None);
             Err(e)
         }
     };
     let mut s = match claimed {
         Some((mut s, delta)) => {
             let delta = s.note_cut(delta);
-            let images = images_of(&turn.input[s.absorbed.len()..]);
+            let images = images_of(&turn.input[continuation_skip(&s.absorbed, &turn.input)..]);
             match s.send_prompt(&delta, &images, &turn.names) {
                 Ok(id) => match s.await_prompt(id, deadline, cancel) {
                     Ok(r) => {
@@ -1256,14 +1290,13 @@ pub fn run_turn(
         }
         None => spawn_fresh(reason)?,
     };
-    let diag = fresh_diag(turn, reason);
     let mode = format!("fresh:{reason}");
     let id = match s.send_prompt(&prompt_text, &images_of(&turn.input), &turn.names) {
         Ok(id) => id,
         Err(e) => {
             // The prompt never reached the child (dead pipe): nothing to
             // pool, and no fresh fallback left — the turn fails.
-            trace_turn(&mode, &s.session_id, chars, None, Some(&e), diag.as_deref());
+            trace_turn(&mode, &s.session_id, chars, None, Some(&e), None);
             s.close();
             return Err(e);
         }
@@ -1271,12 +1304,12 @@ pub fn run_turn(
     match s.await_prompt(id, deadline, cancel) {
         Ok(r) => {
             s.absorb(turn, &r);
-            trace_turn(&mode, &s.session_id, chars, Some(&r), None, diag.as_deref());
+            trace_turn(&mode, &s.session_id, chars, Some(&r), None, None);
             session::give_back(s);
             Ok(r)
         }
         Err(e) => {
-            trace_turn(&mode, &s.session_id, chars, None, Some(&e), diag.as_deref());
+            trace_turn(&mode, &s.session_id, chars, None, Some(&e), None);
             if s.prompt_in_flight {
                 s.close();
             } else {
@@ -1291,14 +1324,6 @@ pub fn run_turn(
             }
             Err(e)
         }
-    }
-}
-
-fn fresh_diag(turn: &PreparedTurn, reason: &str) -> Option<String> {
-    match reason {
-        "prefix" => session::prefix_divergence(turn),
-        "no_session" => Some(session::persisted_rejections(turn)),
-        _ => None,
     }
 }
 
@@ -1319,11 +1344,17 @@ pub(crate) fn trace_turn(
     // cache miss can't be told apart from an eviction or a diverged prefix.
     // Reloads land too — each is a re-bill avoided, the number to watch.
     // Reuse turns (the normal case) stay behind DEVIN_SUB_DEBUG.
-    let persist = mode.starts_with("fresh") || mode == "reload" || err.is_some();
+    let cold = mode == "reuse"
+        && r.is_some_and(|r| {
+            r.usage.input_tokens >= 20_000 && r.usage.cached_tokens * 2 < r.usage.input_tokens
+        });
+    let persist =
+        cold || mode.starts_with("fresh") || mode == "reload" || mode == "replay" || err.is_some();
     let debug = std::env::var_os("DEVIN_SUB_DEBUG").is_some();
     if !persist && !debug {
         return;
     }
+    let mode = if cold { "reuse:cold" } else { mode };
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| format!("{}.{:03}", d.as_secs(), d.subsec_millis()))
@@ -1492,7 +1523,7 @@ pub fn fold_result(r: &TurnResult) -> Result<Vec<u8>, String> {
     Ok(sse)
 }
 
-pub(crate) fn rand_hex(n: usize) -> String {
+pub fn rand_hex(n: usize) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)

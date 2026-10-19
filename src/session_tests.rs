@@ -115,6 +115,7 @@ fn stub_session() -> LiveSession {
         absorbed: Vec::new(),
         reply_call_ids: Vec::new(),
         reply_text: String::new(),
+        last_reply: None,
         last_used: Instant::now(),
         last_prompt_at: None,
         keepalive_turns: 0,
@@ -345,6 +346,257 @@ fn take_waits_for_a_checked_out_session() {
     assert!(!locked_pool().borrowed_for(&tb));
 }
 
+/// A stub `devin acp` child: JSON-RPC over stdio, answers initialize /
+/// session/new / session/load / session/delete and replies to
+/// session/prompt with one message chunk + usage. Every request is
+/// appended to @LOG@ so the test can assert exactly which methods ran.
+const STUB_ACP: &str = r##"#!/usr/bin/env python3
+import sys, json, os
+LOG = "@LOG@"
+def log(method, extra=None):
+    with open(LOG, "a") as f:
+        f.write(json.dumps(dict({"method": method}, **(extra or {}))) + "\n")
+sid = "stub-%d" % os.getpid()
+for line in sys.stdin:
+    try:
+        m = json.loads(line)
+    except Exception:
+        continue
+    method, rid = m.get("method"), m.get("id")
+    params = m.get("params") or {}
+    if method == "session/cancel" or rid is None:
+        continue
+    if method == "session/prompt":
+        text = "".join(p.get("text", "") for p in params.get("prompt", []))
+        log(method, {"sessionId": params.get("sessionId"), "text": text})
+        u = {"sessionUpdate": "agent_message_chunk",
+             "content": {"type": "text", "text": "stub reply"}}
+        print(json.dumps({"jsonrpc": "2.0", "method": "session/update",
+                          "params": {"sessionId": params.get("sessionId"), "update": u}}))
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 1000, "outputTokens": 10,
+                      "cachedReadTokens": 900}}}))
+    elif method == "initialize":
+        log(method)
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result":
+            {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}}}))
+    elif method == "session/new":
+        log(method)
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": sid}}))
+    elif method in ("session/load", "session/delete"):
+        log(method, {"sessionId": params.get("sessionId")})
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {}}))
+    else:
+        print(json.dumps({"jsonrpc": "2.0", "id": rid,
+                          "error": {"code": -32601, "message": "unknown"}}))
+    sys.stdout.flush()
+"##;
+
+/// End-to-end against the stub child — real spawn, real JSON-RPC, real
+/// pool — proving the cycle a unit stub can't: fresh `session/new`,
+/// prompt, pool; strict reuse prompting only the delta; a keepalive on
+/// the due session; idle reap detaching without `session/delete`; and a
+/// later turn reattaching through `session/load`.
+#[test]
+fn e2e_stub_child_pool_cycle() {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = std::env::temp_dir().join(format!("devin-sub-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let log_path = dir.join("child.log");
+    let stub_path = dir.join("devin-stub");
+    std::fs::write(
+        &stub_path,
+        STUB_ACP.replace("@LOG@", &log_path.to_string_lossy().into_owned()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // SAFETY: serialized by LOCK; no other test reads these vars.
+    unsafe {
+        std::env::set_var("GRAY_DEVIN_SUB_COMMAND", &stub_path);
+        std::env::set_var("GRAY_HOME", dir.join("gray-home"));
+    }
+    let read_log = || -> Vec<Value> {
+        std::fs::read_to_string(&log_path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    };
+    let count = |method: &str| -> usize {
+        read_log()
+            .iter()
+            .filter(|e| e.get("method").and_then(Value::as_str) == Some(method))
+            .count()
+    };
+
+    let never = AtomicBool::new(false);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let model = "e2e-stub-model";
+
+    // Fresh turn: spawn + handshake + real prompt over the wire.
+    let mut t1 = turn(model, vec![json!({"role": "user", "content": "hi"})]);
+    t1.gray_session = "conv-e2e".to_string();
+    let mut s = spawn(&t1, deadline, &never).expect("spawn failed");
+    let r = s
+        .send_prompt("hi", &[], &[])
+        .and_then(|id| s.await_prompt(id, deadline, &never))
+        .expect("prompt failed");
+    assert_eq!(r.text, "stub reply");
+    s.absorb(&t1, &r);
+    let sid = s.session_id.clone();
+    give_back(s);
+    assert_eq!(count("session/new"), 1);
+    assert_eq!(count("session/prompt"), 1);
+
+    // Strict continuation: the pooled child answers only the delta.
+    let mut t2 = turn(
+        model,
+        vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "stub reply"}),
+            json!({"role": "user", "content": "next"}),
+        ],
+    );
+    t2.gray_session = "conv-e2e".to_string();
+    let (claimed, reason) = take(&t2, &never);
+    let (mut s, delta) = claimed.unwrap_or_else(|| panic!("continuation missed: {reason}"));
+    assert_eq!(s.session_id, sid);
+    assert_eq!(delta, "[User]\nnext");
+    let r = s
+        .send_prompt(&delta, &[], &[])
+        .and_then(|id| s.await_prompt(id, deadline, &never))
+        .expect("delta prompt failed");
+    s.absorb(&t2, &r);
+    give_back(s);
+    assert_eq!(count("session/new"), 1, "reuse spawned a fresh child");
+    assert_eq!(count("session/prompt"), 2);
+    let last = read_log().pop().unwrap();
+    assert_eq!(last["text"], "[User]\nnext");
+
+    // Keepalive: staleness due → one marker prompt, no delete.
+    {
+        let mut pool = locked_pool();
+        let s = pool
+            .live
+            .iter_mut()
+            .find(|s| s.session_id == sid)
+            .expect("pooled session gone");
+        s.last_prompt_at = Some(Instant::now() - KEEPALIVE_AFTER - Duration::from_secs(1));
+    }
+    let mut s = take_keepalive().expect("due session not offered for keepalive");
+    assert_eq!(s.session_id, sid);
+    s.keepalive().expect("keepalive prompt failed");
+    give_back(s);
+    let last = read_log().pop().unwrap();
+    assert_eq!(last["method"], "session/prompt");
+    assert_eq!(last["text"], KEEPALIVE_TEXT);
+
+    // Idle reap detaches: child exits, record survives, no delete.
+    {
+        let mut pool = locked_pool();
+        let s = pool
+            .live
+            .iter_mut()
+            .find(|s| s.session_id == sid)
+            .expect("pooled session gone");
+        s.last_used = Instant::now() - IDLE_TTL - Duration::from_secs(1);
+    }
+    // A take of an unrelated turn sweeps the idle session out.
+    let other = turn(
+        "e2e-unrelated",
+        vec![json!({"role": "user", "content": "x"})],
+    );
+    let _ = take(&other, &never);
+    assert!(
+        !locked_pool().live.iter().any(|s| s.session_id == sid),
+        "idle session was not reaped"
+    );
+    assert_eq!(count("session/delete"), 0, "reap deleted the session");
+    assert_eq!(count("session/load"), 0);
+
+    // Reattach: a new child `session/load`s the detached session and the
+    // next turn prompts only the delta — not a fresh transcript.
+    let mut t3 = turn(
+        model,
+        vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "stub reply"}),
+            json!({"role": "user", "content": "next"}),
+            json!({"role": "assistant", "content": "stub reply"}),
+            json!({"role": "user", "content": "again"}),
+        ],
+    );
+    t3.gray_session = "conv-e2e".to_string();
+    let (mut s, delta) =
+        reattach(&t3, deadline, &never).expect("reattach missed the detached session");
+    assert_eq!(s.session_id, sid);
+    assert_eq!(delta, "[User]\nagain");
+    assert_eq!(count("session/load"), 1);
+    assert_eq!(count("session/new"), 1, "reattach spawned session/new");
+    let r = s
+        .send_prompt(&delta, &[], &[])
+        .and_then(|id| s.await_prompt(id, deadline, &never))
+        .expect("reattached prompt failed");
+    s.absorb(&t3, &r);
+    s.close();
+    assert_eq!(count("session/delete"), 1, "close() must still delete");
+
+    unsafe {
+        std::env::remove_var("GRAY_DEVIN_SUB_COMMAND");
+        std::env::remove_var("GRAY_HOME");
+    }
+}
+
+/// A rewritten transcript (compaction, a cut) can't strictly continue —
+/// but the conversation's own session still holds those turns upstream,
+/// so it answers with only the new non-assistant tail instead of
+/// re-billing a fresh transcript. A different conversation's diverged
+/// history still misses: its tail would land on foreign context.
+#[test]
+fn a_rewritten_history_reuses_its_own_session_with_only_the_tail() {
+    let model = "model-rewritten-tail";
+    let mut first = turn(model, vec![json!({"role": "user", "content": "hi"})]);
+    first.gray_session = "conv-rewrite".to_string();
+    let mut s = stub_session();
+    s.session_id = "s-rewrite".to_string();
+    s.native_model = model.to_string();
+    s.absorb(&first, &answered("answer"));
+    give_back(s);
+
+    let mut next = turn(
+        model,
+        vec![
+            json!({"role": "user", "content": "[summary of earlier turns]"}),
+            json!({"role": "assistant", "content": "kept reply"}),
+            json!({"role": "user", "content": "continue"}),
+        ],
+    );
+    next.gray_session = "conv-rewrite".to_string();
+    let never = AtomicBool::new(false);
+    let (claimed, reason) = take(&next, &never);
+    let (s, delta) =
+        claimed.unwrap_or_else(|| panic!("rewritten history missed the pool: {reason}"));
+    assert_eq!(s.session_id, "s-rewrite");
+    assert_eq!(delta, "[User]\ncontinue");
+    s.close();
+
+    let mut other = turn(
+        model,
+        vec![json!({"role": "user", "content": "unrelated start"})],
+    );
+    other.gray_session = "conv-other".to_string();
+    let (claimed, _) = take(&other, &never);
+    assert!(claimed.is_none());
+}
+
 #[test]
 fn keepalive_due_bounds_warming() {
     let active = Instant::now();
@@ -359,7 +611,7 @@ fn keepalive_due_bounds_warming() {
     assert!(!keepalive_due(stale, active, false));
     // User idle past the keepalive horizon → stop; the idle reaper
     // takes the session anyway.
-    let idle = Instant::now() - keepalive_idle_max() - Duration::from_secs(1);
+    let idle = Instant::now() - KEEPALIVE_IDLE_MAX - Duration::from_secs(1);
     assert!(!keepalive_due(stale, idle, true));
 }
 

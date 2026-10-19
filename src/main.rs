@@ -20,14 +20,12 @@
 //! - `plugin/shutdown` → clean exit. Unknown methods are protocol errors
 //!   (provider sidecars must fail loudly, never hang a turn).
 
-use devin_sub::{catalog, manifest, models, relay, session, setup, usage};
+use devin_sub::{catalog, chat, manifest, models, relay, session, setup, usage};
 
-use gray_plugin::{ProviderRefreshRequest, ProviderRevokeRequest, ProviderRpcError};
+use gray_plugin::ProviderRpcError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::io::Write;
-use std::sync::{Arc, Mutex};
 
 #[derive(Deserialize)]
 struct Request {
@@ -47,10 +45,6 @@ struct Response {
     error: Option<Value>,
 }
 
-/// Active relay intents by per-turn token (see `relay::RelayIntent`):
-/// the relay server fills the transcript in when the host POSTs.
-type Relays = relay::Intents;
-
 fn cli_help() -> String {
     "devin-sub — Devin subscription provider for gray\n\
      usage: devin-sub manifest | sidecar | models | tools [all|bash|+name|-name|name …]\n\
@@ -58,8 +52,7 @@ fn cli_help() -> String {
         .to_string()
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // `gray install plugin` registers sidecars by running `<bin> manifest`.
     match std::env::args_os().nth(1).as_deref() {
         Some(m) if m == "manifest" => {
@@ -129,11 +122,10 @@ async fn main() -> anyhow::Result<()> {
     // entries lapse otherwise. Best-effort, background.
     std::thread::spawn(devin_sub::session::rewarm);
 
-    let relays: Relays = Arc::new(Mutex::new(HashMap::new()));
-    let mut lines =
-        tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(tokio::io::stdin()));
+    let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
-    while let Some(line) = lines.next_line().await? {
+    for line in std::io::BufRead::lines(stdin.lock()) {
+        let line = line?;
         if line.trim().is_empty() {
             continue;
         }
@@ -148,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
             }
             continue;
         }
-        let outcome = handle(&relays, &request).await;
+        let outcome = handle(&request);
         let response = match outcome {
             Ok(result) => Response {
                 id: request.id,
@@ -176,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpcError> {
+fn handle(request: &Request) -> Result<Value, ProviderRpcError> {
     let params = request.params.clone().unwrap_or_else(|| json!({}));
     match request.method.as_str() {
         "plugin/manifest" => Ok(serde_json::to_value(manifest::manifest()).unwrap()),
@@ -208,18 +200,17 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
             "external login has no pollable operation".into(),
         )),
         "provider/auth/cancel" => Ok(json!({})),
-        "provider/auth/refresh" => {
-            let req: ProviderRefreshRequest = serde_json::from_value(params).map_err(|e| {
-                ProviderRpcError::Protocol(format!("bad provider/auth/refresh params: {e}"))
-            })?;
-            ensure_provider(&req.provider, &req.auth_method)?;
-            Ok(json!({"status": "unsupported"}))
-        }
-        "provider/auth/revoke" => {
-            let req: ProviderRevokeRequest = serde_json::from_value(params).map_err(|e| {
-                ProviderRpcError::Protocol(format!("bad provider/auth/revoke params: {e}"))
-            })?;
-            ensure_provider(&req.provider, &req.auth_method)?;
+        "provider/auth/refresh" | "provider/auth/revoke" => {
+            ensure_provider(
+                params
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                params
+                    .get("auth_method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )?;
             Ok(json!({"status": "unsupported"}))
         }
         "provider/models" => {
@@ -235,7 +226,7 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
             let catalog = models::catalog().map_err(ProviderRpcError::Unavailable)?;
             Ok(serde_json::to_value(catalog).unwrap())
         }
-        "provider/chat" => chat_turn(relays, params).await,
+        "provider/chat" => chat_turn(params),
         "provider/usage" => {
             let provider = params
                 .get("provider")
@@ -279,7 +270,7 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
 /// the host the relay URL + per-turn bearer its standard Responses POST
 /// uses. The admitted POST translates, spawns, folds and streams — the
 /// sidecar answers from the relay, never from this method.
-async fn chat_turn(relays: &Relays, params: Value) -> Result<Value, ProviderRpcError> {
+fn chat_turn(params: Value) -> Result<Value, ProviderRpcError> {
     let provider = params
         .get("provider")
         .and_then(Value::as_str)
@@ -311,35 +302,15 @@ async fn chat_turn(relays: &Relays, params: Value) -> Result<Value, ProviderRpcE
             setup::LoginState::Unknown => {}
         }
     }
-    let bearer = format!("devin-sub-{}", hex_id());
-    let intent = relay::RelayIntent {
-        model: model.clone(),
-    };
-    relays
-        .lock()
-        .map(|mut r| {
-            r.insert(bearer.clone(), intent);
-        })
-        .ok();
-    let relays2 = relays.clone();
-    let bearer2 = bearer.clone();
-    let (port, _handle) =
-        relay::start_turn_server(relays2, bearer2).map_err(ProviderRpcError::Unavailable)?;
+    let bearer = format!("devin-sub-{}", chat::rand_hex(16));
+    let (port, _handle) = relay::start_turn_server(model.clone(), bearer.clone())
+        .map_err(ProviderRpcError::Unavailable)?;
     std::mem::forget(_handle);
     Ok(json!({
         "relay_url": format!("http://127.0.0.1:{port}/relay/{bearer}/responses"),
         "relay_token": bearer,
         "native_model": catalog::native_model(&model, None),
     }))
-}
-
-fn hex_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    format!("{:08x}{:08x}", t, std::process::id())
 }
 
 fn ensure_provider(provider: &str, auth_method: &str) -> Result<(), ProviderRpcError> {

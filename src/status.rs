@@ -9,10 +9,7 @@ use crate::{setup, usage};
 /// "  Name:  X" / "  Email:  X" / "  Tier:  X" from `devin auth status`.
 fn field(output: &str, name: &str) -> Option<String> {
     for line in output.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix(name)
-            && let Some(v) = rest.strip_prefix(':')
-        {
+        if let Some(v) = line.trim().strip_prefix(&format!("{name}:")) {
             let v = v.trim();
             if !v.is_empty() {
                 return Some(v.to_string());

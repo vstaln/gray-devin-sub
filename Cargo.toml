@@ -17,17 +17,19 @@ path = "src/main.rs"
 anyhow = "1"
 gray-core = { git = "https://github.com/vstaln/gray.git" }
 gray-plugin = { git = "https://github.com/vstaln/gray.git" }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+prost = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time", "process"] }
 
 [profile.release]
 strip = true
 
 # Dev builds: full DWARF bloats the binary and every edit pays the link.
 # Line tables keep file:line in panics and backtraces; deps carry none
-# (nobody steps into tokio). Need a debugger? CARGO_PROFILE_DEV_DEBUG=2
+# (nobody steps into dep frames). Need a debugger? CARGO_PROFILE_DEV_DEBUG=2
 # for that one build.
 [profile.dev]
 debug = "line-tables-only"

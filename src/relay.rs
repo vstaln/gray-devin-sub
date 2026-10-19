@@ -17,12 +17,11 @@
 //! Credentials are forwarded, never persisted: the bearer is a per-turn
 //! token minted by the sidecar, never the user's OAuth token.
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -84,19 +83,12 @@ fn wait_turn(
     }
 }
 
-/// What `provider/chat` parked for one turn: the relay fills the body in.
-pub struct RelayIntent {
-    pub model: String,
-}
-
-pub type Intents = Arc<Mutex<HashMap<String, RelayIntent>>>;
-
 /// Start the per-turn relay server. Returns the loopback port + handle.
 /// The admitted POST does the whole turn synchronously; the server stays
 /// open afterwards only to answer 400s to anything past the single
 /// admission (native retries must see denial, not a hang).
 pub fn start_turn_server(
-    intents: Intents,
+    model: String,
     bearer: String,
 ) -> Result<(u16, std::thread::JoinHandle<()>), String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("relay bind: {e}"))?;
@@ -105,7 +97,7 @@ pub fn start_turn_server(
         .map_err(|e| format!("relay addr: {e}"))?
         .port();
     let used = Arc::new(AtomicBool::new(false));
-    let handle = std::thread::spawn(move || serve(listener, intents, bearer, used));
+    let handle = std::thread::spawn(move || serve(listener, model, bearer, used));
     Ok((port, handle))
 }
 
@@ -121,14 +113,14 @@ const UNUSED_TTL: Duration = Duration::from_secs(10 * 60);
 /// Accept-poll cadence while nonblocking.
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
 
-fn serve(listener: TcpListener, intents: Intents, bearer: String, used: Arc<AtomicBool>) {
+fn serve(listener: TcpListener, model: String, bearer: String, used: Arc<AtomicBool>) {
     let _ = listener.set_nonblocking(true);
     let minted = Instant::now();
     let mut admitted_at: Option<Instant> = None;
     loop {
         match listener.accept() {
             Ok((mut s, _)) => {
-                handle_conn(&mut s, &intents, &bearer, &used);
+                handle_conn(&mut s, &model, &bearer, &used);
                 if admitted_at.is_none() && used.load(Ordering::SeqCst) {
                     admitted_at = Some(Instant::now());
                 }
@@ -148,12 +140,7 @@ fn serve(listener: TcpListener, intents: Intents, bearer: String, used: Arc<Atom
     }
 }
 
-fn handle_conn(
-    s: &mut std::net::TcpStream,
-    intents: &Intents,
-    bearer: &str,
-    used: &Arc<AtomicBool>,
-) {
+fn handle_conn(s: &mut std::net::TcpStream, model: &str, bearer: &str, used: &Arc<AtomicBool>) {
     let _ = s.set_read_timeout(Some(Duration::from_secs(330)));
     let mut buf = vec![0u8; 65536];
     let mut head = Vec::new();
@@ -240,11 +227,10 @@ fn handle_conn(
     let (tx, rx) = mpsc::channel::<Result<Vec<u8>, String>>();
     let cancel = Arc::new(AtomicBool::new(false));
     {
-        let intents = intents.clone();
-        let bearer = bearer.to_string();
+        let model = model.to_string();
         let cancel = cancel.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(run_turn(&intents, &bearer, &session_id, &body, &cancel));
+            let _ = tx.send(run_turn(&model, &session_id, &body, &cancel));
         });
     }
     match wait_turn(&rx, s, &cancel, HEADER_GRACE) {
@@ -316,25 +302,18 @@ fn handle_conn(
 }
 
 fn run_turn(
-    intents: &Intents,
-    bearer: &str,
+    model: &str,
     session_id: &str,
     raw: &[u8],
     cancel: &Arc<AtomicBool>,
 ) -> Result<Vec<u8>, String> {
-    let intent = intents
-        .lock()
-        .map(|mut m| m.remove(bearer))
-        .ok()
-        .flatten()
-        .ok_or_else(|| "relay intent expired".to_string())?;
     let body: Value = serde_json::from_slice(raw)
         .map_err(|e| format!("relay body is not JSON ({} bytes): {e}", raw.len()))?;
     let model = body
         .get("model")
         .and_then(Value::as_str)
         .filter(|m| !m.is_empty())
-        .unwrap_or(&intent.model);
+        .unwrap_or(model);
     let mut turn = crate::chat::prepare_turn(&body, model)?;
     turn.gray_session = session_id.to_string();
     // A pooled session when this history continues one, else a fresh

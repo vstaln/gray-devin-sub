@@ -6,7 +6,7 @@
 //! segment — absent means `None`, never a guess. The listing is cached per
 //! process; a CLI failure is an error, not a silent empty list.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 /// The family a row was listed under — parsed from its section header
 /// `Display Name (slug)`. The slug is a routable fuzzy name the
@@ -31,75 +31,23 @@ pub struct ModelEntry {
 
 /// `devin models list`, cached per process.
 pub fn entries() -> Result<Vec<ModelEntry>, String> {
-    type CatalogResult = Result<Vec<ModelEntry>, String>;
-    static CACHE: OnceLock<Mutex<Option<CatalogResult>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(None));
-    if let Some(hit) = cache.lock().ok().and_then(|c| c.clone()) {
-        return hit;
-    }
-    let got = run_list().map(|text| parse_list(&text));
-    if let Ok(mut c) = cache.lock() {
-        *c = Some(got.clone());
-    }
-    got
+    static CACHE: OnceLock<Result<Vec<ModelEntry>, String>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| run_list().map(|text| parse_list(&text)))
+        .clone()
 }
 
 fn run_list() -> Result<String, String> {
     let binary =
         crate::setup::resolve_command().ok_or_else(|| crate::setup::INSTALL_HINT.to_string())?;
-    let mut child = std::process::Command::new(binary)
-        .args(["models", "list"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .envs(crate::setup::child_env())
-        .spawn()
-        .map_err(|e| format!("devin models list: {e}"))?;
-    // The listing is ~175KB — bigger than the pipe buffer. Drain stdout on
-    // a reader thread while waiting: wait-then-read deadlocks the child on
-    // a full pipe and always hits the deadline.
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "devin models list stdout unavailable".to_string())?;
-    let reader = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut s = String::new();
-        let _ = stdout.read_to_string(&mut s);
-        s
-    });
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "devin models list stderr unavailable".to_string())?;
-    let err_reader = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut s = String::new();
-        let _ = stderr.read_to_string(&mut s);
-        s
-    });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                let _ = err_reader.join();
-                return Err("devin models list timed out".into());
-            }
-            Err(e) => return Err(format!("devin models list: {e}")),
-        }
-    };
-    let out = reader.join().unwrap_or_default();
-    let err = err_reader.join().unwrap_or_default();
-    if !status.success() {
+    let (ok, out, err) = crate::setup::run_captured(
+        &binary,
+        &["models", "list"],
+        std::time::Duration::from_secs(30),
+    )?;
+    if !ok {
         let detail = err.trim().lines().last().unwrap_or("unknown error");
-        return Err(format!("devin models list failed ({status}): {detail}"));
+        return Err(format!("devin models list failed: {detail}"));
     }
     Ok(out)
 }
@@ -504,29 +452,6 @@ fn closest_effort<'a>(group: &PlainGroup<'a>, want: &str) -> Option<&'a ModelEnt
         })
         .min_by_key(|(_, i)| (i.abs_diff(w), std::cmp::Reverse(*i)))
         .map(|(m, _)| m)
-}
-
-pub fn context_window(model: &str) -> Option<u32> {
-    entries()
-        .ok()?
-        .into_iter()
-        .find(|e| e.id == model)
-        .and_then(|e| e.context)
-}
-
-/// Every routable id the CLI currently advertises.
-pub fn all_ids() -> Vec<String> {
-    entries()
-        .map(|es| es.into_iter().map(|e| e.id).collect())
-        .unwrap_or_default()
-}
-
-/// Display name for a route id.
-pub fn display_name(id: &str) -> String {
-    entries()
-        .ok()
-        .and_then(|es| es.into_iter().find(|e| e.id == id).map(|e| e.display))
-        .unwrap_or_else(|| format!("{id} (Devin)"))
 }
 
 #[path = "catalog_tests.rs"]
