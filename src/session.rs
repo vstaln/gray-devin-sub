@@ -90,10 +90,10 @@ pub const IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 /// upstream contact.
 const KEEPALIVE_SWEEP: Duration = Duration::from_secs(30);
 /// Fire a keepalive once the last `session/prompt` this session settled
-/// is this old — comfortably under Devin's ~5min per-session prompt
-/// cache TTL (plus sweep granularity), so the next continuation still
-/// hits a warm prefix.
-const KEEPALIVE_AFTER: Duration = Duration::from_secs(4 * 60);
+/// is this old — under Devin's ~5min per-session prompt cache TTL with a
+/// full sweep + settle window of slack: a slow or once-failed keepalive
+/// still re-warms inside the TTL instead of billing a cold turn.
+const KEEPALIVE_AFTER: Duration = Duration::from_secs(3 * 60);
 /// Keep warming only while the user is plausibly mid-break. The tradeoff
 /// is arithmetic: each keepalive is a billed upstream prompt, and past
 /// ~30min idle the odds of a return in the next TTL window are too low
@@ -1059,6 +1059,17 @@ fn keepalive_paused() -> bool {
         .is_some_and(|until| Instant::now() < until)
 }
 
+/// A settled prompt proves the account has headroom: drop any pause a
+/// failed keepalive left behind instead of keeping every pooled session
+/// cold while real turns succeed. Called only from `absorb` and
+/// `absorb_keepalive` — a failed turn (including the silent empty-reply
+/// usage rejection) leaves the pause alone.
+fn clear_keepalive_pause() {
+    *KEEPALIVE_PAUSED_UNTIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// Keepalive predicate, kept field-level so tests can drive it without
 /// a live child: the session settled ≥1 real prompt, its last upstream
 /// contact is stale past `KEEPALIVE_AFTER`, the user is still active
@@ -1469,6 +1480,7 @@ impl LiveSession {
         let now = Instant::now();
         self.last_used = now;
         self.last_prompt_at = Some(now);
+        clear_keepalive_pause();
     }
 
     fn record_seen_reply(&mut self, r: &TurnResult) {
@@ -1508,6 +1520,7 @@ impl LiveSession {
     fn absorb_keepalive(&mut self) {
         self.keepalive_turns += 1;
         self.last_prompt_at = Some(Instant::now());
+        clear_keepalive_pause();
     }
 
     /// Drive one cache-refresh `session/prompt` while this session is out
