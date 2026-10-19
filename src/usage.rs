@@ -35,7 +35,9 @@ fn now_secs() -> u64 {
 }
 
 fn cache_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
     Some(home.join(".cache/devin/cli"))
 }
 
