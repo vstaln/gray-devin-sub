@@ -550,10 +550,11 @@ pub(crate) fn reload_candidates(
             }
             // Same conversation, rewritten history: load its own session
             // and prompt only the new tail (see `find`'s lenient pass).
-            if !p.gray_session.is_empty() && p.gray_session == turn.gray_session {
-                if let Some(delta) = crate::chat::tail_delta(&turn.input) {
-                    return Some((p, delta));
-                }
+            if !p.gray_session.is_empty()
+                && p.gray_session == turn.gray_session
+                && let Some(delta) = crate::chat::tail_delta(&turn.input)
+            {
+                return Some((p, delta));
             }
             None
         })
