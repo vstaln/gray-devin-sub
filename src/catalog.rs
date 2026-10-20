@@ -439,10 +439,28 @@ pub fn native_model_in(
     effort: Option<&str>,
     home: Option<&std::path::Path>,
 ) -> String {
+    let model = bare_model(model);
     let Ok(entries) = entries_in(home) else {
         return model.to_string();
     };
     resolve_native(&entries, model, effort)
+}
+
+/// The Devin id inside a gray-qualified model spec. `gray -p --model
+/// 'devin-sub:devin-subscription/swe-2-max'` (or the `plugin:…|id` form)
+/// can reach the relay verbatim; passed through as the native model it
+/// 404s upstream ("issue with the selected model"). Only a prefix carrying
+/// a `:` (a provider key) is stripped, so a bare id is left alone.
+pub fn bare_model(model: &str) -> &str {
+    if let Some(rest) = model.strip_prefix("plugin:") {
+        if let Some((_, id)) = rest.rsplit_once('|') {
+            return id;
+        }
+    }
+    match model.split_once('/') {
+        Some((prefix, id)) if prefix.contains(':') && !id.is_empty() => id,
+        _ => model,
+    }
 }
 
 /// [`native_model`] over an explicit listing.

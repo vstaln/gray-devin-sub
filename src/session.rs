@@ -1098,7 +1098,7 @@ pub fn give_back(s: LiveSession) {
 
 /// Whether an upstream error is the account's usage/rate limit — the
 /// one failure a retry can only prolong.
-fn is_usage_limit(err: &str) -> bool {
+pub(crate) fn is_usage_limit(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
     e.contains("rate limit") || e.contains("usage limit") || e.contains("429")
 }
