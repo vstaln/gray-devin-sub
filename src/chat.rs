@@ -405,7 +405,13 @@ fn funnel_contract(tool_specs: &[String]) -> String {
         arrive as `[Tool result id=…]` blocks and new user input as `[User]` blocks.\n\
         You write exactly ONE assistant turn. Never write `[User]`, `[Tool result …]` or any other \
         transcript record yourself; tool results only come from the harness. Never claim a command \
-        ran unless its `[Tool result]` is in the transcript.",
+        ran unless its `[Tool result]` is in the transcript.\n\
+        To delegate parallel or independent work, spawn a gray subagent through `bash`: \
+        `gray subagents run --name NAME 'task'` (add `--isolation worktree` when parallel \
+        runs edit the same repo); follow up with `gray subagents status`, `gray subagents \
+        view ID [--lines N]`, `gray subagents steer ID 'follow-up'`, `gray subagents stop ID`. \
+        Your own native subagent tool is disabled — a child spawned inside this session can \
+        never run a tool, so delegate via `gray subagents` only.",
     );
     s.push_str("\n\nHarness tools:\n");
     if tool_specs.is_empty() {

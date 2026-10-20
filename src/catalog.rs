@@ -6,7 +6,8 @@
 //! segment — absent means `None`, never a guess. The listing is cached per
 //! process; a CLI failure is an error, not a silent empty list.
 
-use std::sync::OnceLock;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// The family a row was listed under — parsed from its section header
 /// `Display Name (slug)`. The slug is a routable fuzzy name the
@@ -29,9 +30,12 @@ pub struct ModelEntry {
     pub alias: bool,
 }
 
-/// `devin models list`, cached per process per account home — tiers
-/// differ across accounts, so a second account's listing must not
-/// inherit the first's.
+/// `devin models list`, cached briefly per process per account home —
+/// tiers differ across accounts, so a second account's listing must not
+/// inherit the first's; and the sidecar is long-lived while models ship
+/// inside the `devin` binary, so entries expire to pick up updates.
+const LIST_TTL: Duration = Duration::from_secs(300);
+
 pub fn entries() -> Result<Vec<ModelEntry>, String> {
     entries_in(None)
 }
@@ -39,17 +43,23 @@ pub fn entries() -> Result<Vec<ModelEntry>, String> {
 type Listing = Result<Vec<ModelEntry>, String>;
 
 pub fn entries_in(home: Option<&std::path::Path>) -> Listing {
-    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<String, Listing>>> =
-        OnceLock::new();
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (Instant, Listing)>>,
+    > = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let key = home
         .map(|h| h.to_string_lossy().into_owned())
         .unwrap_or_default();
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    guard
-        .entry(key)
-        .or_insert_with(|| run_list(home).map(|text| parse_list(&text)))
-        .clone()
+    if let Some((at, cached)) = guard.get(&key)
+        && at.elapsed() < LIST_TTL
+    {
+        return cached.clone();
+    }
+    let fresh = run_list(home).map(|text| parse_list(&text));
+    guard.insert(key, (Instant::now(), fresh.clone()));
+    fresh
+}
 }
 
 fn run_list(home: Option<&std::path::Path>) -> Result<String, String> {

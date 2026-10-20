@@ -171,6 +171,20 @@ struct AcpStage {
 
 static STAGE: [OnceLock<AcpStage>; 2] = [OnceLock::new(), OnceLock::new()];
 
+/// Child config for every non-Fusion model: native subagents disabled.
+const PLAIN_CONFIG: &str = "config.json";
+/// Child config for `fusion-*` models: the sidekick needs native subagents.
+const FUSION_CONFIG: &str = "config-fusion.json";
+
+/// The staged `--config` file a child on `native_model` runs with.
+pub(crate) fn config_file(native_model: &str) -> &'static str {
+    if native_model.starts_with("fusion-") {
+        FUSION_CONFIG
+    } else {
+        PLAIN_CONFIG
+    }
+}
+
 impl AcpStage {
     fn make(deny_search: bool) -> Result<Self, String> {
         match gray_core::paths::gray_home() {
@@ -216,26 +230,35 @@ impl AcpStage {
         )
         .map_err(|e| format!("staging config: {e}"))?;
         // User config: no MCP servers, rules, skills, auto-update
-        // or notifications — but credentials still load. Subagents stay
-        // enabled: the tool exists natively and disabling it leaves the
-        // model reaching for a tool that is not there.
-        write_atomic(
-            &cfg.join("config.json"),
-            json!({
-                "version": 1,
-                "subagents_enabled": true,
-                "auto_update": false,
-                "notify": "never",
-                "read_config_from": {
-                    "agents_standard": false, "cursor": false, "windsurf": false,
-                    "claude": false, "copilot": false, "opencode": false, "zed": false,
-                },
-                "permissions": {"deny": deny, "allow": [], "ask": ASK_RULES},
-            })
-            .to_string()
-            .as_bytes(),
-        )
-        .map_err(|e| format!("staging config: {e}"))?;
+        // or notifications — but credentials still load. Two variants
+        // share this stage (same cwd, so the same cached prefix per
+        // model): native subagents are OFF for plain models — a
+        // `run_subagent` child runs inside this ACP session, its tool
+        // calls leak into the parent's funnel as redirects and every
+        // permission it needs is cancelled, so it can never do work
+        // (observed: four QA subagents all blocked, then the model
+        // rewrote the user's own ~/.config/devin allowlist trying to
+        // unblock them). Fusion keeps them: its sidekick IS a native
+        // persistent subagent.
+        for (file, subagents) in [(PLAIN_CONFIG, false), (FUSION_CONFIG, true)] {
+            write_atomic(
+                &cfg.join(file),
+                json!({
+                    "version": 1,
+                    "subagents_enabled": subagents,
+                    "auto_update": false,
+                    "notify": "never",
+                    "read_config_from": {
+                        "agents_standard": false, "cursor": false, "windsurf": false,
+                        "claude": false, "copilot": false, "opencode": false, "zed": false,
+                    },
+                    "permissions": {"deny": deny, "allow": [], "ask": ASK_RULES},
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .map_err(|e| format!("staging config: {e}"))?;
+        }
         Ok(Self {
             work,
             cfg,
@@ -1232,7 +1255,10 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
     let mut child = Command::new(&binary)
         .args([
             "--config",
-            &stage.cfg.join("config.json").to_string_lossy(),
+            &stage
+                .cfg
+                .join(config_file(&turn.native_model))
+                .to_string_lossy(),
             "acp",
             "--model",
             &turn.native_model,
