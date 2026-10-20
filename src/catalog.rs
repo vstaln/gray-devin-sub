@@ -6,7 +6,8 @@
 //! segment — absent means `None`, never a guess. The listing is cached per
 //! process; a CLI failure is an error, not a silent empty list.
 
-use std::sync::OnceLock;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// The family a row was listed under — parsed from its section header
 /// `Display Name (slug)`. The slug is a routable fuzzy name the
@@ -29,12 +30,22 @@ pub struct ModelEntry {
     pub alias: bool,
 }
 
-/// `devin models list`, cached per process.
+/// `devin models list`, cached briefly per process — the sidecar is
+/// long-lived and models ship inside the `devin` binary, so a OnceLock
+/// would keep hiding whatever a `devin` update adds until respawn.
+const LIST_TTL: Duration = Duration::from_secs(300);
+
 pub fn entries() -> Result<Vec<ModelEntry>, String> {
-    static CACHE: OnceLock<Result<Vec<ModelEntry>, String>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| run_list().map(|text| parse_list(&text)))
-        .clone()
+    static CACHE: Mutex<Option<(Instant, Result<Vec<ModelEntry>, String>)>> = Mutex::new(None);
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, cached)) = &*guard
+        && at.elapsed() < LIST_TTL
+    {
+        return cached.clone();
+    }
+    let fresh = run_list().map(|text| parse_list(&text));
+    *guard = Some((Instant::now(), fresh.clone()));
+    fresh
 }
 
 fn run_list() -> Result<String, String> {
