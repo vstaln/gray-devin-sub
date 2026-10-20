@@ -60,7 +60,6 @@ pub fn entries_in(home: Option<&std::path::Path>) -> Listing {
     guard.insert(key, (Instant::now(), fresh.clone()));
     fresh
 }
-}
 
 fn run_list(home: Option<&std::path::Path>) -> Result<String, String> {
     let binary =
