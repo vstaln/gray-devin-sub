@@ -51,6 +51,21 @@ pub struct PreparedTurn {
     /// same conversation can claim them across a process boundary. Empty
     /// when the host sent none.
     pub gray_session: String,
+    /// The serving account — set by the relay from
+    /// [`crate::accounts::select`], `None` on the single-account path.
+    /// Pool matching keys on it: a session only continues a turn of the
+    /// same account.
+    pub account: Option<crate::accounts::Account>,
+}
+
+impl PreparedTurn {
+    /// The account label for pool matching; `""` on the legacy path.
+    pub(crate) fn account_label(&self) -> &str {
+        self.account
+            .as_ref()
+            .map(|a| a.label.as_str())
+            .unwrap_or("")
+    }
 }
 
 /// Normalize a tool input schema: strip top-level `oneOf`/`allOf`/`anyOf`
@@ -261,7 +276,11 @@ fn render_items(items: &[Value]) -> String {
 }
 
 /// Translate an OpenAI Responses body into one funnel turn.
-pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
+pub fn prepare_turn(
+    body: &Value,
+    model: &str,
+    account_home: Option<&std::path::Path>,
+) -> Result<PreparedTurn, String> {
     let instructions = body
         .get("instructions")
         .and_then(Value::as_str)
@@ -351,8 +370,9 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
         content_line,
         input,
         names,
-        native_model: crate::catalog::native_model(model, effort),
+        native_model: crate::catalog::native_model_in(model, effort, account_home),
         gray_session: String::new(),
+        account: None,
     })
 }
 
@@ -1188,6 +1208,18 @@ pub struct Usage {
 /// identical request, and a pooled continuation session re-answers it
 /// with just the delta instead of re-billing the transcript.
 pub fn run_turn(
+    turn: &PreparedTurn,
+    cancel: &Arc<AtomicBool>,
+    timeout: Duration,
+) -> Result<TurnResult, String> {
+    let r = run_turn_inner(turn, cancel, timeout);
+    // Account-scoped failures bench the serving account (a success
+    // clears a stale bench); request-scoped ones leave it alone.
+    crate::accounts::observe(turn.account.as_ref(), &r);
+    r
+}
+
+fn run_turn_inner(
     turn: &PreparedTurn,
     cancel: &Arc<AtomicBool>,
     timeout: Duration,

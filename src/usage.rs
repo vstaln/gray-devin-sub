@@ -29,7 +29,13 @@ const REFRESH_AFTER: Duration = Duration::from_secs(30 * 60);
 /// Cap on the refresh command itself.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
 
-fn cache_dir() -> Option<PathBuf> {
+/// The CLI's `user_status` cache dir. With an account home the child env
+/// pins `XDG_CACHE_HOME` to `<home>/cache`, so the cache — and this read
+/// — follows it: quota windows can't bleed across accounts.
+fn cache_dir_for(home: Option<&std::path::Path>) -> Option<PathBuf> {
+    if let Some(h) = home {
+        return Some(h.join("cache").join("devin/cli"));
+    }
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)?;
@@ -37,8 +43,8 @@ fn cache_dir() -> Option<PathBuf> {
 }
 
 /// The newest `user_status.*.bin`, if any.
-fn latest_cache() -> Option<(PathBuf, u64)> {
-    let dir = cache_dir()?;
+fn latest_cache_for(home: Option<&std::path::Path>) -> Option<(PathBuf, u64)> {
+    let dir = cache_dir_for(home)?;
     let mut best: Option<(PathBuf, u64)> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
@@ -61,15 +67,22 @@ fn latest_cache() -> Option<(PathBuf, u64)> {
 
 /// `provider/usage` entry point.
 pub fn handle() -> Result<Value, ProviderRpcError> {
-    let Some((_, mtime)) = latest_cache() else {
+    handle_in(None)
+}
+
+/// [`handle`] against an account's credential home — its
+/// `XDG_CACHE_HOME` (`<home>/cache`) decides which `user_status` cache
+/// this reads and which login the refresh probes.
+pub fn handle_in(home: Option<&std::path::Path>) -> Result<Value, ProviderRpcError> {
+    let Some((_, mtime)) = latest_cache_for(home) else {
         return Err(ProviderRpcError::Unavailable(
             "no Devin CLI user-status cache; run `devin auth status` once".into(),
         ));
     };
     if crate::setup::unix_secs().saturating_sub(mtime) > REFRESH_AFTER.as_secs() {
-        refresh();
+        refresh(home);
     }
-    let Some((path, _)) = latest_cache() else {
+    let Some((path, _)) = latest_cache_for(home) else {
         return Err(ProviderRpcError::Unavailable(
             "user-status cache vanished".into(),
         ));
@@ -83,9 +96,14 @@ pub fn handle() -> Result<Value, ProviderRpcError> {
 
 /// `devin auth status` re-fetches user status when online; a hard
 /// timeout keeps a hung refresh from stalling `/usage`.
-fn refresh() {
+fn refresh(home: Option<&std::path::Path>) {
     if let Some(binary) = crate::setup::resolve_command() {
-        let _ = crate::setup::run_captured(&binary, &["auth", "status"], REFRESH_TIMEOUT);
+        let _ = crate::setup::run_captured_in(
+            &binary,
+            &["auth", "status"],
+            REFRESH_TIMEOUT,
+            &crate::setup::child_env_for(home),
+        );
     }
 }
 

@@ -36,13 +36,24 @@ pub fn run_captured(
     args: &[&str],
     timeout: std::time::Duration,
 ) -> Result<(bool, String, String), String> {
+    run_captured_in(binary, args, timeout, &child_env())
+}
+
+/// [`run_captured`] with an explicit child env — account probes pass the
+/// account's home (`XDG_DATA_HOME`) here.
+pub fn run_captured_in(
+    binary: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+    env: &[(String, String)],
+) -> Result<(bool, String, String), String> {
     use std::io::Read;
     let mut child = std::process::Command::new(binary)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .envs(child_env())
+        .envs(env.iter().cloned())
         .env("BROWSER", "/bin/true")
         .env("DISPLAY", "")
         .env("WAYLAND_DISPLAY", "")
@@ -125,9 +136,27 @@ const CONFLICTING_KEYS: &[&str] = &[
 
 /// Child env for every spawn: never inherit a conflicting value.
 pub fn child_env() -> Vec<(String, String)> {
-    std::env::vars()
+    child_env_for(None)
+}
+
+/// [`child_env`] pointed at an account's credential home: the account's
+/// `home` replaces `XDG_DATA_HOME` (so `devin` reads
+/// `<home>/devin/credentials.toml`) and `<home>/cache` replaces
+/// `XDG_CACHE_HOME` (so the CLI's `user_status` cache can't mix
+/// accounts). `None` inherits everything — the single-account path.
+pub fn child_env_for(home: Option<&std::path::Path>) -> Vec<(String, String)> {
+    let mut vars: Vec<(String, String)> = std::env::vars()
         .filter(|(k, _)| !CONFLICTING_KEYS.contains(&k.as_str()))
-        .collect()
+        .collect();
+    if let Some(h) = home {
+        vars.retain(|(k, _)| k != "XDG_DATA_HOME" && k != "XDG_CACHE_HOME");
+        vars.push(("XDG_DATA_HOME".into(), h.to_string_lossy().into_owned()));
+        vars.push((
+            "XDG_CACHE_HOME".into(),
+            h.join("cache").to_string_lossy().into_owned(),
+        ));
+    }
+    vars
 }
 
 /// Login state. `Unknown` degrades to an error, never to a turn.
@@ -160,13 +189,19 @@ pub fn auth_status_verdict(exit_ok: bool, output: &str) -> LoginState {
 /// returning the verdict plus the captured output for callers that can
 /// parse account lines out of it (`/devin status`).
 pub fn auth_status_output() -> (LoginState, Option<String>) {
+    auth_status_output_in(None)
+}
+
+/// [`auth_status_output`] against an account's credential home.
+pub fn auth_status_output_in(home: Option<&std::path::Path>) -> (LoginState, Option<String>) {
     let Some(binary) = resolve_command() else {
         return (LoginState::Unknown, None);
     };
-    let Ok((ok, out, err)) = run_captured(
+    let Ok((ok, out, err)) = run_captured_in(
         &binary,
         &["auth", "status"],
         std::time::Duration::from_secs(8),
+        &child_env_for(home),
     ) else {
         return (LoginState::Unknown, None);
     };
@@ -181,6 +216,11 @@ pub fn auth_status_output() -> (LoginState, Option<String>) {
 /// * spawn failure / timeout → `Unknown`.
 pub fn probe_login() -> LoginState {
     auth_status_output().0
+}
+
+/// [`probe_login`] against an account's credential home.
+pub fn probe_login_in(home: Option<&std::path::Path>) -> LoginState {
+    auth_status_output_in(home).0
 }
 
 #[path = "setup_tests.rs"]

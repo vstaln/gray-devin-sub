@@ -29,21 +29,37 @@ pub struct ModelEntry {
     pub alias: bool,
 }
 
-/// `devin models list`, cached per process.
+/// `devin models list`, cached per process per account home — tiers
+/// differ across accounts, so a second account's listing must not
+/// inherit the first's.
 pub fn entries() -> Result<Vec<ModelEntry>, String> {
-    static CACHE: OnceLock<Result<Vec<ModelEntry>, String>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| run_list().map(|text| parse_list(&text)))
+    entries_in(None)
+}
+
+type Listing = Result<Vec<ModelEntry>, String>;
+
+pub fn entries_in(home: Option<&std::path::Path>) -> Listing {
+    static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<String, Listing>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = home
+        .map(|h| h.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(key)
+        .or_insert_with(|| run_list(home).map(|text| parse_list(&text)))
         .clone()
 }
 
-fn run_list() -> Result<String, String> {
+fn run_list(home: Option<&std::path::Path>) -> Result<String, String> {
     let binary =
         crate::setup::resolve_command().ok_or_else(|| crate::setup::INSTALL_HINT.to_string())?;
-    let (ok, out, err) = crate::setup::run_captured(
+    let (ok, out, err) = crate::setup::run_captured_in(
         &binary,
         &["models", "list"],
         std::time::Duration::from_secs(30),
+        &crate::setup::child_env_for(home),
     )?;
     if !ok {
         let detail = err.trim().lines().last().unwrap_or("unknown error");
@@ -403,7 +419,18 @@ pub fn plain_groups(entries: &[ModelEntry]) -> Vec<PlainGroup<'_>> {
 /// the family's default tier. `fusion`
 /// with no resolved pairing is the Fusion header slug and passes through.
 pub fn native_model(model: &str, effort: Option<&str>) -> String {
-    let Ok(entries) = entries() else {
+    native_model_in(model, effort, None)
+}
+
+/// [`native_model`] under an account's credential home: its model list
+/// is its tier's, so route resolution must read that account's
+/// catalog, not the default login's.
+pub fn native_model_in(
+    model: &str,
+    effort: Option<&str>,
+    home: Option<&std::path::Path>,
+) -> String {
+    let Ok(entries) = entries_in(home) else {
         return model.to_string();
     };
     resolve_native(&entries, model, effort)

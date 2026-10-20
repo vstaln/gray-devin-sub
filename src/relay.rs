@@ -90,6 +90,7 @@ fn wait_turn(
 pub fn start_turn_server(
     model: String,
     bearer: String,
+    account: Option<crate::accounts::Account>,
 ) -> Result<(u16, std::thread::JoinHandle<()>), String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("relay bind: {e}"))?;
     let port = listener
@@ -97,7 +98,7 @@ pub fn start_turn_server(
         .map_err(|e| format!("relay addr: {e}"))?
         .port();
     let used = Arc::new(AtomicBool::new(false));
-    let handle = std::thread::spawn(move || serve(listener, model, bearer, used));
+    let handle = std::thread::spawn(move || serve(listener, model, bearer, used, account));
     Ok((port, handle))
 }
 
@@ -113,14 +114,20 @@ const UNUSED_TTL: Duration = Duration::from_secs(10 * 60);
 /// Accept-poll cadence while nonblocking.
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
 
-fn serve(listener: TcpListener, model: String, bearer: String, used: Arc<AtomicBool>) {
+fn serve(
+    listener: TcpListener,
+    model: String,
+    bearer: String,
+    used: Arc<AtomicBool>,
+    account: Option<crate::accounts::Account>,
+) {
     let _ = listener.set_nonblocking(true);
     let minted = Instant::now();
     let mut admitted_at: Option<Instant> = None;
     loop {
         match listener.accept() {
             Ok((mut s, _)) => {
-                handle_conn(&mut s, &model, &bearer, &used);
+                handle_conn(&mut s, &model, &bearer, &used, &account);
                 if admitted_at.is_none() && used.load(Ordering::SeqCst) {
                     admitted_at = Some(Instant::now());
                 }
@@ -140,7 +147,13 @@ fn serve(listener: TcpListener, model: String, bearer: String, used: Arc<AtomicB
     }
 }
 
-fn handle_conn(s: &mut std::net::TcpStream, model: &str, bearer: &str, used: &Arc<AtomicBool>) {
+fn handle_conn(
+    s: &mut std::net::TcpStream,
+    model: &str,
+    bearer: &str,
+    used: &Arc<AtomicBool>,
+    account: &Option<crate::accounts::Account>,
+) {
     let _ = s.set_read_timeout(Some(Duration::from_secs(330)));
     let mut buf = vec![0u8; 65536];
     let mut head = Vec::new();
@@ -229,8 +242,9 @@ fn handle_conn(s: &mut std::net::TcpStream, model: &str, bearer: &str, used: &Ar
     {
         let model = model.to_string();
         let cancel = cancel.clone();
+        let account = account.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(run_turn(&model, &session_id, &body, &cancel));
+            let _ = tx.send(run_turn(&model, &session_id, &body, &cancel, account));
         });
     }
     match wait_turn(&rx, s, &cancel, HEADER_GRACE) {
@@ -306,6 +320,7 @@ fn run_turn(
     session_id: &str,
     raw: &[u8],
     cancel: &Arc<AtomicBool>,
+    account: Option<crate::accounts::Account>,
 ) -> Result<Vec<u8>, String> {
     let body: Value = serde_json::from_slice(raw)
         .map_err(|e| format!("relay body is not JSON ({} bytes): {e}", raw.len()))?;
@@ -314,8 +329,10 @@ fn run_turn(
         .and_then(Value::as_str)
         .filter(|m| !m.is_empty())
         .unwrap_or(model);
-    let mut turn = crate::chat::prepare_turn(&body, model)?;
+    let mut turn =
+        crate::chat::prepare_turn(&body, model, account.as_ref().map(|a| a.home.as_path()))?;
     turn.gray_session = session_id.to_string();
+    turn.account = account;
     // A pooled session when this history continues one, else a fresh
     // spawn — either way native makes exactly one upstream request.
     let result = crate::chat::run_turn(&turn, cancel, Duration::from_secs(600))?;

@@ -359,6 +359,11 @@ pub struct LiveSession {
     /// conversation's next sidecar can claim it across a process
     /// boundary. The last absorbing turn owns it.
     pub(crate) gray_session: String,
+    /// The account label this child was spawned under (its credential
+    /// home was `XDG_DATA_HOME`); `""` on the legacy single-login path.
+    /// Pool matching never crosses accounts: a session only continues a
+    /// turn of the same label.
+    pub(crate) account: String,
     /// The stage variant this child's config baked in, derived in
     /// `spawn_child` from the spawn turn's `names` — the same expression
     /// the callers pass to [`stage`]. Persisted so [`rewarm`] mounts the
@@ -397,6 +402,11 @@ pub(crate) struct Persisted {
     /// rewammable: the wrong stage's cwd is a cold cache.
     #[serde(default)]
     pub deny_search: Option<bool>,
+    /// The account label the owning child was spawned under; `""` on
+    /// records written before accounts existed — those only match
+    /// account-less turns.
+    #[serde(default)]
+    pub account: String,
 }
 
 fn unix_now() -> u64 {
@@ -540,6 +550,7 @@ pub(crate) fn reload_candidates(
     let mut out: Vec<(Persisted, String)> = records
         .into_iter()
         .filter(|p| !owner_blocks(p, turn, alive))
+        .filter(|p| p.account == turn.account_label())
         .filter(|p| now_unix.saturating_sub(p.last_prompt_unix) <= max_age.as_secs())
         .filter(|p| p.native_model == turn.native_model && p.system == turn.system)
         .filter_map(|p| {
@@ -649,7 +660,12 @@ fn spawn_idle(p: &Persisted, deny_search: bool) -> Option<LiveSession> {
         },
         native_model: p.native_model.clone(),
         gray_session: p.gray_session.clone(),
+        account: crate::accounts::resolve(&p.account),
     };
+    if !p.account.is_empty() && turn.account.is_none() {
+        crate::chat::pool_event("rewarm:no_account", &p.session_id);
+        return None;
+    }
     let never = AtomicBool::new(false);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut s = spawn_child(&turn, stage).ok()?;
@@ -724,6 +740,7 @@ pub fn rewarm() {
             session_id: p.session_id.clone(),
             native_model: p.native_model.clone(),
             system: p.system.clone(),
+            account: p.account.clone(),
         });
         match spawn_idle(&p, deny_search) {
             // `give_back` persists the record under this pid (claiming
@@ -748,6 +765,7 @@ struct Warming {
     session_id: String,
     native_model: String,
     system: String,
+    account: String,
 }
 
 /// A session checked out of the pool for a real prompt in flight: not in
@@ -761,6 +779,7 @@ struct Borrowed {
     native_model: String,
     system: String,
     gray_session: String,
+    account: String,
 }
 
 impl Borrowed {
@@ -770,6 +789,7 @@ impl Borrowed {
             native_model: s.native_model.clone(),
             system: s.system.clone(),
             gray_session: s.gray_session.clone(),
+            account: s.account.clone(),
         }
     }
 }
@@ -787,9 +807,11 @@ impl Pool {
     /// check. An unrelated conversation sharing both just waits out one
     /// keepalive (seconds) before spawning fresh.
     fn warming_for(&self, turn: &PreparedTurn) -> bool {
-        self.warming
-            .iter()
-            .any(|w| w.native_model == turn.native_model && w.system == turn.system)
+        self.warming.iter().any(|w| {
+            w.native_model == turn.native_model
+                && w.system == turn.system
+                && w.account == turn.account_label()
+        })
     }
 
     /// Whether a checked-out session belongs to `turn`'s conversation:
@@ -798,6 +820,9 @@ impl Pool {
     /// waits out the window, same tradeoff as `warming_for`).
     fn borrowed_for(&self, turn: &PreparedTurn) -> bool {
         self.borrowed.iter().any(|b| {
+            if b.account != turn.account_label() {
+                return false;
+            }
             if !b.gray_session.is_empty() && !turn.gray_session.is_empty() {
                 b.gray_session == turn.gray_session
             } else {
@@ -908,6 +933,9 @@ fn find(live: &[LiveSession], turn: &PreparedTurn) -> Result<(usize, String), &'
     let mut reason = "no_session";
     let mut depth = 0;
     for (i, s) in live.iter().enumerate() {
+        if s.account != turn.account_label() {
+            continue;
+        }
         let (miss, d) = if s.native_model != turn.native_model {
             ("model", 1)
         } else if s.system != turn.system {
@@ -939,6 +967,7 @@ fn find(live: &[LiveSession], turn: &PreparedTurn) -> Result<(usize, String), &'
             if s.native_model != turn.native_model
                 || s.system != turn.system
                 || s.gray_session != turn.gray_session
+                || s.account != turn.account_label()
             {
                 continue;
             }
@@ -970,6 +999,7 @@ pub fn replay(turn: &PreparedTurn) -> Option<TurnResult> {
     let s = pool.live.iter_mut().find(|s| {
         s.native_model == turn.native_model
             && s.system == turn.system
+            && s.account == turn.account_label()
             && s.absorbed == turn.input
             && s.last_reply.is_some()
     })?;
@@ -1100,13 +1130,14 @@ fn take_keepalive() -> Option<LiveSession> {
             s.last_prompt_at,
             s.last_used,
             matches!(s.child.try_wait(), Ok(None)),
-        )
+        ) && !crate::accounts::is_cooled(&s.account)
     })?;
     let s = pool.live.remove(i);
     pool.warming.push(Warming {
         session_id: s.session_id.clone(),
         native_model: s.native_model.clone(),
         system: s.system.clone(),
+        account: s.account.clone(),
     });
     Some(s)
 }
@@ -1122,6 +1153,11 @@ fn keepalive_sweep() {
         // so it goes back to the pool like a settled real-turn failure.
         // Only a prompt left in flight closes the child.
         let failed = s.keepalive().err();
+        if let Some(e) = failed.as_deref()
+            && let Some(ttl) = crate::accounts::classify(e)
+        {
+            crate::accounts::cool(&s.account, ttl, e);
+        }
         if let Some(e) = failed.as_deref().filter(|e| is_usage_limit(e)) {
             *KEEPALIVE_PAUSED_UNTIL
                 .lock()
@@ -1205,7 +1241,9 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .envs(setup::child_env())
+        .envs(setup::child_env_for(
+            turn.account.as_ref().map(|a| a.home.as_path()),
+        ))
         // A turn must never pop a browser out of a stale login.
         .env("BROWSER", "/bin/true")
         .env("DISPLAY", "")
@@ -1288,6 +1326,7 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         keepalive_prompt: false,
         loading: false,
         gray_session: turn.gray_session.clone(),
+        account: turn.account_label().to_string(),
         deny_search: !turn.names.iter().any(|n| n == "web_search"),
         rewarmed: false,
     };
@@ -1375,6 +1414,7 @@ impl LiveSession {
             owner_pid: std::process::id(),
             gray_session: self.gray_session.clone(),
             deny_search: Some(self.deny_search),
+            account: self.account.clone(),
         })
     }
 

@@ -102,6 +102,10 @@ fn valid_name(name: &str) -> bool {
 /// host's provider-login shortcut (connect → model picker) takes it.
 pub fn command(argv: &[String]) -> String {
     match argv.first().map(String::as_str) {
+        Some("account") => match crate::accounts::command(&argv[1..]) {
+            Ok(text) => text,
+            Err(e) => e,
+        },
         Some("tools") => tools_command(&argv[1..]),
         _ => format!("{USAGE}\n\n{}", status_line(&ToolPolicy::load())),
     }
@@ -115,7 +119,9 @@ const USAGE: &str = "\
   /devin tools bash     bash only (the default)
   /devin tools +name    also allow one tool, e.g. /devin tools +discord_send
   /devin tools -name    remove one
-Same from a shell: `gray devin-sub tools …`.";
+Same from a shell: `gray devin-sub tools …`.
+/devin account — multi-login pool: add · list · use · remove · status
+  (`account add` runs `devin auth login` — a shell, not the REPL).";
 
 fn status_line(policy: &ToolPolicy) -> String {
     if policy.allow.contains(ALL) {

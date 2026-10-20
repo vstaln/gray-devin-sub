@@ -32,8 +32,13 @@ pub const FUSION_ID: &str = "fusion";
 
 /// The live catalog. A CLI failure is an error, not a silent empty list.
 pub fn catalog() -> Result<ProviderModelCatalog, String> {
+    catalog_in(None)
+}
+
+/// [`catalog`] under an account's credential home (its tier's listing).
+pub fn catalog_in(home: Option<&std::path::Path>) -> Result<ProviderModelCatalog, String> {
     Ok(ProviderModelCatalog {
-        models: collapse(catalog::entries()?),
+        models: collapse(catalog::entries_in(home)?),
     })
 }
 

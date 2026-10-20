@@ -7,7 +7,8 @@ use serde_json::Value;
 use crate::{setup, usage};
 
 /// "  Name:  X" / "  Email:  X" / "  Tier:  X" from `devin auth status`.
-fn field(output: &str, name: &str) -> Option<String> {
+/// `pub(crate)` so `accounts::add` can read the identity for dedupe.
+pub(crate) fn field(output: &str, name: &str) -> Option<String> {
     for line in output.lines() {
         if let Some(v) = line.trim().strip_prefix(&format!("{name}:")) {
             let v = v.trim();
@@ -42,7 +43,10 @@ fn window_line(w: &Value) -> Option<String> {
 
 pub fn text() -> String {
     let mut out = "Devin backend (unofficial)".to_string();
-    let (state, output) = setup::auth_status_output();
+    // The serving account (fill_first over the pool, `None` on the
+    // legacy single-login path) decides which home the probes read.
+    let account = crate::accounts::select().ok().flatten();
+    let (state, output) = setup::auth_status_output_in(account.as_ref().map(|a| a.home.as_path()));
     match state {
         setup::LoginState::LoggedIn => {
             out.push_str("\n  login: devin auth (devin CLI) · logged in")
@@ -68,7 +72,7 @@ pub fn text() -> String {
             out.push_str(&format!("\n  tier:  {tier}"));
         }
     }
-    match usage::handle() {
+    match usage::handle_in(account.as_ref().map(|a| a.home.as_path())) {
         Ok(v) => {
             if let Some(plan) = v.get("plan").and_then(Value::as_str)
                 && plan != "unknown"
@@ -91,5 +95,7 @@ pub fn text() -> String {
         }
         Err(e) => out.push_str(&format!("\n  usage: ({e})")),
     }
+    out.push('\n');
+    out.push_str(&crate::accounts::status());
     out
 }
