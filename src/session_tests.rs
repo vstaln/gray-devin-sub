@@ -350,6 +350,7 @@ fn take_waits_for_a_checked_out_session() {
 /// session/new / session/load / session/delete and replies to
 /// session/prompt with one message chunk + usage. Every request is
 /// appended to @LOG@ so the test can assert exactly which methods ran.
+#[cfg(unix)]
 const STUB_ACP: &str = r##"#!/usr/bin/env python3
 import sys, json, os
 LOG = "@LOG@"
@@ -398,6 +399,8 @@ for line in sys.stdin:
 /// prompt, pool; strict reuse prompting only the delta; a keepalive on
 /// the due session; idle reap detaching without `session/delete`; and a
 /// later turn reattaching through `session/load`.
+// The stub child is a python script run via its shebang: unix only.
+#[cfg(unix)]
 #[test]
 fn e2e_stub_child_pool_cycle() {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -410,7 +413,7 @@ fn e2e_stub_child_pool_cycle() {
     let stub_path = dir.join("devin-stub");
     std::fs::write(
         &stub_path,
-        STUB_ACP.replace("@LOG@", &log_path.to_string_lossy().into_owned()),
+        STUB_ACP.replace("@LOG@", &log_path.to_string_lossy()),
     )
     .unwrap();
     #[cfg(unix)]

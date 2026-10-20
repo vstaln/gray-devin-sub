@@ -1089,7 +1089,7 @@ pub(crate) fn continuation(
 pub(crate) fn tail_delta(input: &[Value]) -> Option<String> {
     let start = input
         .iter()
-        .rposition(|item| assistant_side(item))
+        .rposition(assistant_side)
         .map(|i| i + 1)
         .unwrap_or(0);
     let delta = render_items(&input[start..]);
@@ -1108,7 +1108,7 @@ pub(crate) fn continuation_skip(absorbed: &[Value], input: &[Value]) -> usize {
     } else {
         input
             .iter()
-            .rposition(|item| assistant_side(item))
+            .rposition(assistant_side)
             .map(|i| i + 1)
             .unwrap_or(0)
     }
