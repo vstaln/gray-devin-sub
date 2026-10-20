@@ -112,6 +112,7 @@ fn stub_session() -> LiveSession {
         session_id: "s-test".to_string(),
         native_model: "model".to_string(),
         system: "sys".to_string(),
+        account: String::new(),
         absorbed: Vec::new(),
         reply_call_ids: Vec::new(),
         reply_text: String::new(),
@@ -154,6 +155,7 @@ fn keepalive_turns_do_not_break_continuation_matching() {
         names: Vec::new(),
         native_model: "model".to_string(),
         gray_session: String::new(),
+        account: None,
     };
     let r = TurnResult {
         text: "answer".to_string(),
@@ -226,6 +228,7 @@ fn a_turn_waits_for_its_session_to_return_from_a_keepalive() {
         names: Vec::new(),
         native_model: model.to_string(),
         gray_session: String::new(),
+        account: None,
     };
     let history = vec![json!({"role": "user", "content": "hi"})];
     let first = turn(model, history.clone());
@@ -255,6 +258,7 @@ fn a_turn_waits_for_its_session_to_return_from_a_keepalive() {
         session_id: s.session_id.clone(),
         native_model: model.to_string(),
         system: "sys".to_string(),
+        account: String::new(),
     });
     let back = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(300));
@@ -635,6 +639,7 @@ fn turn(model: &str, input: Vec<Value>) -> PreparedTurn {
         names: Vec::new(),
         native_model: model.to_string(),
         gray_session: String::new(),
+        account: None,
     }
 }
 
@@ -956,6 +961,7 @@ fn record(session_id: &str, model: &str, owner_pid: u32, last_prompt_unix: u64) 
         owner_pid,
         gray_session: String::new(),
         deny_search: Some(false),
+        account: String::new(),
     }
 }
 

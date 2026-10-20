@@ -1,6 +1,7 @@
 //! Library target for `gray-devin-sub`: the protocol-1.2 sidecar plugin
 //! (`devin-sub` binary) for Gray's plugin system.
 
+pub mod accounts;
 pub mod catalog;
 pub mod chat;
 pub mod guard;

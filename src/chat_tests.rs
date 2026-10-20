@@ -11,7 +11,7 @@ fn bash_tool() -> Value {
 #[test]
 fn prepare_accepts_short_form_user_message() {
     let body = json!({"input": [{"role": "user", "content": "hi"}]});
-    let turn = prepare_turn(&body, "swe-2-medium").expect("short-form message must prepare");
+    let turn = prepare_turn(&body, "swe-2-medium", None).expect("short-form message must prepare");
     assert!(turn.content_line.contains("hi"), "{}", turn.content_line);
     assert_eq!(turn.native_model, "swe-2-medium");
 }
@@ -23,7 +23,7 @@ fn prepare_accepts_short_form_assistant_then_user() {
         {"role": "assistant", "content": "hello"},
         {"role": "user", "content": "again"}
     ]});
-    let turn = prepare_turn(&body, "swe-2-medium").expect("replay must prepare");
+    let turn = prepare_turn(&body, "swe-2-medium", None).expect("replay must prepare");
     assert!(turn.content_line.contains("hello"));
     assert!(turn.content_line.contains("again"));
 }
@@ -34,14 +34,14 @@ fn prepare_rejects_assistant_prefill() {
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "hello"}
     ]});
-    assert!(prepare_turn(&body, "swe-2-medium").is_err());
+    assert!(prepare_turn(&body, "swe-2-medium", None).is_err());
 }
 
 #[test]
 fn prepare_collects_tool_names_into_contract() {
     let body = json!({"input": [{"role": "user", "content": "hi"}],
         "tools": [bash_tool()]});
-    let turn = prepare_turn(&body, "swe-2-medium").unwrap();
+    let turn = prepare_turn(&body, "swe-2-medium", None).unwrap();
     assert!(turn.system.contains("gray_calls"));
     assert!(turn.system.contains("bash"));
     assert_eq!(turn.names, vec!["bash".to_string()]);

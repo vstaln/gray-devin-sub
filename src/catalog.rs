@@ -30,31 +30,45 @@ pub struct ModelEntry {
     pub alias: bool,
 }
 
-/// `devin models list`, cached briefly per process — the sidecar is
-/// long-lived and models ship inside the `devin` binary, so a OnceLock
-/// would keep hiding whatever a `devin` update adds until respawn.
+/// `devin models list`, cached briefly per process per account home —
+/// tiers differ across accounts, so a second account's listing must not
+/// inherit the first's; and the sidecar is long-lived while models ship
+/// inside the `devin` binary, so entries expire to pick up updates.
 const LIST_TTL: Duration = Duration::from_secs(300);
 
 pub fn entries() -> Result<Vec<ModelEntry>, String> {
-    static CACHE: Mutex<Option<(Instant, Result<Vec<ModelEntry>, String>)>> = Mutex::new(None);
-    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((at, cached)) = &*guard
+    entries_in(None)
+}
+
+type Listing = Result<Vec<ModelEntry>, String>;
+
+pub fn entries_in(home: Option<&std::path::Path>) -> Listing {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (Instant, Listing)>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = home
+        .map(|h| h.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, cached)) = guard.get(&key)
         && at.elapsed() < LIST_TTL
     {
         return cached.clone();
     }
-    let fresh = run_list().map(|text| parse_list(&text));
-    *guard = Some((Instant::now(), fresh.clone()));
+    let fresh = run_list(home).map(|text| parse_list(&text));
+    guard.insert(key, (Instant::now(), fresh.clone()));
     fresh
 }
 
-fn run_list() -> Result<String, String> {
+fn run_list(home: Option<&std::path::Path>) -> Result<String, String> {
     let binary =
         crate::setup::resolve_command().ok_or_else(|| crate::setup::INSTALL_HINT.to_string())?;
-    let (ok, out, err) = crate::setup::run_captured(
+    let (ok, out, err) = crate::setup::run_captured_in(
         &binary,
         &["models", "list"],
         std::time::Duration::from_secs(30),
+        &crate::setup::child_env_for(home),
     )?;
     if !ok {
         let detail = err.trim().lines().last().unwrap_or("unknown error");
@@ -414,7 +428,18 @@ pub fn plain_groups(entries: &[ModelEntry]) -> Vec<PlainGroup<'_>> {
 /// the family's default tier. `fusion`
 /// with no resolved pairing is the Fusion header slug and passes through.
 pub fn native_model(model: &str, effort: Option<&str>) -> String {
-    let Ok(entries) = entries() else {
+    native_model_in(model, effort, None)
+}
+
+/// [`native_model`] under an account's credential home: its model list
+/// is its tier's, so route resolution must read that account's
+/// catalog, not the default login's.
+pub fn native_model_in(
+    model: &str,
+    effort: Option<&str>,
+    home: Option<&std::path::Path>,
+) -> String {
+    let Ok(entries) = entries_in(home) else {
         return model.to_string();
     };
     resolve_native(&entries, model, effort)

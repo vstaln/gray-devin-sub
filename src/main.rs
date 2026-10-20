@@ -20,7 +20,7 @@
 //! - `plugin/shutdown` → clean exit. Unknown methods are protocol errors
 //!   (provider sidecars must fail loudly, never hang a turn).
 
-use devin_sub::{catalog, chat, manifest, models, relay, session, setup, usage};
+use devin_sub::{accounts, catalog, chat, manifest, models, relay, session, setup, usage};
 
 use gray_plugin::ProviderRpcError;
 use serde::{Deserialize, Serialize};
@@ -47,8 +47,9 @@ struct Response {
 
 fn cli_help() -> String {
     "devin-sub — Devin subscription provider for gray\n\
-     usage: devin-sub manifest | sidecar | models | tools [all|bash|+name|-name|name …]\n\
-     slash:  /devin · /devin tools … · /fusion"
+     usage: devin-sub manifest | sidecar | models | tools [all|bash|+name|-name|name …] | account <verb>\n\
+     account: add <label> [home] [-- login-args] · list · use <label> · remove <label> · status\n\
+     slash:  /devin · /devin tools … · /devin account … · /fusion"
         .to_string()
 }
 
@@ -73,6 +74,22 @@ fn main() -> anyhow::Result<()> {
                 .collect();
             println!("{}", devin_sub::settings::tools_command(&args));
             return Ok(());
+        }
+        Some(a) if a == "account" => {
+            let args: Vec<String> = std::env::args_os()
+                .skip(2)
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            match accounts::command(&args) {
+                Ok(text) => {
+                    println!("{text}");
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
         }
         Some(s) if s == "help" || s == "--help" || s == "-h" => {
             println!("{}", cli_help());
@@ -223,7 +240,9 @@ fn handle(request: &Request) -> Result<Value, ProviderRpcError> {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             ensure_provider(provider, auth_method)?;
-            let catalog = models::catalog().map_err(ProviderRpcError::Unavailable)?;
+            let home = accounts::select().ok().flatten().map(|a| a.home);
+            let catalog =
+                models::catalog_in(home.as_deref()).map_err(ProviderRpcError::Unavailable)?;
             Ok(serde_json::to_value(catalog).unwrap())
         }
         "provider/chat" => chat_turn(params),
@@ -237,7 +256,13 @@ fn handle(request: &Request) -> Result<Value, ProviderRpcError> {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             ensure_provider(provider, auth_method)?;
-            usage::handle()
+            usage::handle_in(
+                accounts::select()
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(|a| a.home.as_path()),
+            )
         }
         "command/run" => {
             let name = params
@@ -287,29 +312,59 @@ fn chat_turn(params: Value) -> Result<Value, ProviderRpcError> {
     if setup::resolve_command().is_none() {
         return Err(ProviderRpcError::Unavailable(setup::INSTALL_HINT.into()));
     }
+    // Pick the serving account now: fill_first over the configured
+    // pool, `None` on the legacy single-login path. The relay mint parks
+    // the choice — the admitted POST spawns `devin` under this home.
+    let account = match accounts::select() {
+        Ok(a) => a,
+        Err(e) => return Err(ProviderRpcError::Unavailable(e)),
+    };
     // No login, no relay: `/connect` shows the hint instead of a turn that
-    // dies later. A confirmed login is remembered for this sidecar's life;
-    // an inconclusive probe never blocks a turn.
-    static LOGGED_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !LOGGED_IN.load(std::sync::atomic::Ordering::Relaxed) {
-        match setup::probe_login() {
+    // dies later. A confirmed login is remembered for this sidecar's life
+    // (per account); an inconclusive probe never blocks a turn.
+    static LOGGED_IN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let key = account
+        .as_ref()
+        .map(|a| a.label.clone())
+        .unwrap_or_default();
+    let known = LOGGED_IN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&key);
+    if !known {
+        match setup::probe_login_in(account.as_ref().map(|a| a.home.as_path())) {
             setup::LoginState::LoggedOut => {
-                return Err(ProviderRpcError::Unavailable(setup::LOGIN_HINT.into()));
+                return Err(ProviderRpcError::Unavailable(match &account {
+                    Some(a) => format!(
+                        "account {:?} is not logged in — its home is {}",
+                        a.label,
+                        a.home.display()
+                    ),
+                    None => setup::LOGIN_HINT.into(),
+                }));
             }
             setup::LoginState::LoggedIn => {
-                LOGGED_IN.store(true, std::sync::atomic::Ordering::Relaxed)
+                LOGGED_IN
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key);
             }
             setup::LoginState::Unknown => {}
         }
     }
     let bearer = format!("devin-sub-{}", chat::rand_hex(16));
-    let (port, _handle) = relay::start_turn_server(model.clone(), bearer.clone())
+    let (port, _handle) = relay::start_turn_server(model.clone(), bearer.clone(), account.clone())
         .map_err(ProviderRpcError::Unavailable)?;
     std::mem::forget(_handle);
     Ok(json!({
         "relay_url": format!("http://127.0.0.1:{port}/relay/{bearer}/responses"),
         "relay_token": bearer,
-        "native_model": catalog::native_model(&model, None),
+        "native_model": catalog::native_model_in(
+            &model,
+            None,
+            account.as_ref().map(|a| a.home.as_path()),
+        ),
     }))
 }
 
