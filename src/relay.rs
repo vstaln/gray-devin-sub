@@ -259,10 +259,11 @@ fn handle_conn(
             let _ = s.flush();
         }
         Wait::Done(Err(detail)) => {
+            let (status, kind, _) = failure_kind(&detail);
             let body = json!({"type": "error", "error": {
-                "type": "server_error", "message": detail,
+                "type": kind, "message": detail,
             }});
-            write_resp(s, 500, body.to_string().as_bytes());
+            write_resp(s, status, body.to_string().as_bytes());
         }
         Wait::Died => {
             let body = json!({"type": "error", "error": {
@@ -293,7 +294,7 @@ fn handle_conn(
                     Wait::Done(Err(detail)) => {
                         let failed = json!({"type": "response.failed",
                             "response": {"status": "failed",
-                                "error": {"code": "server_error", "message": detail}}});
+                                "error": {"code": failure_kind(&detail).2, "message": detail}}});
                         let _ =
                             s.write_all(format!("data: {failed}\n\ndata: [DONE]\n\n").as_bytes());
                         let _ = s.flush();
@@ -339,11 +340,24 @@ fn run_turn(
     crate::chat::fold_result(&result)
 }
 
+/// HTTP status, error `type` and stream `code` for a failed turn. A Devin
+/// usage/rate limit must surface as 429 `rate_limit_error`: as a 500 the
+/// host treats it as transient and retries the turn, and every retry spends
+/// the exhausted quota again before the run dies as an opaque failure.
+fn failure_kind(detail: &str) -> (u16, &'static str, &'static str) {
+    if crate::session::is_usage_limit(detail) {
+        (429, "rate_limit_error", "rate_limit_exceeded")
+    } else {
+        (500, "server_error", "server_error")
+    }
+}
+
 fn write_resp(s: &mut std::net::TcpStream, status: u16, body: &[u8]) {
     let reason = match status {
         400 => "Bad Request",
         413 => "Payload Too Large",
         404 => "Not Found",
+        429 => "Too Many Requests",
         _ => "Error",
     };
     let header = format!(

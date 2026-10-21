@@ -108,6 +108,8 @@ fn stub_session() -> LiveSession {
         stdin,
         rx,
         stderr_tail: stderr(&[]),
+        limit_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        limit_polls: 0,
         next_id: 0,
         session_id: "s-test".to_string(),
         native_model: "model".to_string(),
@@ -815,7 +817,8 @@ fn an_empty_end_turn_on_a_real_prompt_is_a_limit_failure() {
         .err()
         .unwrap();
     assert!(e.contains("empty end_turn"), "{e}");
-    assert!(e.contains("usage-limit"), "{e}");
+    assert!(e.contains("usage limit"), "{e}");
+    assert!(is_usage_limit(&e), "{e}");
     assert!(
         !s.prompt_in_flight,
         "the prompt settled — the session stays poolable"
@@ -1140,4 +1143,33 @@ fn usage_limit_errors_are_the_ones_not_worth_retrying() {
     assert!(is_usage_limit("HTTP 429 Too Many Requests"));
     assert!(!is_usage_limit("prompt timed out after 60s"));
     assert!(!is_usage_limit("child exited"));
+}
+
+#[test]
+fn limit_line_matches_only_the_refusal_signature() {
+    for line in [
+        "devin subscription usage limit reached (resets 18:00)",
+        "POST /v1/turns -> 429 Too Many Requests",
+        "daily quota exhausted, retrying in 240s",
+        "upstream rate limit exceeded",
+    ] {
+        assert!(limit_line(line), "{line}");
+    }
+    for line in [
+        "session/load ok",
+        "prompt settled end_turn",
+        "permission request id=9",
+    ] {
+        assert!(!limit_line(line), "{line}");
+    }
+}
+
+#[test]
+fn early_abort_error_still_maps_to_429() {
+    // limit_error's output must satisfy is_usage_limit, else the relay's
+    // 429 mapping misses it and the host retries the wedged turn.
+    assert!(is_usage_limit("Devin usage limit reached"));
+    assert!(is_usage_limit(
+        "Devin usage limit reached: daily quota exhausted"
+    ));
 }

@@ -128,8 +128,12 @@ const CLIENT_GONE: &str = "client disconnected";
 /// usage-limit rejection ACP agents can return instead of an error (the
 /// turn "succeeds" with an empty reply the host can't tell from a real
 /// answer). Surfaced as a failure so the host retries; no transcript
-/// content in the message.
-const EMPTY_END_TURN: &str = "devin acp returned an empty end_turn with no output — likely a usage-limit rejection; session kept pooled";
+/// content in the message. Carries "usage limit reached" so the same
+/// matchers trip that `limit_error`, `is_usage_limit`, the relay's 429
+/// mapping and the account bench all share — a hyphenated "usage-limit"
+/// classified as a plain 500 and the host retry-burned against the
+/// exhausted quota.
+const EMPTY_END_TURN: &str = "Devin usage limit reached: devin acp returned an empty end_turn with no output (silent rejection); session kept pooled";
 
 /// Deny list written into both the project config and the user config the
 /// child sees: every native capability Devin exposes outside `ASK_RULES`.
@@ -311,6 +315,18 @@ pub struct LiveSession {
     stdin: ChildStdin,
     rx: Receiver<Value>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /// Set by the stderr reader when the child logs an upstream
+    /// usage-limit refusal mid-turn: `devin acp` retries a refused
+    /// request internally for hours (see KEEPALIVE_COOLDOWN), so a
+    /// flagged in-flight prompt can only burn the rest of the turn
+    /// budget — `recv_response` fails it fast instead. `send_prompt`
+    /// clears it: a refusal logged under an earlier prompt must not
+    /// fail this one, and a still-limited account re-logs during the
+    /// prompt anyway.
+    limit_flag: Arc<AtomicBool>,
+    /// Consecutive wait polls that saw `limit_flag` while a prompt was
+    /// in flight — two sightings fail the turn; one line can't abort it.
+    limit_polls: u8,
     next_id: u64,
     pub(crate) session_id: String,
     pub(crate) native_model: String,
@@ -1098,9 +1114,23 @@ pub fn give_back(s: LiveSession) {
 
 /// Whether an upstream error is the account's usage/rate limit — the
 /// one failure a retry can only prolong.
-fn is_usage_limit(err: &str) -> bool {
+pub(crate) fn is_usage_limit(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
-    e.contains("rate limit") || e.contains("usage limit") || e.contains("429")
+    e.contains("rate limit")
+        || e.contains("usage limit")
+        || e.contains("usage-limit")
+        || e.contains("429")
+}
+
+/// Whether a `devin acp` stderr line is an upstream usage/rate-limit
+/// refusal — the signature `map_rpc_error` and `is_usage_limit` share,
+/// watched live by the stderr reader so a parked turn fails fast.
+fn limit_line(line: &str) -> bool {
+    let e = line.to_ascii_lowercase();
+    e.contains("rate limit")
+        || e.contains("usage limit")
+        || e.contains("quota")
+        || e.contains("429")
 }
 
 /// When keepalives resume after a usage-limit failure (`None` = not paused).
@@ -1279,11 +1309,16 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
 
     // stderr → last ~20 lines, redacted, for error detail only.
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let limit_flag: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     if let Some(err) = child.stderr.take() {
         let tail = stderr_tail.clone();
+        let limit = limit_flag.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(err).lines() {
                 let Ok(line) = line else { break };
+                if limit_line(&line) {
+                    limit.store(true, Ordering::SeqCst);
+                }
                 if let Ok(mut t) = tail.lock() {
                     if t.len() >= 20 {
                         t.pop_front();
@@ -1322,6 +1357,8 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         stdin,
         rx,
         stderr_tail,
+        limit_flag,
+        limit_polls: 0,
         next_id: 0,
         session_id: String::new(),
         native_model: turn.native_model.clone(),
@@ -1469,6 +1506,8 @@ impl LiveSession {
         self.pending_perms.clear();
         self.batch_quiet = None;
         self.batch_flushed = false;
+        self.limit_polls = 0;
+        self.limit_flag.store(false, Ordering::SeqCst);
         self.guard = TurnGuard::default();
         self.usage = Usage::default();
         self.names = names.to_vec();
@@ -1519,7 +1558,7 @@ impl LiveSession {
             && self.thought.trim().is_empty()
             && self.redirected.is_empty()
         {
-            return Err(EMPTY_END_TURN.to_string());
+            return Err(self.limit_detail(EMPTY_END_TURN.to_string()));
         }
         let mut r = self.finish(stop_reason);
         r.unseen = unseen;
@@ -1879,6 +1918,7 @@ impl LiveSession {
             });
             match self.rx.recv_timeout(left.min(wait)) {
                 Ok(line) => {
+                    self.limit_polls = 0;
                     if line.get("method").is_some() && line.get("id").is_some() {
                         self.on_request(&line)?;
                     } else if line.get("method").is_some() {
@@ -1887,7 +1927,20 @@ impl LiveSession {
                         return Ok(line);
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    // The child logged an upstream usage-limit refusal
+                    // while this prompt is in flight: `devin acp` parks
+                    // the refused request on its own ~4-minute retry loop
+                    // for hours, so the wait cannot succeed soon — fail
+                    // it as a rate limit now (prompt_result's cancel +
+                    // settle grace still lets a late result win).
+                    if self.prompt_in_flight && self.limit_flag.load(Ordering::SeqCst) {
+                        self.limit_polls += 1;
+                        if self.limit_polls >= 2 {
+                            return Err(self.limit_error());
+                        }
+                    }
+                }
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err("native stdout closed".into());
                 }
@@ -1896,6 +1949,25 @@ impl LiveSession {
                 self.flush_batch();
             }
         }
+    }
+
+    /// The error a limit-flagged in-flight prompt fails with: the
+    /// newest refusal line the child logged, so it carries the same
+    /// signature `is_usage_limit` and the relay's 429 mapping look for.
+    fn limit_error(&self) -> String {
+        self.limit_detail("Devin usage limit reached".to_string())
+    }
+
+    /// `fallback` unless the child's stderr tail holds a refusal line —
+    /// then that line, verbatim: it can carry reset detail ("resets
+    /// 18:00") the bench TTL and the host's quota-window retry parse.
+    fn limit_detail(&self, fallback: String) -> String {
+        if let Ok(tail) = self.stderr_tail.lock()
+            && let Some(line) = tail.iter().rev().find(|l| limit_line(l))
+        {
+            return format!("Devin usage limit reached: {line}");
+        }
+        fallback
     }
 
     /// Read until the response to request `id` arrives (or a hard error).
