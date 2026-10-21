@@ -128,8 +128,12 @@ const CLIENT_GONE: &str = "client disconnected";
 /// usage-limit rejection ACP agents can return instead of an error (the
 /// turn "succeeds" with an empty reply the host can't tell from a real
 /// answer). Surfaced as a failure so the host retries; no transcript
-/// content in the message.
-const EMPTY_END_TURN: &str = "devin acp returned an empty end_turn with no output — likely a usage-limit rejection; session kept pooled";
+/// content in the message. Carries "usage limit reached" so the same
+/// matchers trip that `limit_error`, `is_usage_limit`, the relay's 429
+/// mapping and the account bench all share — a hyphenated "usage-limit"
+/// classified as a plain 500 and the host retry-burned against the
+/// exhausted quota.
+const EMPTY_END_TURN: &str = "Devin usage limit reached: devin acp returned an empty end_turn with no output (silent rejection); session kept pooled";
 
 /// Deny list written into both the project config and the user config the
 /// child sees: every native capability Devin exposes outside `ASK_RULES`.
@@ -1109,7 +1113,10 @@ pub fn give_back(s: LiveSession) {
 /// one failure a retry can only prolong.
 pub(crate) fn is_usage_limit(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
-    e.contains("rate limit") || e.contains("usage limit") || e.contains("429")
+    e.contains("rate limit")
+        || e.contains("usage limit")
+        || e.contains("usage-limit")
+        || e.contains("429")
 }
 
 /// Whether a `devin acp` stderr line is an upstream usage/rate-limit
@@ -1547,7 +1554,7 @@ impl LiveSession {
             && self.thought.trim().is_empty()
             && self.redirected.is_empty()
         {
-            return Err(EMPTY_END_TURN.to_string());
+            return Err(self.limit_detail(EMPTY_END_TURN.to_string()));
         }
         let mut r = self.finish(stop_reason);
         r.unseen = unseen;
@@ -1943,12 +1950,19 @@ impl LiveSession {
     /// newest refusal line the child logged, so it carries the same
     /// signature `is_usage_limit` and the relay's 429 mapping look for.
     fn limit_error(&self) -> String {
+        self.limit_detail("Devin usage limit reached".to_string())
+    }
+
+    /// `fallback` unless the child's stderr tail holds a refusal line —
+    /// then that line, verbatim: it can carry reset detail ("resets
+    /// 18:00") the bench TTL and the host's quota-window retry parse.
+    fn limit_detail(&self, fallback: String) -> String {
         if let Ok(tail) = self.stderr_tail.lock()
             && let Some(line) = tail.iter().rev().find(|l| limit_line(l))
         {
             return format!("Devin usage limit reached: {line}");
         }
-        "Devin usage limit reached".to_string()
+        fallback
     }
 
     /// Read until the response to request `id` arrives (or a hard error).

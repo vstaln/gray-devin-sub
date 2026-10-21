@@ -817,7 +817,8 @@ fn an_empty_end_turn_on_a_real_prompt_is_a_limit_failure() {
         .err()
         .unwrap();
     assert!(e.contains("empty end_turn"), "{e}");
-    assert!(e.contains("usage-limit"), "{e}");
+    assert!(e.contains("usage limit"), "{e}");
+    assert!(is_usage_limit(&e), "{e}");
     assert!(
         !s.prompt_in_flight,
         "the prompt settled — the session stays poolable"
