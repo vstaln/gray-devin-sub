@@ -311,6 +311,15 @@ pub struct LiveSession {
     stdin: ChildStdin,
     rx: Receiver<Value>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /// Set by the stderr reader when the child logs an upstream
+    /// usage-limit refusal mid-turn: `devin acp` retries a refused
+    /// request internally for hours (see KEEPALIVE_COOLDOWN), so a
+    /// flagged in-flight prompt can only burn the rest of the turn
+    /// budget — `recv_response` fails it fast instead.
+    limit_flag: Arc<AtomicBool>,
+    /// Consecutive wait polls that saw `limit_flag` while a prompt was
+    /// in flight — two sightings fail the turn; one line can't abort it.
+    limit_polls: u8,
     next_id: u64,
     pub(crate) session_id: String,
     pub(crate) native_model: String,
@@ -1103,6 +1112,17 @@ pub(crate) fn is_usage_limit(err: &str) -> bool {
     e.contains("rate limit") || e.contains("usage limit") || e.contains("429")
 }
 
+/// Whether a `devin acp` stderr line is an upstream usage/rate-limit
+/// refusal — the signature `map_rpc_error` and `is_usage_limit` share,
+/// watched live by the stderr reader so a parked turn fails fast.
+fn limit_line(line: &str) -> bool {
+    let e = line.to_ascii_lowercase();
+    e.contains("rate limit")
+        || e.contains("usage limit")
+        || e.contains("quota")
+        || e.contains("429")
+}
+
 /// When keepalives resume after a usage-limit failure (`None` = not paused).
 static KEEPALIVE_PAUSED_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
@@ -1279,11 +1299,16 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
 
     // stderr → last ~20 lines, redacted, for error detail only.
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let limit_flag: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     if let Some(err) = child.stderr.take() {
         let tail = stderr_tail.clone();
+        let limit = limit_flag.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(err).lines() {
                 let Ok(line) = line else { break };
+                if limit_line(&line) {
+                    limit.store(true, Ordering::SeqCst);
+                }
                 if let Ok(mut t) = tail.lock() {
                     if t.len() >= 20 {
                         t.pop_front();
@@ -1322,6 +1347,8 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         stdin,
         rx,
         stderr_tail,
+        limit_flag,
+        limit_polls: 0,
         next_id: 0,
         session_id: String::new(),
         native_model: turn.native_model.clone(),
@@ -1469,6 +1496,7 @@ impl LiveSession {
         self.pending_perms.clear();
         self.batch_quiet = None;
         self.batch_flushed = false;
+        self.limit_polls = 0;
         self.guard = TurnGuard::default();
         self.usage = Usage::default();
         self.names = names.to_vec();
@@ -1887,7 +1915,20 @@ impl LiveSession {
                         return Ok(line);
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    // The child logged an upstream usage-limit refusal
+                    // while this prompt is in flight: `devin acp` parks
+                    // the refused request on its own ~4-minute retry loop
+                    // for hours, so the wait cannot succeed soon — fail
+                    // it as a rate limit now (prompt_result's cancel +
+                    // settle grace still lets a late result win).
+                    if self.prompt_in_flight && self.limit_flag.load(Ordering::SeqCst) {
+                        self.limit_polls += 1;
+                        if self.limit_polls >= 2 {
+                            return Err(self.limit_error());
+                        }
+                    }
+                }
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err("native stdout closed".into());
                 }
@@ -1896,6 +1937,18 @@ impl LiveSession {
                 self.flush_batch();
             }
         }
+    }
+
+    /// The error a limit-flagged in-flight prompt fails with: the
+    /// newest refusal line the child logged, so it carries the same
+    /// signature `is_usage_limit` and the relay's 429 mapping look for.
+    fn limit_error(&self) -> String {
+        if let Ok(tail) = self.stderr_tail.lock()
+            && let Some(line) = tail.iter().rev().find(|l| limit_line(l))
+        {
+            return format!("Devin usage limit reached: {line}");
+        }
+        "Devin usage limit reached".to_string()
     }
 
     /// Read until the response to request `id` arrives (or a hard error).
