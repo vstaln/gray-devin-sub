@@ -451,10 +451,10 @@ pub fn native_model_in(
 /// 404s upstream ("issue with the selected model"). Only a prefix carrying
 /// a `:` (a provider key) is stripped, so a bare id is left alone.
 pub fn bare_model(model: &str) -> &str {
-    if let Some(rest) = model.strip_prefix("plugin:") {
-        if let Some((_, id)) = rest.rsplit_once('|') {
-            return id;
-        }
+    if let Some(rest) = model.strip_prefix("plugin:")
+        && let Some((_, id)) = rest.rsplit_once('|')
+    {
+        return id;
     }
     match model.split_once('/') {
         Some((prefix, id)) if prefix.contains(':') && !id.is_empty() => id,
