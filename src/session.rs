@@ -319,7 +319,10 @@ pub struct LiveSession {
     /// usage-limit refusal mid-turn: `devin acp` retries a refused
     /// request internally for hours (see KEEPALIVE_COOLDOWN), so a
     /// flagged in-flight prompt can only burn the rest of the turn
-    /// budget — `recv_response` fails it fast instead.
+    /// budget — `recv_response` fails it fast instead. `send_prompt`
+    /// clears it: a refusal logged under an earlier prompt must not
+    /// fail this one, and a still-limited account re-logs during the
+    /// prompt anyway.
     limit_flag: Arc<AtomicBool>,
     /// Consecutive wait polls that saw `limit_flag` while a prompt was
     /// in flight — two sightings fail the turn; one line can't abort it.
@@ -1504,6 +1507,7 @@ impl LiveSession {
         self.batch_quiet = None;
         self.batch_flushed = false;
         self.limit_polls = 0;
+        self.limit_flag.store(false, Ordering::SeqCst);
         self.guard = TurnGuard::default();
         self.usage = Usage::default();
         self.names = names.to_vec();
@@ -1914,6 +1918,7 @@ impl LiveSession {
             });
             match self.rx.recv_timeout(left.min(wait)) {
                 Ok(line) => {
+                    self.limit_polls = 0;
                     if line.get("method").is_some() && line.get("id").is_some() {
                         self.on_request(&line)?;
                     } else if line.get("method").is_some() {
