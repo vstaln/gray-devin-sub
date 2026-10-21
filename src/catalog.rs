@@ -6,7 +6,6 @@
 //! segment — absent means `None`, never a guess. The listing is cached per
 //! process; a CLI failure is an error, not a silent empty list.
 
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// The family a row was listed under — parsed from its section header
