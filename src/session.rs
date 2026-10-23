@@ -1040,7 +1040,9 @@ pub fn replay(turn: &PreparedTurn) -> Option<TurnResult> {
             && s.system == turn.system
             && s.account == turn.account_label()
             && s.absorbed == turn.input
-            && s.last_reply.is_some()
+            // A stored reply with no text and no tool call (a reasoning-only
+            // answer) is never worth replaying: the caller is retrying it.
+            && s.last_reply.as_ref().is_some_and(|r| !r.text.trim().is_empty() || !r.calls.is_empty())
     })?;
     let mut r = s.last_reply.clone()?;
     if r.unseen {

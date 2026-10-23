@@ -1173,3 +1173,41 @@ fn early_abort_error_still_maps_to_429() {
         "Devin usage limit reached: daily quota exhausted"
     ));
 }
+
+/// A reasoning-only reply (no text, no tool call) must not be replayed:
+/// the host's identical retry of that empty completion has to reach a
+/// real request, or it gets the same empty answer back forever.
+#[test]
+fn an_empty_stored_reply_is_not_replayed() {
+    let model = "model-empty-replay";
+    let input = vec![json!({"role": "user", "content": "go"})];
+    let t = turn(model, input.clone());
+    let mut s = stub_session();
+    s.session_id = "s-empty-replay".to_string();
+    s.native_model = model.to_string();
+    let mut empty = answered("");
+    empty.thought = "thinking only".to_string();
+    s.absorb(&t, &empty);
+    give_back(s);
+    assert!(replay(&t).is_none());
+
+    // The same request with a real stored answer still replays.
+    let mut pool = locked_pool();
+    let s = pool
+        .live
+        .iter_mut()
+        .find(|s| s.session_id == "s-empty-replay")
+        .expect("pooled");
+    s.last_reply = Some(answered("real"));
+    drop(pool);
+    assert_eq!(replay(&t).map(|r| r.text).as_deref(), Some("real"));
+    let mut pool = locked_pool();
+    let i = pool
+        .live
+        .iter()
+        .position(|s| s.session_id == "s-empty-replay")
+        .expect("pooled");
+    let s = pool.live.remove(i);
+    drop(pool);
+    s.close();
+}
