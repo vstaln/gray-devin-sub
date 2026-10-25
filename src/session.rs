@@ -1786,21 +1786,20 @@ impl LiveSession {
                     json!({"exitCode": exit_code, "signal": null}),
                 )?;
             }
+            ParkKind::ReadTextFile | ParkKind::WriteTextFile if exit_code != 0 => {
+                let message = if output.is_empty() {
+                    format!("gray bash exited with status {exit_code}")
+                } else {
+                    output
+                };
+                self.send(&json!({"jsonrpc": "2.0", "id": parked.request_id,
+                    "error": {"code": -32000, "message": message}}))?;
+            }
             ParkKind::ReadTextFile => {
                 self.answer_request(&parked.request_id, json!({"content": output}))?;
             }
             ParkKind::WriteTextFile => {
-                if exit_code == 0 {
-                    self.answer_request(&parked.request_id, Value::Null)?;
-                } else {
-                    let message = if output.is_empty() {
-                        format!("gray bash exited with status {exit_code}")
-                    } else {
-                        output
-                    };
-                    self.send(&json!({"jsonrpc": "2.0", "id": parked.request_id,
-                        "error": {"code": -32000, "message": message}}))?;
-                }
+                self.answer_request(&parked.request_id, Value::Null)?;
             }
         }
         self.await_prompt_or_parked(parked.prompt_id, deadline, cancel)
@@ -2155,7 +2154,10 @@ impl LiveSession {
                 .map(String::as_str)
                 .unwrap_or("");
             let options = params.get("options").and_then(Value::as_array);
-            if matches!(inference, "exec" | "read" | "edit" | "write" | "multi_edit") {
+            if matches!(
+                inference,
+                "exec" | "read" | "edit" | "write" | "multi_edit" | "apply_patch"
+            ) {
                 if let Some(option_id) = options
                     .into_iter()
                     .flatten()
