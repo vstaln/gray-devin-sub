@@ -1105,41 +1105,6 @@ pub(crate) fn continuation(
     Ok(delta)
 }
 
-/// Diverged-history fallback: the trailing run of non-assistant items —
-/// the only content a session that already holds this conversation's
-/// earlier turns still needs to see. Used when `continuation` missed but
-/// the candidate is provably this same conversation (`gray_session`
-/// match): its transcript was rewritten (compaction, a cut), so nothing
-/// past the last assistant item can already be upstream. `None` when the
-/// tail is empty or renders empty.
-pub(crate) fn tail_delta(input: &[Value]) -> Option<String> {
-    let start = input
-        .iter()
-        .rposition(assistant_side)
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    let delta = render_items(&input[start..]);
-    (!delta.trim().is_empty()).then_some(delta)
-}
-
-/// How many leading `input` items a claimed session has already seen:
-/// `absorbed.len()` on a strict continuation, else the start of the
-/// trailing non-assistant tail `tail_delta` prompts with. Keeps image
-/// extraction on exactly the items the delta covers — and never indexes
-/// past `input.len()` when a rewritten history is shorter than the
-/// session's absorbed one.
-pub(crate) fn continuation_skip(absorbed: &[Value], input: &[Value]) -> usize {
-    if input.len() > absorbed.len() && input.starts_with(absorbed) {
-        absorbed.len()
-    } else {
-        input
-            .iter()
-            .rposition(assistant_side)
-            .map(|i| i + 1)
-            .unwrap_or(0)
-    }
-}
-
 /// Usage snapshot from a `usage_update` notification's `update` object or
 /// a prompt result's `usage` value: plain key first, then Cognition's flat
 /// `_meta["cognition.ai/<key>"]`, then the nested `_meta["cognition.ai"]
@@ -1261,7 +1226,7 @@ fn run_turn_inner(
     let mut s = match claimed {
         Some((mut s, delta)) => {
             let delta = s.note_cut(delta);
-            let images = images_of(&turn.input[continuation_skip(&s.absorbed, &turn.input)..]);
+            let images = images_of(&turn.input[s.absorbed.len()..]);
             match s.send_prompt(&delta, &images, &turn.names) {
                 Ok(id) => match s.await_prompt(id, deadline, cancel) {
                     Ok(r) => {

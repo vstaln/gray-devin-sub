@@ -564,11 +564,8 @@ fn e2e_stub_child_pool_cycle() {
     }
 }
 
-/// Compaction and cuts start fresh because they cannot reuse the old upstream
-/// transcript. Same-start drift in the same conversation may reuse only its
-/// non-assistant tail; a different conversation still misses.
 #[test]
-fn same_start_drift_reuses_tail_but_compaction_and_cuts_start_fresh() {
+fn rewritten_history_never_reuses_the_upstream_session() {
     let model = "model-rewritten-tail";
     let start = json!({"role": "user", "content": "hi"});
     let mut first = turn(
@@ -619,7 +616,7 @@ fn same_start_drift_reuses_tail_but_compaction_and_cuts_start_fresh() {
     let mut drift = turn(
         model,
         vec![
-            start,
+            start.clone(),
             json!({"role": "assistant", "content": "edited answer"}),
             json!({"role": "user", "content": "rewritten question"}),
             json!({"role": "assistant", "content": "kept reply"}),
@@ -629,11 +626,11 @@ fn same_start_drift_reuses_tail_but_compaction_and_cuts_start_fresh() {
         ],
     );
     drift.gray_session = "conv-rewrite".to_string();
-    let (claimed, reason) = take(&drift, &never);
-    let (s, delta) = claimed.unwrap_or_else(|| panic!("same-start drift missed: {reason}"));
-    assert_eq!(s.session_id, "s-rewrite");
-    assert_eq!(delta, "[User]\ncontinue");
-    s.close();
+    let (claimed, _) = take(&drift, &never);
+    assert!(
+        claimed.is_none(),
+        "rewritten history reused the old upstream session"
+    );
 
     let mut other = turn(
         model,
@@ -642,6 +639,23 @@ fn same_start_drift_reuses_tail_but_compaction_and_cuts_start_fresh() {
     other.gray_session = "conv-other".to_string();
     let (claimed, _) = take(&other, &never);
     assert!(claimed.is_none());
+
+    let mut next = turn(
+        model,
+        vec![
+            start,
+            json!({"role": "assistant", "content": "original answer"}),
+            json!({"role": "user", "content": "previous"}),
+            json!({"role": "assistant", "content": "answer"}),
+            json!({"role": "user", "content": "continue"}),
+        ],
+    );
+    next.gray_session = "conv-rewrite".to_string();
+    let (claimed, reason) = take(&next, &never);
+    let (s, delta) = claimed.unwrap_or_else(|| panic!("strict continuation missed: {reason}"));
+    assert_eq!(s.session_id, "s-rewrite");
+    assert_eq!(delta, "[User]\ncontinue");
+    s.close();
 }
 
 #[test]
@@ -1003,6 +1017,7 @@ fn record(session_id: &str, model: &str, owner_pid: u32, last_prompt_unix: u64) 
         gray_session: String::new(),
         deny_search: Some(false),
         account: String::new(),
+        exact: true,
     }
 }
 

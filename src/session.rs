@@ -446,6 +446,8 @@ pub(crate) struct Persisted {
     /// account-less turns.
     #[serde(default)]
     pub account: String,
+    #[serde(default)]
+    pub exact: bool,
 }
 
 fn unix_now() -> u64 {
@@ -592,23 +594,11 @@ pub(crate) fn reload_candidates(
         .filter(|p| p.account == turn.account_label())
         .filter(|p| now_unix.saturating_sub(p.last_prompt_unix) <= max_age.as_secs())
         .filter(|p| p.native_model == turn.native_model && p.system == turn.system)
+        .filter(|p| p.exact)
         .filter_map(|p| {
-            if let Ok(delta) =
-                continuation(&p.absorbed, &p.reply_call_ids, &p.reply_text, &turn.input)
-            {
-                return Some((p, delta));
-            }
-            // Same-start drift may reuse this conversation's session; a
-            // changed start or shorter cut must start fresh, like `find`.
-            if !p.gray_session.is_empty()
-                && p.gray_session == turn.gray_session
-                && turn.input.len() >= p.absorbed.len()
-                && turn.input.first() == p.absorbed.first()
-                && let Some(delta) = crate::chat::tail_delta(&turn.input)
-            {
-                return Some((p, delta));
-            }
-            None
+            continuation(&p.absorbed, &p.reply_call_ids, &p.reply_text, &turn.input)
+                .ok()
+                .map(|delta| (p, delta))
         })
         .collect();
     out.sort_by_key(|e| std::cmp::Reverse(e.0.last_prompt_unix));
@@ -997,25 +987,6 @@ fn find(live: &[LiveSession], turn: &PreparedTurn) -> Result<(usize, String), &'
         if d > depth {
             depth = d;
             reason = miss;
-        }
-    }
-    // No strict continuation. Same-start drift is safe to reuse only while
-    // the request is not shorter than the absorbed transcript. A compacted
-    // start or a cut starts fresh, so upstream receives the rewritten history.
-    if !turn.gray_session.is_empty() {
-        for (i, s) in live.iter().enumerate() {
-            if s.native_model != turn.native_model
-                || s.system != turn.system
-                || s.gray_session != turn.gray_session
-                || s.account != turn.account_label()
-                || turn.input.len() < s.absorbed.len()
-                || turn.input.first() != s.absorbed.first()
-            {
-                continue;
-            }
-            if let Some(delta) = crate::chat::tail_delta(&turn.input) {
-                return Ok((i, delta));
-            }
         }
     }
     Err(reason)
@@ -1483,6 +1454,7 @@ impl LiveSession {
             gray_session: self.gray_session.clone(),
             deny_search: Some(self.deny_search),
             account: self.account.clone(),
+            exact: true,
         })
     }
 
