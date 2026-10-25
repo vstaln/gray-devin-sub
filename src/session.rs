@@ -598,10 +598,12 @@ pub(crate) fn reload_candidates(
             {
                 return Some((p, delta));
             }
-            // Same conversation, rewritten history: load its own session
-            // and prompt only the new tail (see `find`'s lenient pass).
+            // Same-start drift may reuse this conversation's session; a
+            // changed start or shorter cut must start fresh, like `find`.
             if !p.gray_session.is_empty()
                 && p.gray_session == turn.gray_session
+                && turn.input.len() >= p.absorbed.len()
+                && turn.input.first() == p.absorbed.first()
                 && let Some(delta) = crate::chat::tail_delta(&turn.input)
             {
                 return Some((p, delta));
@@ -997,16 +999,17 @@ fn find(live: &[LiveSession], turn: &PreparedTurn) -> Result<(usize, String), &'
             reason = miss;
         }
     }
-    // No strict continuation. If the miss is this same conversation's
-    // own session (its transcript was rewritten — compaction, a cut), it
-    // still holds the earlier turns upstream: prompt only the new
-    // non-assistant tail instead of re-billing a fresh transcript.
+    // No strict continuation. Same-start drift is safe to reuse only while
+    // the request is not shorter than the absorbed transcript. A compacted
+    // start or a cut starts fresh, so upstream receives the rewritten history.
     if !turn.gray_session.is_empty() {
         for (i, s) in live.iter().enumerate() {
             if s.native_model != turn.native_model
                 || s.system != turn.system
                 || s.gray_session != turn.gray_session
                 || s.account != turn.account_label()
+                || turn.input.len() < s.absorbed.len()
+                || turn.input.first() != s.absorbed.first()
             {
                 continue;
             }

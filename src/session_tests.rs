@@ -564,15 +564,21 @@ fn e2e_stub_child_pool_cycle() {
     }
 }
 
-/// A rewritten transcript (compaction, a cut) can't strictly continue —
-/// but the conversation's own session still holds those turns upstream,
-/// so it answers with only the new non-assistant tail instead of
-/// re-billing a fresh transcript. A different conversation's diverged
-/// history still misses: its tail would land on foreign context.
+/// Compaction and cuts start fresh because they cannot reuse the old upstream
+/// transcript. Same-start drift in the same conversation may reuse only its
+/// non-assistant tail; a different conversation still misses.
 #[test]
-fn a_rewritten_history_reuses_its_own_session_with_only_the_tail() {
+fn same_start_drift_reuses_tail_but_compaction_and_cuts_start_fresh() {
     let model = "model-rewritten-tail";
-    let mut first = turn(model, vec![json!({"role": "user", "content": "hi"})]);
+    let start = json!({"role": "user", "content": "hi"});
+    let mut first = turn(
+        model,
+        vec![
+            start.clone(),
+            json!({"role": "assistant", "content": "original answer"}),
+            json!({"role": "user", "content": "previous"}),
+        ],
+    );
     first.gray_session = "conv-rewrite".to_string();
     let mut s = stub_session();
     s.session_id = "s-rewrite".to_string();
@@ -580,7 +586,8 @@ fn a_rewritten_history_reuses_its_own_session_with_only_the_tail() {
     s.absorb(&first, &answered("answer"));
     give_back(s);
 
-    let mut next = turn(
+    let never = AtomicBool::new(false);
+    let mut compacted = turn(
         model,
         vec![
             json!({"role": "user", "content": "[summary of earlier turns]"}),
@@ -588,11 +595,42 @@ fn a_rewritten_history_reuses_its_own_session_with_only_the_tail() {
             json!({"role": "user", "content": "continue"}),
         ],
     );
-    next.gray_session = "conv-rewrite".to_string();
-    let never = AtomicBool::new(false);
-    let (claimed, reason) = take(&next, &never);
-    let (s, delta) =
-        claimed.unwrap_or_else(|| panic!("rewritten history missed the pool: {reason}"));
+    compacted.gray_session = "conv-rewrite".to_string();
+    let (claimed, _) = take(&compacted, &never);
+    assert!(
+        claimed.is_none(),
+        "compaction reused the old upstream session"
+    );
+
+    let mut cut = turn(
+        model,
+        vec![
+            start.clone(),
+            json!({"role": "assistant", "content": "original answer"}),
+        ],
+    );
+    cut.gray_session = "conv-rewrite".to_string();
+    let (claimed, _) = take(&cut, &never);
+    assert!(
+        claimed.is_none(),
+        "cut history reused the old upstream session"
+    );
+
+    let mut drift = turn(
+        model,
+        vec![
+            start,
+            json!({"role": "assistant", "content": "edited answer"}),
+            json!({"role": "user", "content": "rewritten question"}),
+            json!({"role": "assistant", "content": "kept reply"}),
+            json!({"role": "user", "content": "another revised turn"}),
+            json!({"role": "assistant", "content": "still in history"}),
+            json!({"role": "user", "content": "continue"}),
+        ],
+    );
+    drift.gray_session = "conv-rewrite".to_string();
+    let (claimed, reason) = take(&drift, &never);
+    let (s, delta) = claimed.unwrap_or_else(|| panic!("same-start drift missed: {reason}"));
     assert_eq!(s.session_id, "s-rewrite");
     assert_eq!(delta, "[User]\ncontinue");
     s.close();
