@@ -59,7 +59,7 @@
 //! that answered a prompt (kills the child, keeps the upstream session)
 //! instead of deleting them; only never-prompted ones are still deleted.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -157,6 +157,55 @@ const DENY_SEARCH_RULE: &str = "web_search";
 const ASK_RULES: &[&str] = &["read", "edit", "grep", "glob", "exec"];
 
 const BATCH_QUIET: Duration = Duration::from_millis(250);
+const PARKED_TTL: Duration = Duration::from_secs(10 * 60);
+
+enum ParkKind {
+    TerminalWait(String),
+    ReadTextFile,
+    WriteTextFile,
+}
+
+struct Parked {
+    call_id: String,
+    request_id: Value,
+    prompt_id: u64,
+    command: String,
+    kind: ParkKind,
+    at: Instant,
+}
+
+struct TerminalState {
+    sidekick_id: String,
+    command: String,
+    output: Option<String>,
+    exit_code: Option<i64>,
+}
+
+enum RequestDisposition {
+    Continue,
+    Parked,
+}
+
+enum WireEvent {
+    Response(Value),
+    Parked,
+}
+
+enum PromptWait {
+    Settled(Value, bool),
+    Parked,
+}
+
+pub(crate) enum AwaitPrompt {
+    Complete(TurnResult),
+    Parked(TurnResult),
+}
+
+enum FindResult {
+    Prompt(usize, String),
+    Parked(usize, String),
+    CancelParked(usize),
+}
 
 /// Process-wide staging: one scratch cwd + generated user config shared by
 /// every pooled child, created lazily on first spawn. The dirs are STABLE
@@ -328,12 +377,14 @@ pub struct LiveSession {
     /// in flight — two sightings fail the turn; one line can't abort it.
     limit_polls: u8,
     next_id: u64,
+    current_prompt_id: Option<u64>,
     pub(crate) session_id: String,
     pub(crate) native_model: String,
     /// Funnel system text (instructions + contract incl. tool specs) the
     /// first prompt carried; a reused session only matches a request whose
     /// prepared system is identical.
     system: String,
+    stage_work: PathBuf,
     /// The exact `input` array of the last request this session answered.
     pub(crate) absorbed: Vec<Value>,
     /// Call ids emitted in that answer, in order.
@@ -386,6 +437,11 @@ pub struct LiveSession {
     /// Last `usage_update` snapshot for the in-flight prompt.
     usage: Usage,
     names: Vec<String>,
+    sidekick_calls: HashMap<String, String>,
+    active_sidekick: Option<String>,
+    unhandled_sidekick: HashSet<String>,
+    terminals: HashMap<String, TerminalState>,
+    parked: Option<Parked>,
     /// This prompt is the fixed keepalive: a near-empty `end_turn` is a
     /// fine answer to it, never a silent drop.
     keepalive_prompt: bool,
@@ -939,10 +995,16 @@ fn reap(pool: &mut Vec<LiveSession>) -> Vec<LiveSession> {
     let mut dead = Vec::new();
     let mut i = 0;
     while i < pool.len() {
-        let idle = pool[i].last_used.elapsed() > IDLE_TTL;
+        let parked_expired = pool[i]
+            .parked
+            .as_ref()
+            .is_some_and(|parked| parked.at.elapsed() > PARKED_TTL);
+        let idle = pool[i].parked.is_none() && pool[i].last_used.elapsed() > IDLE_TTL;
         let exited = !matches!(pool[i].child.try_wait(), Ok(None));
-        if idle || exited {
-            let why = if exited {
+        if idle || exited || parked_expired {
+            let why = if parked_expired {
+                "reap:parked_timeout"
+            } else if exited {
                 "reap:child_exited"
             } else {
                 "reap:idle"
@@ -960,7 +1022,7 @@ fn reap(pool: &mut Vec<LiveSession>) -> Vec<LiveSession> {
 /// native model, same system text, `continuation` yields a delta): its
 /// index plus the delta, or on a miss the deepest reason any candidate
 /// reached (`no_session` when the pool was empty).
-fn find(live: &[LiveSession], turn: &PreparedTurn) -> Result<(usize, String), &'static str> {
+fn find(live: &[LiveSession], turn: &PreparedTurn) -> Result<FindResult, &'static str> {
     let mut reason = "no_session";
     let mut depth = 0;
     for (i, s) in live.iter().enumerate() {
@@ -971,9 +1033,24 @@ fn find(live: &[LiveSession], turn: &PreparedTurn) -> Result<(usize, String), &'
             ("model", 1)
         } else if s.system != turn.system {
             ("system", 2)
+        } else if let Some(parked) = &s.parked {
+            if !turn.input.starts_with(&s.absorbed) {
+                ("prefix", 3)
+            } else {
+                return match crate::chat::continuation_output(
+                    &s.absorbed,
+                    &s.reply_call_ids,
+                    &s.reply_text,
+                    &turn.input,
+                    &parked.call_id,
+                ) {
+                    Ok((delta, _)) => Ok(FindResult::Parked(i, delta)),
+                    Err(_) => Ok(FindResult::CancelParked(i)),
+                };
+            }
         } else {
             match continuation(&s.absorbed, &s.reply_call_ids, &s.reply_text, &turn.input) {
-                Ok(delta) => return Ok((i, delta)),
+                Ok(delta) => return Ok(FindResult::Prompt(i, delta)),
                 Err(m) => (
                     m,
                     match m {
@@ -1039,15 +1116,20 @@ pub fn take(
 ) -> (Option<(LiveSession, String)>, &'static str) {
     let deadline = Instant::now() + KEEPALIVE_WINDOW;
     let mut dead = Vec::new();
+    let mut cancelled_parked = Vec::new();
     let result = {
         let mut pool = locked_pool();
         loop {
             dead.extend(reap(&mut pool.live));
             let reason = match find(&pool.live, turn) {
-                Ok((i, delta)) => {
+                Ok(FindResult::Prompt(i, delta) | FindResult::Parked(i, delta)) => {
                     let s = pool.live.remove(i);
                     pool.borrowed.push(Borrowed::of(&s));
                     break (Some((s, delta)), "reuse");
+                }
+                Ok(FindResult::CancelParked(i)) => {
+                    cancelled_parked.push(pool.live.remove(i));
+                    break (None, "parked_mismatch");
                 }
                 Err(reason) => reason,
             };
@@ -1068,12 +1150,23 @@ pub fn take(
     for s in dead {
         s.abandon();
     }
+    let had_cancelled_parked = !cancelled_parked.is_empty();
+    for s in cancelled_parked {
+        s.close();
+    }
+    if had_cancelled_parked {
+        POOL_CHANGED.notify_all();
+    }
     result
 }
 
 /// Return a session to the pool after a successful turn or keepalive.
 pub fn give_back(s: LiveSession) {
-    persist(&s);
+    if s.parked.is_some() {
+        unpersist(&s.session_id);
+    } else {
+        persist(&s);
+    }
     let mut dead = {
         let mut pool = locked_pool();
         let dead = reap(&mut pool.live);
@@ -1155,11 +1248,13 @@ fn take_keepalive() -> Option<LiveSession> {
     let pool = POOL.get()?;
     let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
     let i = pool.live.iter_mut().position(|s| {
-        keepalive_due(
-            s.last_prompt_at,
-            s.last_used,
-            matches!(s.child.try_wait(), Ok(None)),
-        ) && !crate::accounts::is_cooled(&s.account)
+        s.parked.is_none()
+            && keepalive_due(
+                s.last_prompt_at,
+                s.last_used,
+                matches!(s.child.try_wait(), Ok(None)),
+            )
+            && !crate::accounts::is_cooled(&s.account)
     })?;
     let s = pool.live.remove(i);
     pool.warming.push(Warming {
@@ -1336,9 +1431,11 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         limit_flag,
         limit_polls: 0,
         next_id: 0,
+        current_prompt_id: None,
         session_id: String::new(),
         native_model: turn.native_model.clone(),
         system: turn.system.clone(),
+        stage_work: stage.work.clone(),
         absorbed: Vec::new(),
         reply_call_ids: Vec::new(),
         reply_text: String::new(),
@@ -1354,6 +1451,11 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         dropped_siblings: 0,
         prior_dropped: 0,
         seen_calls: HashSet::new(),
+        sidekick_calls: HashMap::new(),
+        active_sidekick: None,
+        unhandled_sidekick: HashSet::new(),
+        terminals: HashMap::new(),
+        parked: None,
         seen_update_kinds: HashSet::new(),
         pending_perms: Vec::new(),
         batch_quiet: None,
@@ -1373,6 +1475,12 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
 }
 
 impl LiveSession {
+    fn client_capabilities(&self) -> Value {
+        let fusion = self.native_model.starts_with("fusion-");
+        json!({"fs": {"readTextFile": fusion, "writeTextFile": fusion},
+            "terminal": fusion})
+    }
+
     /// initialize → session/new; leaves the session ready for prompts.
     fn handshake(
         &mut self,
@@ -1380,11 +1488,11 @@ impl LiveSession {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
+        let client_capabilities = self.client_capabilities();
         self.call(
             "initialize",
             json!({"protocolVersion": 1,
-                "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false},
-                    "terminal": false}}),
+                "clientCapabilities": client_capabilities}),
             Duration::from_secs(60),
             deadline,
             cancel,
@@ -1414,11 +1522,11 @@ impl LiveSession {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
+        let client_capabilities = self.client_capabilities();
         self.call(
             "initialize",
             json!({"protocolVersion": 1,
-                "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false},
-                    "terminal": false}}),
+                "clientCapabilities": client_capabilities}),
             Duration::from_secs(60),
             deadline,
             cancel,
@@ -1480,6 +1588,9 @@ impl LiveSession {
         self.redirected.clear();
         self.dropped_siblings = 0;
         self.seen_calls.clear();
+        self.sidekick_calls.clear();
+        self.active_sidekick = None;
+        self.terminals.clear();
         self.pending_perms.clear();
         self.batch_quiet = None;
         self.batch_flushed = false;
@@ -1495,6 +1606,7 @@ impl LiveSession {
             "session/prompt",
             json!({"sessionId": self.session_id, "prompt": prompt}),
         )?;
+        self.current_prompt_id = Some(id);
         self.prompt_in_flight = true;
         Ok(id)
     }
@@ -1506,7 +1618,24 @@ impl LiveSession {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<TurnResult, String> {
-        let (result, unseen) = self.prompt_result(id, deadline, cancel)?;
+        match self.await_prompt_or_parked(id, deadline, cancel)? {
+            AwaitPrompt::Complete(result) => Ok(result),
+            AwaitPrompt::Parked(_) => {
+                Err("sidekick request requires a host tool continuation".to_string())
+            }
+        }
+    }
+
+    pub(crate) fn await_prompt_or_parked(
+        &mut self,
+        id: u64,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<AwaitPrompt, String> {
+        let (result, unseen) = match self.prompt_result(id, deadline, cancel)? {
+            PromptWait::Settled(result, unseen) => (result, unseen),
+            PromptWait::Parked => return Ok(AwaitPrompt::Parked(self.park_result()?)),
+        };
         // A settled prompt proves a re-pooled session: failures past
         // here are turn failures, not stale records.
         self.rewarmed = false;
@@ -1539,7 +1668,92 @@ impl LiveSession {
         }
         let mut r = self.finish(stop_reason);
         r.unseen = unseen;
-        Ok(r)
+        Ok(AwaitPrompt::Complete(r))
+    }
+
+    pub(crate) fn is_parked(&self) -> bool {
+        self.parked.is_some()
+    }
+
+    fn park_result(&mut self) -> Result<TurnResult, String> {
+        let parked = self
+            .parked
+            .as_ref()
+            .ok_or_else(|| "sidekick request was not parked".to_string())?;
+        let result = TurnResult {
+            text: strip_reasoning(&self.text).trim().to_string(),
+            thought: String::new(),
+            calls: vec![(
+                parked.call_id.clone(),
+                "bash".to_string(),
+                json!({"command": parked.command}).to_string(),
+            )],
+            usage: Usage::default(),
+            stop: "tool_use".to_string(),
+            unseen: false,
+        };
+        unpersist(&self.session_id);
+        self.text.clear();
+        self.thought.clear();
+        self.text_boundary = false;
+        self.guard = TurnGuard::default();
+        Ok(result)
+    }
+
+    pub(crate) fn resume_parked(
+        &mut self,
+        turn: &PreparedTurn,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<AwaitPrompt, String> {
+        let call_id = self
+            .parked
+            .as_ref()
+            .ok_or_else(|| "session has no parked sidekick request".to_string())?
+            .call_id
+            .clone();
+        let (_, output) = crate::chat::continuation_output(
+            &self.absorbed,
+            &self.reply_call_ids,
+            &self.reply_text,
+            &turn.input,
+            &call_id,
+        )
+        .map_err(|_| "parked sidekick result did not match its host call".to_string())?;
+        let (exit_code, output) = bash_result(&output);
+        let parked = self
+            .parked
+            .take()
+            .ok_or_else(|| "session has no parked sidekick request".to_string())?;
+        match parked.kind {
+            ParkKind::TerminalWait(terminal_id) => {
+                if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+                    terminal.output = Some(output);
+                    terminal.exit_code = Some(exit_code);
+                }
+                self.answer_request(
+                    &parked.request_id,
+                    json!({"exitCode": exit_code, "signal": null}),
+                )?;
+            }
+            ParkKind::ReadTextFile => {
+                self.answer_request(&parked.request_id, json!({"content": output}))?;
+            }
+            ParkKind::WriteTextFile => {
+                if exit_code == 0 {
+                    self.answer_request(&parked.request_id, Value::Null)?;
+                } else {
+                    let message = if output.is_empty() {
+                        format!("gray bash exited with status {exit_code}")
+                    } else {
+                        output
+                    };
+                    self.send(&json!({"jsonrpc": "2.0", "id": parked.request_id,
+                        "error": {"code": -32000, "message": message}}))?;
+                }
+            }
+        }
+        self.await_prompt_or_parked(parked.prompt_id, deadline, cancel)
     }
 
     /// Record what this session just answered so the next request can be
@@ -1665,6 +1879,12 @@ impl LiveSession {
         if delete {
             unpersist(&self.session_id);
         }
+        if self.parked.is_some()
+            || (self.prompt_in_flight && self.native_model.starts_with("fusion-"))
+        {
+            let _ = self.send(&json!({"jsonrpc": "2.0", "method": "session/cancel",
+                "params": {"sessionId": self.session_id}}));
+        }
         if delete
             && !self.session_id.is_empty()
             && self
@@ -1711,21 +1931,272 @@ impl LiveSession {
             "error": {"code": -32601, "message": "method not found"}}))
     }
 
-    /// One server→client request: permissions always cancel, anything else
-    /// is a JSON-RPC method-not-found (never a hang).
-    fn on_request(&mut self, line: &Value) -> Result<(), String> {
+    fn on_request(&mut self, line: &Value) -> Result<RequestDisposition, String> {
         let id = line.get("id").cloned().unwrap_or(Value::Null);
+        let params = line.get("params").unwrap_or(&Value::Null);
         match line.get("method").and_then(Value::as_str) {
-            Some("session/request_permission") if self.prompt_in_flight && !self.batch_flushed => {
-                self.pending_perms.push(id);
-                self.batch_quiet = Some(Instant::now() + BATCH_QUIET);
-                Ok(())
+            Some("session/request_permission") => self.request_permission(&id, params),
+            Some("fs/read_text_file")
+                if self.native_model.starts_with("fusion-") && self.prompt_in_flight =>
+            {
+                let Some(sidekick_id) = self.active_sidekick.clone() else {
+                    self.refuse_request(&id)?;
+                    return Ok(RequestDisposition::Continue);
+                };
+                let Some(path) = params.get("path").and_then(Value::as_str) else {
+                    self.refuse_request(&id)?;
+                    return Ok(RequestDisposition::Continue);
+                };
+                let command = crate::chat::sidekick_read_command(
+                    path,
+                    params.get("line").and_then(Value::as_u64),
+                    params.get("limit").and_then(Value::as_u64),
+                    &self.stage_work,
+                    &self.system,
+                );
+                self.park_request(id, sidekick_id, command, ParkKind::ReadTextFile)
             }
-            Some("session/request_permission") => {
-                self.answer_request(&id, json!({"outcome": {"outcome": "cancelled"}}))
+            Some("fs/write_text_file")
+                if self.native_model.starts_with("fusion-") && self.prompt_in_flight =>
+            {
+                let Some(sidekick_id) = self.active_sidekick.clone() else {
+                    self.refuse_request(&id)?;
+                    return Ok(RequestDisposition::Continue);
+                };
+                let Some(path) = params.get("path").and_then(Value::as_str) else {
+                    self.refuse_request(&id)?;
+                    return Ok(RequestDisposition::Continue);
+                };
+                let content = params.get("content").and_then(Value::as_str).unwrap_or("");
+                let command = crate::chat::sidekick_write_command(
+                    path,
+                    content,
+                    &self.stage_work,
+                    &self.system,
+                );
+                self.park_request(id, sidekick_id, command, ParkKind::WriteTextFile)
             }
-            _ => self.refuse_request(&id),
+            Some("terminal/create")
+                if self.native_model.starts_with("fusion-") && self.prompt_in_flight =>
+            {
+                let Some(sidekick_id) = self.active_sidekick.clone() else {
+                    self.refuse_request(&id)?;
+                    return Ok(RequestDisposition::Continue);
+                };
+                let Some(command) = params.get("command").and_then(Value::as_str) else {
+                    self.refuse_request(&id)?;
+                    return Ok(RequestDisposition::Continue);
+                };
+                let args = params
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .map(|args| {
+                        args.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let command = crate::chat::sidekick_terminal_command(
+                    command,
+                    &args,
+                    params.get("cwd").and_then(Value::as_str),
+                    &self.stage_work,
+                    &self.system,
+                );
+                let terminal_id = rand_hex(8);
+                self.terminals.insert(
+                    terminal_id.clone(),
+                    TerminalState {
+                        sidekick_id,
+                        command,
+                        output: None,
+                        exit_code: None,
+                    },
+                );
+                self.answer_request(&id, json!({"terminalId": terminal_id}))?;
+                Ok(RequestDisposition::Continue)
+            }
+            Some("terminal/wait_for_exit")
+                if self.native_model.starts_with("fusion-") && self.prompt_in_flight =>
+            {
+                let Some(terminal_id) = params
+                    .get("terminalId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                else {
+                    self.refuse_request(&id)?;
+                    return Ok(RequestDisposition::Continue);
+                };
+                let Some((sidekick_id, command, exit_code)) =
+                    self.terminals.get(&terminal_id).map(|terminal| {
+                        (
+                            terminal.sidekick_id.clone(),
+                            terminal.command.clone(),
+                            terminal.exit_code,
+                        )
+                    })
+                else {
+                    self.refuse_request(&id)?;
+                    return Ok(RequestDisposition::Continue);
+                };
+                if let Some(exit_code) = exit_code {
+                    self.answer_request(&id, json!({"exitCode": exit_code, "signal": null}))?;
+                    Ok(RequestDisposition::Continue)
+                } else {
+                    self.park_request(
+                        id,
+                        sidekick_id,
+                        command,
+                        ParkKind::TerminalWait(terminal_id),
+                    )
+                }
+            }
+            Some("terminal/output")
+                if self.native_model.starts_with("fusion-") && self.prompt_in_flight =>
+            {
+                let terminal = params
+                    .get("terminalId")
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.terminals.get(id));
+                let result = match terminal
+                    .and_then(|terminal| Some((terminal.output.as_ref()?, terminal.exit_code?)))
+                {
+                    Some((output, exit_code)) => json!({"output": output, "truncated": false,
+                        "exitStatus": {"exitCode": exit_code, "signal": null}}),
+                    None => json!({"output": "", "truncated": false}),
+                };
+                self.answer_request(&id, result)?;
+                Ok(RequestDisposition::Continue)
+            }
+            Some("terminal/release" | "terminal/kill")
+                if self.native_model.starts_with("fusion-") && self.prompt_in_flight =>
+            {
+                if let Some(terminal_id) = params.get("terminalId").and_then(Value::as_str) {
+                    self.terminals.remove(terminal_id);
+                }
+                self.answer_request(&id, Value::Null)?;
+                Ok(RequestDisposition::Continue)
+            }
+            _ => {
+                self.refuse_request(&id)?;
+                Ok(RequestDisposition::Continue)
+            }
         }
+    }
+
+    fn request_permission(
+        &mut self,
+        id: &Value,
+        params: &Value,
+    ) -> Result<RequestDisposition, String> {
+        let tool_call_id = params
+            .pointer("/toolCall/toolCallId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let sidekick = self.prompt_in_flight
+            && !self.loading
+            && self.native_model.starts_with("fusion-")
+            && (tool_call_id.starts_with("sk::") || self.sidekick_calls.contains_key(tool_call_id));
+        if sidekick {
+            let inference = self
+                .sidekick_calls
+                .get(tool_call_id)
+                .map(String::as_str)
+                .unwrap_or("");
+            let options = params.get("options").and_then(Value::as_array);
+            if matches!(inference, "exec" | "read" | "edit" | "write" | "multi_edit") {
+                if let Some(option_id) = options
+                    .into_iter()
+                    .flatten()
+                    .find(|option| {
+                        option.get("optionId").and_then(Value::as_str) == Some("allow_once")
+                    })
+                    .and_then(|option| option.get("optionId"))
+                {
+                    self.answer_request(
+                        id,
+                        json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
+                    )?;
+                } else {
+                    self.answer_request(id, json!({"outcome": {"outcome": "cancelled"}}))?;
+                }
+            } else {
+                let name = if inference.is_empty() {
+                    "<unknown>"
+                } else {
+                    inference
+                };
+                if self.unhandled_sidekick.insert(name.to_string()) {
+                    eprintln!("devin-sub: rejected unsupported Fusion sidekick tool {name}");
+                }
+                if let Some(option_id) = options
+                    .into_iter()
+                    .flatten()
+                    .find(|option| {
+                        option.get("optionId").and_then(Value::as_str) == Some("reject_once")
+                    })
+                    .and_then(|option| option.get("optionId"))
+                {
+                    self.answer_request(
+                        id,
+                        json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
+                    )?;
+                } else {
+                    self.answer_request(id, json!({"outcome": {"outcome": "cancelled"}}))?;
+                }
+            }
+            return Ok(RequestDisposition::Continue);
+        }
+        if self.prompt_in_flight && !self.batch_flushed {
+            self.pending_perms.push(id.clone());
+            self.batch_quiet = Some(Instant::now() + BATCH_QUIET);
+            Ok(RequestDisposition::Continue)
+        } else {
+            self.answer_request(id, json!({"outcome": {"outcome": "cancelled"}}))?;
+            Ok(RequestDisposition::Continue)
+        }
+    }
+
+    fn park_request(
+        &mut self,
+        request_id: Value,
+        sidekick_id: String,
+        command: String,
+        kind: ParkKind,
+    ) -> Result<RequestDisposition, String> {
+        let Some(prompt_id) = self
+            .current_prompt_id
+            .filter(|_| self.prompt_in_flight && self.parked.is_none())
+        else {
+            self.refuse_request(&request_id)?;
+            return Ok(RequestDisposition::Continue);
+        };
+        self.parked = Some(Parked {
+            call_id: format!("call_{sidekick_id}"),
+            request_id,
+            prompt_id,
+            command,
+            kind,
+            at: Instant::now(),
+        });
+        Ok(RequestDisposition::Parked)
+    }
+
+    fn is_sidekick_update(&self, update: &Value) -> bool {
+        if !self.native_model.starts_with("fusion-") {
+            return false;
+        }
+        let tool_call_id = update
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        update
+            .pointer("/_meta/cognition.ai~1sidekick")
+            .and_then(Value::as_bool)
+            == Some(true)
+            || tool_call_id.starts_with("sk::")
+            || self.sidekick_calls.contains_key(tool_call_id)
     }
 
     fn on_notification(&mut self, line: &Value) {
@@ -1735,6 +2206,17 @@ impl LiveSession {
         let update = &line["params"]["update"];
         let kind = update.get("sessionUpdate").and_then(Value::as_str);
         if self.guard.cut().is_some() && kind != Some("usage_update") {
+            return;
+        }
+        if kind != Some("tool_call") && self.is_sidekick_update(update) {
+            if kind == Some("tool_call_update")
+                && update.get("status").and_then(Value::as_str) == Some("completed")
+                && self.active_sidekick.as_deref()
+                    == update.get("toolCallId").and_then(Value::as_str)
+            {
+                self.active_sidekick = None;
+            }
+            self.text_boundary = true;
             return;
         }
         match kind {
@@ -1774,7 +2256,23 @@ impl LiveSession {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                if !self.batch_flushed && self.seen_calls.insert(id) {
+                let sidekick = self.native_model.starts_with("fusion-")
+                    && (update
+                        .pointer("/_meta/cognition.ai~1sidekick")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                        || id.starts_with("sk::"));
+                if sidekick {
+                    if !id.is_empty() {
+                        let inference = update
+                            .pointer("/_meta/cognition.ai~1inferenceToolName")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        self.sidekick_calls.insert(id.clone(), inference);
+                        self.active_sidekick = Some(id);
+                    }
+                } else if !self.batch_flushed && self.seen_calls.insert(id) {
                     let call = match redirect_call(update, &self.names) {
                         Some(call) => call,
                         None => blocked_call(update, &self.names),
@@ -1880,7 +2378,7 @@ impl LiveSession {
         window: Duration,
         deadline: Instant,
         cancel: &AtomicBool,
-    ) -> Result<Value, String> {
+    ) -> Result<WireEvent, String> {
         let until = (Instant::now() + window).min(deadline);
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -1897,11 +2395,13 @@ impl LiveSession {
                 Ok(line) => {
                     self.limit_polls = 0;
                     if line.get("method").is_some() && line.get("id").is_some() {
-                        self.on_request(&line)?;
+                        if matches!(self.on_request(&line)?, RequestDisposition::Parked) {
+                            return Ok(WireEvent::Parked);
+                        }
                     } else if line.get("method").is_some() {
                         self.on_notification(&line);
                     } else if line.get("id").is_some() {
-                        return Ok(line);
+                        return Ok(WireEvent::Response(line));
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -1958,7 +2458,12 @@ impl LiveSession {
     ) -> Result<Value, String> {
         let id = self.send_request(method, params)?;
         loop {
-            let line = self.recv_response(window, deadline, cancel)?;
+            let line = match self.recv_response(window, deadline, cancel)? {
+                WireEvent::Response(line) => line,
+                WireEvent::Parked => {
+                    return Err("sidekick request arrived outside a prompt".to_string());
+                }
+            };
             if line.get("id") == Some(&json!(id)) {
                 if let Some(err) = line.get("error") {
                     return Err(map_rpc_error(err, &self.stderr_tail));
@@ -1985,10 +2490,11 @@ impl LiveSession {
         id: u64,
         deadline: Instant,
         cancel: &AtomicBool,
-    ) -> Result<(Value, bool), String> {
+    ) -> Result<PromptWait, String> {
         loop {
             let line = match self.recv_response(Duration::from_secs(600), deadline, cancel) {
-                Ok(line) => line,
+                Ok(WireEvent::Response(line)) => line,
+                Ok(WireEvent::Parked) => return Ok(PromptWait::Parked),
                 Err(e) => {
                     let _ = self.send(&json!({"jsonrpc": "2.0",
                         "method": "session/cancel",
@@ -1997,18 +2503,20 @@ impl LiveSession {
                     let never = AtomicBool::new(false);
                     while Instant::now() < grace {
                         match self.recv_response(Duration::from_secs(10), grace, &never) {
-                            Ok(line) if line.get("id") == Some(&json!(id)) => {
+                            Ok(WireEvent::Response(line)) if line.get("id") == Some(&json!(id)) => {
                                 self.prompt_in_flight = false;
+                                self.current_prompt_id = None;
                                 self.last_prompt_at = Some(Instant::now());
                                 if let Some(err) = line.get("error") {
                                     return Err(map_rpc_error(err, &self.stderr_tail));
                                 }
-                                return Ok((
+                                return Ok(PromptWait::Settled(
                                     line.get("result").cloned().unwrap_or(Value::Null),
                                     e == CLIENT_GONE,
                                 ));
                             }
-                            Ok(_) => {}
+                            Ok(WireEvent::Parked) => break,
+                            Ok(WireEvent::Response(_)) => {}
                             Err(_) => break,
                         }
                     }
@@ -2017,11 +2525,15 @@ impl LiveSession {
             };
             if line.get("id") == Some(&json!(id)) {
                 self.prompt_in_flight = false;
+                self.current_prompt_id = None;
                 self.last_prompt_at = Some(Instant::now());
                 if let Some(err) = line.get("error") {
                     return Err(map_rpc_error(err, &self.stderr_tail));
                 }
-                return Ok((line.get("result").cloned().unwrap_or(Value::Null), false));
+                return Ok(PromptWait::Settled(
+                    line.get("result").cloned().unwrap_or(Value::Null),
+                    false,
+                ));
             }
         }
     }
@@ -2110,6 +2622,21 @@ fn unstage(args: String) -> String {
         .iter()
         .filter_map(OnceLock::get)
         .fold(args, |a, s| a.replace(&*s.work.to_string_lossy(), &cwd))
+}
+
+fn bash_result(text: &str) -> (i64, String) {
+    let Some(rest) = text.strip_prefix("exit ") else {
+        return (0, text.to_string());
+    };
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let Ok(code) = digits.parse::<i64>() else {
+        return (0, text.to_string());
+    };
+    let body = rest.split_once('\n').map_or("", |(_, body)| body);
+    let body = body.strip_prefix("<untrusted-output>\n").unwrap_or(body);
+    let body = body.trim_end_matches('\n');
+    let body = body.strip_suffix("</untrusted-output>").unwrap_or(body);
+    (code, body.trim_end_matches('\n').to_string())
 }
 
 /// Map a JSON-RPC/CLI failure onto the host-facing error classes.

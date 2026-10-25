@@ -27,10 +27,12 @@
 //!   per-turn bearer.
 
 use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use serde_json::{Value, json};
 
 use crate::session;
@@ -356,7 +358,6 @@ pub fn prepare_turn(
     if !instructions.is_empty() {
         system_parts.push(instructions.to_string());
     }
-    system_parts.push(funnel_contract(&tool_specs));
     // Responses `reasoning.effort` is the host's /thinking pick; the model
     // id family + tier name resolve to the real native id (the catalog
     // collapses `swe-2-high|medium|max` into one `swe-2` row, so the effort
@@ -365,12 +366,17 @@ pub fn prepare_turn(
         .get("reasoning")
         .and_then(|r| r.get("effort"))
         .and_then(Value::as_str);
+    let native_model = crate::catalog::native_model_in(model, effort, account_home);
+    system_parts.push(funnel_contract(
+        &tool_specs,
+        native_model.starts_with("fusion-"),
+    ));
     Ok(PreparedTurn {
         system: system_parts.join("\n\n"),
         content_line,
         input,
         names,
-        native_model: crate::catalog::native_model_in(model, effort, account_home),
+        native_model,
         gray_session: String::new(),
         account: None,
     })
@@ -378,12 +384,20 @@ pub fn prepare_turn(
 
 /// The text funnel contract the model answers with. Verified with Claude
 /// Sonnet: it emits the block exactly as specified.
-fn funnel_contract(tool_specs: &[String]) -> String {
-    let mut s = String::from(
-        "You are the model behind another agent harness (\"gray\"). Your own built-in tools are \
+fn funnel_contract(tool_specs: &[String], fusion: bool) -> String {
+    let mut s = String::from("You are the model behind another agent harness (\"gray\"). ");
+    s.push_str(if fusion {
+        "Your own built-in file/process/web tools are DISABLED in this session: such calls auto-redirect onto \
+        `bash` and the host's web tools, anything else returns an explanation instead of running. \
+        Never call them yourself. The one exception is your sidekick: your built-in handoff to your \
+        paired sidekick model is ENABLED, and it is the only thing \"sidekick\" means here."
+    } else {
+        "Your own built-in tools are \
         DISABLED in this session: file/process/web calls auto-redirect onto `bash` and the host's \
         web tools, anything else returns an explanation instead of running — a native call never \
-        does what you asked. Never call them.\n\
+        does what you asked. Never call them."
+    });
+    s.push_str("\n\
         Instead, the harness executes tools for you. To call harness tools, end your reply with \
         exactly one fenced block holding every call for this round, for example:\n\n```gray_calls\n\
         [{\"name\": \"bash\", \"arguments\": {\"command\": \"rg -n parse_config src\"}},\n \
@@ -405,14 +419,22 @@ fn funnel_contract(tool_specs: &[String]) -> String {
         arrive as `[Tool result id=…]` blocks and new user input as `[User]` blocks.\n\
         You write exactly ONE assistant turn. Never write `[User]`, `[Tool result …]` or any other \
         transcript record yourself; tool results only come from the harness. Never claim a command \
-        ran unless its `[Tool result]` is in the transcript.\n\
-        To delegate parallel or independent work, spawn a gray subagent through `bash`: \
+        ran unless its `[Tool result]` is in the transcript.\n");
+    s.push_str(if fusion {
+        "When the user asks for the sidekick, or a task splits off an independent piece, hand it to \
+        your sidekick with your built-in sidekick handoff and wait for its report. Never use \
+        `gray subagents`, the `subagent*` harness tools, or any other background agent for sidekick \
+        work: those are separate agents, not your sidekick. The sidekick's commands and file \
+        reads/writes run inline in the user's workspace through the harness, so its results are \
+        real. Make your own tool calls with the gray_calls block."
+    } else {
+        "To delegate parallel or independent work, spawn a gray subagent through `bash`: \
         `gray subagents run --name NAME 'task'` (add `--isolation worktree` when parallel \
         runs edit the same repo); follow up with `gray subagents status`, `gray subagents \
         view ID [--lines N]`, `gray subagents steer ID 'follow-up'`, `gray subagents stop ID`. \
         Your own native subagent tool is disabled — a child spawned inside this session can \
-        never run a tool, so delegate via `gray subagents` only.",
-    );
+        never run a tool, so delegate via `gray subagents` only."
+    });
     s.push_str("\n\nHarness tools:\n");
     if tool_specs.is_empty() {
         s.push_str("none for this request.");
@@ -1018,6 +1040,86 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+fn working_directory(system: &str) -> Option<String> {
+    system.lines().find_map(|line| {
+        line.strip_prefix("Working directory: ")
+            .and_then(|value| serde_json::from_str::<String>(value).ok())
+    })
+}
+
+fn mapped_stage_path(value: &str, stage_work: &Path, system: &str) -> String {
+    let Some(working_directory) = working_directory(system) else {
+        return value.to_string();
+    };
+    let stage_work = stage_work.to_string_lossy();
+    value.replace(stage_work.as_ref(), &working_directory)
+}
+
+pub(crate) fn sidekick_terminal_command(
+    command: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    stage_work: &Path,
+    system: &str,
+) -> String {
+    let command = mapped_stage_path(command, stage_work, system);
+    let invocation = if args.is_empty() {
+        command
+    } else {
+        let args = args
+            .iter()
+            .map(|arg| shell_quote(&mapped_stage_path(arg, stage_work, system)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{} {args}", shell_quote(&command))
+    };
+    let mapped_cwd = cwd
+        .filter(|cwd| !cwd.is_empty())
+        .map(|cwd| mapped_stage_path(cwd, stage_work, system));
+    let already_at_working_directory = working_directory(system)
+        .as_deref()
+        .is_some_and(|work| mapped_cwd.as_deref() == Some(work));
+    match mapped_cwd.filter(|_| !already_at_working_directory) {
+        Some(cwd) => format!("cd -- {} && {invocation}", shell_quote(&cwd)),
+        None => invocation,
+    }
+}
+
+pub(crate) fn sidekick_read_command(
+    path: &str,
+    line: Option<u64>,
+    limit: Option<u64>,
+    stage_work: &Path,
+    system: &str,
+) -> String {
+    let path = mapped_stage_path(path, stage_work, system);
+    match (line, limit) {
+        (None, None) => format!("cat -- {}", shell_quote(&path)),
+        (line, limit) => {
+            let start = line.unwrap_or(1).max(1);
+            let end = limit.map(|limit| start.saturating_add(limit.max(1) - 1));
+            let range = end.map_or_else(|| format!("{start},$p"), |end| format!("{start},{end}p"));
+            format!("sed -n {} -- {}", shell_quote(&range), shell_quote(&path))
+        }
+    }
+}
+
+pub(crate) fn sidekick_write_command(
+    path: &str,
+    content: &str,
+    stage_work: &Path,
+    system: &str,
+) -> String {
+    let path = mapped_stage_path(path, stage_work, system);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
+    format!(
+        "mkdir -p -- \"$(dirname -- {})\" && printf %s {} | base64 -d > {}",
+        shell_quote(&path),
+        shell_quote(&encoded),
+        shell_quote(&path)
+    )
+}
+
 /// An input item the assistant side produced: the replayed echo of a
 /// session's own answer (assistant message, its calls, reasoning carriers).
 fn assistant_side(item: &Value) -> bool {
@@ -1060,6 +1162,41 @@ pub(crate) fn continuation(
     reply_text: &str,
     input: &[Value],
 ) -> Result<String, &'static str> {
+    continuation_parts(absorbed, reply_call_ids, reply_text, input).map(|(delta, _)| delta)
+}
+
+pub(crate) fn continuation_output(
+    absorbed: &[Value],
+    reply_call_ids: &[String],
+    reply_text: &str,
+    input: &[Value],
+    expected_call_id: &str,
+) -> Result<(String, String), &'static str> {
+    let (delta, tail) = continuation_parts(absorbed, reply_call_ids, reply_text, input)?;
+    if tail.iter().any(|item| {
+        item_kind(item) != "function_call_output"
+            || item.get("call_id").and_then(Value::as_str) != Some(expected_call_id)
+    }) {
+        return Err("parked_tail");
+    }
+    let output = tail
+        .iter()
+        .map(|item| match item.get("output") {
+            Some(Value::String(text)) => text.clone(),
+            Some(value) => value.to_string(),
+            None => String::new(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok((delta, output))
+}
+
+fn continuation_parts<'a>(
+    absorbed: &[Value],
+    reply_call_ids: &[String],
+    reply_text: &str,
+    input: &'a [Value],
+) -> Result<(String, &'a [Value]), &'static str> {
     if input.len() <= absorbed.len() || !input.starts_with(absorbed) {
         return Err("prefix");
     }
@@ -1100,9 +1237,9 @@ pub(crate) fn continuation(
         return Err("empty_delta");
     }
     if undelivered {
-        return Ok(format!("{UNDELIVERED_NOTE}\n\n{delta}"));
+        return Ok((format!("{UNDELIVERED_NOTE}\n\n{delta}"), tail));
     }
-    Ok(delta)
+    Ok((delta, tail))
 }
 
 /// Usage snapshot from a `usage_update` notification's `update` object or
@@ -1210,7 +1347,7 @@ fn run_turn_inner(
     // Nothing live continues this turn: an orphaned session of a dead
     // sidecar (a gray restart) may, loaded instead of re-billed.
     let mut mode = "reuse";
-    if claimed.is_none() && reason != "keepalive_busy" {
+    if claimed.is_none() && !matches!(reason, "keepalive_busy" | "parked_mismatch") {
         claimed = session::reattach(turn, deadline, cancel);
         if claimed.is_some() {
             mode = "reload";
@@ -1225,14 +1362,74 @@ fn run_turn_inner(
     };
     let mut s = match claimed {
         Some((mut s, delta)) => {
+            if s.is_parked() {
+                let parked_mode = format!("{mode}:sidekick_resume");
+                match s.resume_parked(turn, deadline, cancel) {
+                    Ok(session::AwaitPrompt::Complete(r)) => {
+                        s.absorb(turn, &r);
+                        trace_turn(
+                            &parked_mode,
+                            &s.session_id,
+                            delta.chars().count(),
+                            Some(&r),
+                            None,
+                            None,
+                        );
+                        session::give_back(s);
+                        return Ok(r);
+                    }
+                    Ok(session::AwaitPrompt::Parked(r)) => {
+                        s.absorb(turn, &r);
+                        trace_turn(
+                            &format!("{mode}:sidekick_park"),
+                            &s.session_id,
+                            delta.chars().count(),
+                            Some(&r),
+                            None,
+                            None,
+                        );
+                        session::give_back(s);
+                        return Ok(r);
+                    }
+                    Err(e) => {
+                        trace_turn(
+                            &parked_mode,
+                            &s.session_id,
+                            delta.chars().count(),
+                            None,
+                            Some(&e),
+                            None,
+                        );
+                        if s.prompt_in_flight {
+                            s.close();
+                        } else {
+                            session::give_back(s);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
             let delta = s.note_cut(delta);
             let images = images_of(&turn.input[s.absorbed.len()..]);
             match s.send_prompt(&delta, &images, &turn.names) {
-                Ok(id) => match s.await_prompt(id, deadline, cancel) {
-                    Ok(r) => {
+                Ok(id) => match s.await_prompt_or_parked(id, deadline, cancel) {
+                    Ok(session::AwaitPrompt::Complete(r)) => {
                         s.absorb(turn, &r);
                         trace_turn(
                             mode,
+                            &s.session_id,
+                            delta.chars().count(),
+                            Some(&r),
+                            None,
+                            None,
+                        );
+                        session::give_back(s);
+                        return Ok(r);
+                    }
+                    Ok(session::AwaitPrompt::Parked(r)) => {
+                        s.absorb(turn, &r);
+                        trace_turn(
+                            &format!("{mode}:sidekick_park"),
                             &s.session_id,
                             delta.chars().count(),
                             Some(&r),
@@ -1304,10 +1501,23 @@ fn run_turn_inner(
             return Err(e);
         }
     };
-    match s.await_prompt(id, deadline, cancel) {
-        Ok(r) => {
+    match s.await_prompt_or_parked(id, deadline, cancel) {
+        Ok(session::AwaitPrompt::Complete(r)) => {
             s.absorb(turn, &r);
             trace_turn(&mode, &s.session_id, chars, Some(&r), None, None);
+            session::give_back(s);
+            Ok(r)
+        }
+        Ok(session::AwaitPrompt::Parked(r)) => {
+            s.absorb(turn, &r);
+            trace_turn(
+                "fresh:sidekick_park",
+                &s.session_id,
+                chars,
+                Some(&r),
+                None,
+                None,
+            );
             session::give_back(s);
             Ok(r)
         }
