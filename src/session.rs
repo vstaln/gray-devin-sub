@@ -157,6 +157,7 @@ const DENY_SEARCH_RULE: &str = "web_search";
 const ASK_RULES: &[&str] = &["read", "edit", "grep", "glob", "exec"];
 
 const BATCH_QUIET: Duration = Duration::from_millis(250);
+const NUDGE_GAP: u32 = 4;
 const PARKED_TTL: Duration = Duration::from_secs(10 * 60);
 
 enum ParkKind {
@@ -387,6 +388,7 @@ pub struct LiveSession {
     stage_work: PathBuf,
     /// The exact `input` array of the last request this session answered.
     pub(crate) absorbed: Vec<Value>,
+    lead_deltas_since_nudge: u32,
     /// Call ids emitted in that answer, in order.
     reply_call_ids: Vec<String>,
     /// The (trimmed) text emitted in that answer.
@@ -1044,8 +1046,17 @@ fn find(live: &[LiveSession], turn: &PreparedTurn) -> Result<FindResult, &'stati
                     &turn.input,
                     &parked.call_id,
                 ) {
-                    Ok((delta, _)) => Ok(FindResult::Parked(i, delta)),
-                    Err(_) => Ok(FindResult::CancelParked(i)),
+                    Ok((delta, _, _)) => Ok(FindResult::Parked(i, delta)),
+                    Err(miss) => {
+                        crate::chat::pool_event(
+                            &format!(
+                                "cancel_parked:{miss}\t{}",
+                                crate::chat::tail_shape(&s.absorbed, &turn.input)
+                            ),
+                            &s.session_id,
+                        );
+                        Ok(FindResult::CancelParked(i))
+                    }
                 };
             }
         } else {
@@ -1437,6 +1448,7 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         system: turn.system.clone(),
         stage_work: stage.work.clone(),
         absorbed: Vec::new(),
+        lead_deltas_since_nudge: NUDGE_GAP,
         reply_call_ids: Vec::new(),
         reply_text: String::new(),
         last_reply: None,
@@ -1700,6 +1712,39 @@ impl LiveSession {
         Ok(result)
     }
 
+    pub(crate) fn delegation_nudge(&mut self, turn: &PreparedTurn, delta: String) -> String {
+        if !self.native_model.starts_with("fusion-") {
+            return delta;
+        }
+        self.lead_deltas_since_nudge = self.lead_deltas_since_nudge.saturating_add(1);
+        let worked = turn
+            .input
+            .get(self.absorbed.len()..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|item| crate::chat::assistant_side(item))
+            .filter(|item| crate::chat::item_kind(item) == "function_call")
+            .filter(|item| {
+                !item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.starts_with("call_sk::"))
+            })
+            .filter_map(|item| item.get("arguments").and_then(Value::as_str))
+            .filter_map(|args| serde_json::from_str::<Value>(args).ok())
+            .filter_map(|args| {
+                args.get("command")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .any(|command| crate::chat::lead_did_work(&command));
+        if !worked || self.lead_deltas_since_nudge < NUDGE_GAP {
+            return delta;
+        }
+        self.lead_deltas_since_nudge = 0;
+        format!("{delta}\n\n{}", crate::chat::DELEGATION_NUDGE)
+    }
+
     pub(crate) fn resume_parked(
         &mut self,
         turn: &PreparedTurn,
@@ -1712,7 +1757,7 @@ impl LiveSession {
             .ok_or_else(|| "session has no parked sidekick request".to_string())?
             .call_id
             .clone();
-        let (_, output) = crate::chat::continuation_output(
+        let (_, output, notices) = crate::chat::continuation_output(
             &self.absorbed,
             &self.reply_call_ids,
             &self.reply_text,
@@ -1720,7 +1765,10 @@ impl LiveSession {
             &call_id,
         )
         .map_err(|_| "parked sidekick result did not match its host call".to_string())?;
-        let (exit_code, output) = bash_result(&output);
+        let (exit_code, mut output) = bash_result(&output);
+        if !notices.is_empty() {
+            output = format!("{output}\n\n{notices}");
+        }
         let parked = self
             .parked
             .take()

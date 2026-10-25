@@ -157,7 +157,7 @@ pub(crate) fn images_of(items: &[Value]) -> Vec<Value> {
 
 /// Kind of a Responses input item: the `type` field, or "message" for the
 /// EasyInputMessage short form (role present, type absent) the host emits.
-fn item_kind(item: &Value) -> &str {
+pub(crate) fn item_kind(item: &Value) -> &str {
     match item.get("type").and_then(Value::as_str) {
         Some(k) => k,
         None if item.get("role").is_some() => "message",
@@ -287,11 +287,25 @@ pub fn prepare_turn(
         .get("instructions")
         .and_then(Value::as_str)
         .unwrap_or("");
+    // Responses `reasoning.effort` is the host's /thinking pick; the model
+    // id family + tier name resolve to the real native id (the catalog
+    // collapses `swe-2-high|medium|max` into one `swe-2` row, so the effort
+    // is how a tier actually gets chosen).
+    let effort = body
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .and_then(Value::as_str);
+    let native_model = crate::catalog::native_model_in(model, effort, account_home);
     let input = body
         .get("input")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let input = if native_model.starts_with("fusion-") {
+        strip_subagent_hint(input)
+    } else {
+        input
+    };
     let mut names: Vec<String> = Vec::new();
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut tool_specs: Vec<String> = Vec::new();
@@ -358,15 +372,6 @@ pub fn prepare_turn(
     if !instructions.is_empty() {
         system_parts.push(instructions.to_string());
     }
-    // Responses `reasoning.effort` is the host's /thinking pick; the model
-    // id family + tier name resolve to the real native id (the catalog
-    // collapses `swe-2-high|medium|max` into one `swe-2` row, so the effort
-    // is how a tier actually gets chosen).
-    let effort = body
-        .get("reasoning")
-        .and_then(|r| r.get("effort"))
-        .and_then(Value::as_str);
-    let native_model = crate::catalog::native_model_in(model, effort, account_home);
     system_parts.push(funnel_contract(
         &tool_specs,
         native_model.starts_with("fusion-"),
@@ -380,6 +385,58 @@ pub fn prepare_turn(
         gray_session: String::new(),
         account: None,
     })
+}
+
+const SUBAGENT_HINT_PREFIXES: [&str; 2] = [
+    "Subagents: delegate from bash with ",
+    "Subagents are managed through Bash: ",
+];
+
+fn strip_subagent_hint_text(text: &str) -> Option<String> {
+    if !text
+        .lines()
+        .any(|line| SUBAGENT_HINT_PREFIXES.iter().any(|p| line.starts_with(p)))
+    {
+        return Some(text.to_string());
+    }
+    let kept = text
+        .lines()
+        .filter(|line| !SUBAGENT_HINT_PREFIXES.iter().any(|p| line.starts_with(p)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rest = kept.trim();
+    (!rest.is_empty() && rest != "[Context update]").then_some(kept)
+}
+
+fn strip_subagent_hint(input: Vec<Value>) -> Vec<Value> {
+    input
+        .into_iter()
+        .filter_map(|mut item| {
+            if item.get("role").and_then(Value::as_str) != Some("user") {
+                return Some(item);
+            }
+            match item.get_mut("content") {
+                Some(Value::String(text)) => *text = strip_subagent_hint_text(text)?,
+                Some(Value::Array(parts)) => {
+                    parts.retain_mut(|part| match part.get_mut("text") {
+                        Some(Value::String(text)) => match strip_subagent_hint_text(text) {
+                            Some(kept) => {
+                                *text = kept;
+                                true
+                            }
+                            None => false,
+                        },
+                        _ => true,
+                    });
+                    if parts.is_empty() {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+            Some(item)
+        })
+        .collect()
 }
 
 /// The text funnel contract the model answers with. Verified with Claude
@@ -421,12 +478,19 @@ fn funnel_contract(tool_specs: &[String], fusion: bool) -> String {
         transcript record yourself; tool results only come from the harness. Never claim a command \
         ran unless its `[Tool result]` is in the transcript.\n");
     s.push_str(if fusion {
-        "When the user asks for the sidekick, or a task splits off an independent piece, hand it to \
-        your sidekick with your built-in sidekick handoff and wait for its report. Never use \
-        `gray subagents`, the `subagent*` harness tools, or any other background agent for sidekick \
-        work: those are separate agents, not your sidekick. The sidekick's commands and file \
-        reads/writes run inline in the user's workspace through the harness, so its results are \
-        real. Make your own tool calls with the gray_calls block."
+        "You are the lead of a Fusion pair. Delegate by default: hand implementation (edits, \
+        multi-file changes), running builds, linters, tests and benchmarks, environment setup and \
+        repair, and multi-step command sequences to your sidekick with your built-in sidekick \
+        handoff, and wait for its report. Keep for yourself: talking to the user, planning and \
+        design decisions, investigation whose findings you will present, reviewing the sidekick's \
+        diff and evidence, and authority actions (commits, pushes, PRs, releases). Do a step \
+        yourself only when it is trivially small: one or two calls with nothing left to verify. \
+        Give each handoff the goal, the settled design, the exact files and commands, and how to \
+        verify; batch follow-up fixes into one handoff instead of several small ones. Never use \
+        `gray subagents`, the `subagent*` harness tools, or any other background agent for \
+        sidekick work: those are separate agents, not your sidekick. The sidekick's commands and \
+        file reads/writes run inline in the user's workspace through the harness, so its results \
+        are real. Make your own tool calls with the gray_calls block."
     } else {
         "To delegate parallel or independent work, spawn a gray subagent through `bash`: \
         `gray subagents run --name NAME 'task'` (add `--isolation worktree` when parallel \
@@ -1042,8 +1106,12 @@ fn shell_quote(s: &str) -> String {
 
 fn working_directory(system: &str) -> Option<String> {
     system.lines().find_map(|line| {
-        line.strip_prefix("Working directory: ")
-            .and_then(|value| serde_json::from_str::<String>(value).ok())
+        let value = line.strip_prefix("Working directory: ")?.trim();
+        if value.starts_with('"') {
+            serde_json::from_str::<String>(value).ok()
+        } else {
+            (!value.is_empty()).then(|| value.to_string())
+        }
     })
 }
 
@@ -1122,7 +1190,7 @@ pub(crate) fn sidekick_write_command(
 
 /// An input item the assistant side produced: the replayed echo of a
 /// session's own answer (assistant message, its calls, reasoning carriers).
-fn assistant_side(item: &Value) -> bool {
+pub(crate) fn assistant_side(item: &Value) -> bool {
     match item_kind(item) {
         "function_call" | "reasoning" => true,
         "message" => item.get("role").and_then(Value::as_str) == Some("assistant"),
@@ -1171,15 +1239,35 @@ pub(crate) fn continuation_output(
     reply_text: &str,
     input: &[Value],
     expected_call_id: &str,
-) -> Result<(String, String), &'static str> {
+) -> Result<(String, String, String), &'static str> {
     let (delta, tail) = continuation_parts(absorbed, reply_call_ids, reply_text, input)?;
-    if tail.iter().any(|item| {
-        item_kind(item) != "function_call_output"
-            || item.get("call_id").and_then(Value::as_str) != Some(expected_call_id)
-    }) {
+    let results = tail
+        .iter()
+        .take_while(|item| item_kind(item) == "function_call_output")
+        .count();
+    let (results, notices) = tail.split_at(results);
+    if results.is_empty()
+        || results
+            .iter()
+            .any(|item| item.get("call_id").and_then(Value::as_str) != Some(expected_call_id))
+    {
         return Err("parked_tail");
     }
-    let output = tail
+    let notices = notices
+        .iter()
+        .map(|item| {
+            let text = (item_kind(item) == "message"
+                && item.get("role").and_then(Value::as_str) == Some("user"))
+            .then(|| text_of(item.get("content").unwrap_or(&Value::Null)))
+            .filter(|text| {
+                text.starts_with("[Background task notification]")
+                    || text.starts_with("[Background jobs still running]")
+            });
+            text.ok_or("parked_tail")
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join("\n\n");
+    let output = results
         .iter()
         .map(|item| match item.get("output") {
             Some(Value::String(text)) => text.clone(),
@@ -1188,7 +1276,66 @@ pub(crate) fn continuation_output(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    Ok((delta, output))
+    Ok((delta, output, notices))
+}
+
+pub(crate) const DELEGATION_NUDGE: &str = "<system_guidance>Your last round ran implementation or verification work yourself. In Fusion, hand edits, builds, tests and environment work to your sidekick with your built-in sidekick handoff by default; do it yourself only for a one-off trivial step.</system_guidance>";
+
+fn redirects_to_workspace(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| {
+        if b != b'>' || (i > 0 && matches!(bytes[i - 1], b'-' | b'=' | b'>' | b'<')) {
+            return false;
+        }
+        let target = command[i + 1..].trim_start_matches('>').trim_start();
+        !(target.is_empty()
+            || target.starts_with('&')
+            || target.starts_with("/dev/null")
+            || target.starts_with("/tmp")
+            || target.starts_with('('))
+    })
+}
+
+pub(crate) fn lead_did_work(command: &str) -> bool {
+    if [
+        "sed -i",
+        "perl -pi",
+        "perl -i",
+        "apply_patch",
+        "git apply",
+        "tee ",
+    ]
+    .iter()
+    .any(|needle| command.contains(needle))
+        || redirects_to_workspace(command)
+    {
+        return true;
+    }
+    command
+        .split([';', '|', '&', '\n', '(', ')'])
+        .any(|segment| {
+            let words: Vec<&str> = segment.split_whitespace().collect();
+            words.first() == Some(&"make")
+                || words.windows(2).any(|w| {
+                    (w[0] == "cargo"
+                        && matches!(w[1], "build" | "test" | "check" | "clippy" | "fmt" | "run"))
+                        || (matches!(w[0], "npm" | "pnpm" | "yarn")
+                            && matches!(w[1], "run" | "test" | "install" | "build"))
+                })
+        })
+}
+
+pub(crate) fn tail_shape(absorbed: &[Value], input: &[Value]) -> String {
+    let rest = input.get(absorbed.len()..).unwrap_or_default();
+    let kinds = rest
+        .iter()
+        .map(|item| match item.get("role").and_then(Value::as_str) {
+            Some(role) => format!("{}:{role}", item_kind(item)),
+            None => item_kind(item).to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+    format!("prefix={},tail={kinds}", input.starts_with(absorbed))
 }
 
 fn continuation_parts<'a>(
@@ -1410,6 +1557,7 @@ fn run_turn_inner(
                 }
             }
             let delta = s.note_cut(delta);
+            let delta = s.delegation_nudge(turn, delta);
             let images = images_of(&turn.input[s.absorbed.len()..]);
             match s.send_prompt(&delta, &images, &turn.names) {
                 Ok(id) => match s.await_prompt_or_parked(id, deadline, cancel) {

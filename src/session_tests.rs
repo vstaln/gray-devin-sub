@@ -118,6 +118,7 @@ fn stub_session() -> LiveSession {
         stage_work: std::path::PathBuf::new(),
         account: String::new(),
         absorbed: Vec::new(),
+        lead_deltas_since_nudge: 0,
         reply_call_ids: Vec::new(),
         reply_text: String::new(),
         last_reply: None,
