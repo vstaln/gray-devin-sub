@@ -94,6 +94,7 @@ const KEEPALIVE_SWEEP: Duration = Duration::from_secs(30);
 /// full sweep + settle window of slack: a slow or once-failed keepalive
 /// still re-warms inside the TTL instead of billing a cold turn.
 const KEEPALIVE_AFTER: Duration = Duration::from_secs(3 * 60);
+const KEEPALIVE_TOO_LATE: Duration = Duration::from_secs(4 * 60 + 40);
 /// Keep warming only while the user is plausibly mid-break. The tradeoff
 /// is arithmetic: each keepalive is a billed upstream prompt, and past
 /// ~30min idle the odds of a return in the next TTL window are too low
@@ -1241,7 +1242,8 @@ fn clear_keepalive_pause() {
 /// children are the reaper's job, not the sweep's).
 fn keepalive_due(last_prompt_at: Option<Instant>, last_used: Instant, alive: bool) -> bool {
     alive
-        && last_prompt_at.is_some_and(|t| t.elapsed() > KEEPALIVE_AFTER)
+        && last_prompt_at
+            .is_some_and(|t| (KEEPALIVE_AFTER..KEEPALIVE_TOO_LATE).contains(&t.elapsed()))
         && last_used.elapsed() <= KEEPALIVE_IDLE_MAX
 }
 
