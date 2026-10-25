@@ -564,15 +564,18 @@ fn e2e_stub_child_pool_cycle() {
     }
 }
 
-/// A rewritten transcript (compaction, a cut) can't strictly continue —
-/// but the conversation's own session still holds those turns upstream,
-/// so it answers with only the new non-assistant tail instead of
-/// re-billing a fresh transcript. A different conversation's diverged
-/// history still misses: its tail would land on foreign context.
 #[test]
-fn a_rewritten_history_reuses_its_own_session_with_only_the_tail() {
+fn rewritten_history_never_reuses_the_upstream_session() {
     let model = "model-rewritten-tail";
-    let mut first = turn(model, vec![json!({"role": "user", "content": "hi"})]);
+    let start = json!({"role": "user", "content": "hi"});
+    let mut first = turn(
+        model,
+        vec![
+            start.clone(),
+            json!({"role": "assistant", "content": "original answer"}),
+            json!({"role": "user", "content": "previous"}),
+        ],
+    );
     first.gray_session = "conv-rewrite".to_string();
     let mut s = stub_session();
     s.session_id = "s-rewrite".to_string();
@@ -580,7 +583,8 @@ fn a_rewritten_history_reuses_its_own_session_with_only_the_tail() {
     s.absorb(&first, &answered("answer"));
     give_back(s);
 
-    let mut next = turn(
+    let never = AtomicBool::new(false);
+    let mut compacted = turn(
         model,
         vec![
             json!({"role": "user", "content": "[summary of earlier turns]"}),
@@ -588,14 +592,45 @@ fn a_rewritten_history_reuses_its_own_session_with_only_the_tail() {
             json!({"role": "user", "content": "continue"}),
         ],
     );
-    next.gray_session = "conv-rewrite".to_string();
-    let never = AtomicBool::new(false);
-    let (claimed, reason) = take(&next, &never);
-    let (s, delta) =
-        claimed.unwrap_or_else(|| panic!("rewritten history missed the pool: {reason}"));
-    assert_eq!(s.session_id, "s-rewrite");
-    assert_eq!(delta, "[User]\ncontinue");
-    s.close();
+    compacted.gray_session = "conv-rewrite".to_string();
+    let (claimed, _) = take(&compacted, &never);
+    assert!(
+        claimed.is_none(),
+        "compaction reused the old upstream session"
+    );
+
+    let mut cut = turn(
+        model,
+        vec![
+            start.clone(),
+            json!({"role": "assistant", "content": "original answer"}),
+        ],
+    );
+    cut.gray_session = "conv-rewrite".to_string();
+    let (claimed, _) = take(&cut, &never);
+    assert!(
+        claimed.is_none(),
+        "cut history reused the old upstream session"
+    );
+
+    let mut drift = turn(
+        model,
+        vec![
+            start.clone(),
+            json!({"role": "assistant", "content": "edited answer"}),
+            json!({"role": "user", "content": "rewritten question"}),
+            json!({"role": "assistant", "content": "kept reply"}),
+            json!({"role": "user", "content": "another revised turn"}),
+            json!({"role": "assistant", "content": "still in history"}),
+            json!({"role": "user", "content": "continue"}),
+        ],
+    );
+    drift.gray_session = "conv-rewrite".to_string();
+    let (claimed, _) = take(&drift, &never);
+    assert!(
+        claimed.is_none(),
+        "rewritten history reused the old upstream session"
+    );
 
     let mut other = turn(
         model,
@@ -604,6 +639,23 @@ fn a_rewritten_history_reuses_its_own_session_with_only_the_tail() {
     other.gray_session = "conv-other".to_string();
     let (claimed, _) = take(&other, &never);
     assert!(claimed.is_none());
+
+    let mut next = turn(
+        model,
+        vec![
+            start,
+            json!({"role": "assistant", "content": "original answer"}),
+            json!({"role": "user", "content": "previous"}),
+            json!({"role": "assistant", "content": "answer"}),
+            json!({"role": "user", "content": "continue"}),
+        ],
+    );
+    next.gray_session = "conv-rewrite".to_string();
+    let (claimed, reason) = take(&next, &never);
+    let (s, delta) = claimed.unwrap_or_else(|| panic!("strict continuation missed: {reason}"));
+    assert_eq!(s.session_id, "s-rewrite");
+    assert_eq!(delta, "[User]\ncontinue");
+    s.close();
 }
 
 #[test]
@@ -965,6 +1017,7 @@ fn record(session_id: &str, model: &str, owner_pid: u32, last_prompt_unix: u64) 
         gray_session: String::new(),
         deny_search: Some(false),
         account: String::new(),
+        exact: true,
     }
 }
 
@@ -1172,4 +1225,42 @@ fn early_abort_error_still_maps_to_429() {
     assert!(is_usage_limit(
         "Devin usage limit reached: daily quota exhausted"
     ));
+}
+
+/// A reasoning-only reply (no text, no tool call) must not be replayed:
+/// the host's identical retry of that empty completion has to reach a
+/// real request, or it gets the same empty answer back forever.
+#[test]
+fn an_empty_stored_reply_is_not_replayed() {
+    let model = "model-empty-replay";
+    let input = vec![json!({"role": "user", "content": "go"})];
+    let t = turn(model, input.clone());
+    let mut s = stub_session();
+    s.session_id = "s-empty-replay".to_string();
+    s.native_model = model.to_string();
+    let mut empty = answered("");
+    empty.thought = "thinking only".to_string();
+    s.absorb(&t, &empty);
+    give_back(s);
+    assert!(replay(&t).is_none());
+
+    // The same request with a real stored answer still replays.
+    let mut pool = locked_pool();
+    let s = pool
+        .live
+        .iter_mut()
+        .find(|s| s.session_id == "s-empty-replay")
+        .expect("pooled");
+    s.last_reply = Some(answered("real"));
+    drop(pool);
+    assert_eq!(replay(&t).map(|r| r.text).as_deref(), Some("real"));
+    let mut pool = locked_pool();
+    let i = pool
+        .live
+        .iter()
+        .position(|s| s.session_id == "s-empty-replay")
+        .expect("pooled");
+    let s = pool.live.remove(i);
+    drop(pool);
+    s.close();
 }
