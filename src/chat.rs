@@ -485,7 +485,8 @@ fn funnel_contract(tool_specs: &[String], fusion: bool) -> String {
         design decisions, investigation whose findings you will present, reviewing the sidekick's \
         diff and evidence, and authority actions (commits, pushes, PRs, releases). Do a step \
         yourself only when it is trivially small: one or two calls with nothing left to verify. \
-        Give each handoff the goal, the settled design, the exact files and commands, and how to \
+        Creating or rewriting a file, or any change you then have to run or check, is never \
+        trivially small: hand it off. Give each handoff the goal, the settled design, the exact files and commands, and how to \
         verify; batch follow-up fixes into one handoff instead of several small ones. Never use \
         `gray subagents`, the `subagent*` harness tools, or any other background agent for \
         sidekick work: those are separate agents, not your sidekick. The sidekick's commands and \
