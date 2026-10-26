@@ -141,7 +141,8 @@ const EMPTY_END_TURN: &str = "Devin usage limit reached: devin acp returned an e
 const EMPTY_REPLY_NUDGE: &str = "[Harness note] Your previous reply reached the harness empty: no text and no gray_calls block, so nothing was delivered. Reply now: answer the user, or issue the next gray_calls block.";
 /// Heads the follow-up prompt that hands the lead what the user sent while
 /// its sidekick held the turn.
-const PENDING_LEAD_NOTE: &str = "[Harness note] While your sidekick was working, the user sent the following. Address it now.";
+const PENDING_LEAD_NOTE: &str =
+    "[Harness note] While your sidekick was working, the user sent the following. Address it now.";
 
 /// Deny list written into both the project config and the user config the
 /// child sees: every native capability Devin exposes outside `ASK_RULES`.
