@@ -1254,21 +1254,72 @@ pub(crate) fn continuation_output(
     {
         return Err("parked_tail");
     }
-    let notices = notices
-        .iter()
-        .map(|item| {
-            let text = (item_kind(item) == "message"
-                && item.get("role").and_then(Value::as_str) == Some("user"))
-            .then(|| text_of(item.get("content").unwrap_or(&Value::Null)))
-            .filter(|text| {
-                text.starts_with("[Background task notification]")
-                    || text.starts_with("[Background jobs still running]")
-            });
-            text.ok_or("parked_tail")
+    let notices = parked_notices(notices)?;
+    let output = parked_output(results);
+    Ok((delta, output, notices))
+}
+
+pub(crate) fn parked_tail_output(
+    input: &[Value],
+    expected_call_id: &str,
+) -> Result<(String, String), &'static str> {
+    let mut cursor = input.len();
+    let mut notices = Vec::new();
+    while cursor > 0 {
+        let Some(notice) = parked_notice(&input[cursor - 1]) else {
+            break;
+        };
+        notices.push(notice);
+        cursor -= 1;
+    }
+    notices.reverse();
+
+    let output_end = cursor;
+    while cursor > 0 && item_kind(&input[cursor - 1]) == "function_call_output" {
+        cursor -= 1;
+    }
+    let outputs = &input[cursor..output_end];
+    if outputs.is_empty()
+        || outputs
+            .iter()
+            .any(|item| item.get("call_id").and_then(Value::as_str) != Some(expected_call_id))
+    {
+        return Err("parked_tail");
+    }
+
+    let mut assistant_start = cursor;
+    while assistant_start > 0 && assistant_side(&input[assistant_start - 1]) {
+        assistant_start -= 1;
+    }
+    if !input[assistant_start..cursor].iter().any(|item| {
+        item_kind(item) == "function_call"
+            && item.get("call_id").and_then(Value::as_str) == Some(expected_call_id)
+    }) {
+        return Err("parked_tail");
+    }
+
+    Ok((parked_output(outputs), notices.join("\n\n")))
+}
+
+fn parked_notice(item: &Value) -> Option<String> {
+    (item_kind(item) == "message" && item.get("role").and_then(Value::as_str) == Some("user"))
+        .then(|| text_of(item.get("content").unwrap_or(&Value::Null)))
+        .filter(|text| {
+            text.starts_with("[Background task notification]")
+                || text.starts_with("[Background jobs still running]")
         })
-        .collect::<Result<Vec<_>, _>>()?
-        .join("\n\n");
-    let output = results
+}
+
+fn parked_notices(notices: &[Value]) -> Result<String, &'static str> {
+    notices
+        .iter()
+        .map(|item| parked_notice(item).ok_or("parked_tail"))
+        .collect::<Result<Vec<_>, _>>()
+        .map(|notices| notices.join("\n\n"))
+}
+
+fn parked_output(results: &[Value]) -> String {
+    results
         .iter()
         .map(|item| match item.get("output") {
             Some(Value::String(text)) => text.clone(),
@@ -1276,8 +1327,7 @@ pub(crate) fn continuation_output(
             None => String::new(),
         })
         .collect::<Vec<_>>()
-        .join("\n");
-    Ok((delta, output, notices))
+        .join("\n")
 }
 
 pub(crate) const DELEGATION_NUDGE: &str = "<system_guidance>Your last round ran implementation or verification work yourself. In Fusion, hand edits, builds, tests and environment work to your sidekick with your built-in sidekick handoff by default; do it yourself only for a one-off trivial step.</system_guidance>";
@@ -1660,7 +1710,7 @@ fn run_turn_inner(
         Ok(session::AwaitPrompt::Parked(r)) => {
             s.absorb(turn, &r);
             trace_turn(
-                "fresh:sidekick_park",
+                &format!("{mode}:sidekick_park"),
                 &s.session_id,
                 chars,
                 Some(&r),

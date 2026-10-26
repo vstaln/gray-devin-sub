@@ -206,7 +206,6 @@ pub(crate) enum AwaitPrompt {
 enum FindResult {
     Prompt(usize, String),
     Parked(usize, String),
-    CancelParked(usize),
 }
 
 /// Process-wide staging: one scratch cwd + generated user config shared by
@@ -1038,27 +1037,31 @@ fn find(live: &[LiveSession], turn: &PreparedTurn) -> Result<FindResult, &'stati
             ("system", 2)
         } else if let Some(parked) = &s.parked {
             if !turn.input.starts_with(&s.absorbed) {
+                if crate::chat::parked_tail_output(&turn.input, &parked.call_id).is_ok() {
+                    crate::chat::pool_event("parked_rebased", &s.session_id);
+                    return Ok(FindResult::Parked(i, String::new()));
+                }
                 ("prefix", 3)
             } else {
-                return match crate::chat::continuation_output(
+                match crate::chat::continuation_output(
                     &s.absorbed,
                     &s.reply_call_ids,
                     &s.reply_text,
                     &turn.input,
                     &parked.call_id,
                 ) {
-                    Ok((delta, _, _)) => Ok(FindResult::Parked(i, delta)),
+                    Ok((delta, _, _)) => return Ok(FindResult::Parked(i, delta)),
                     Err(miss) => {
                         crate::chat::pool_event(
                             &format!(
-                                "cancel_parked:{miss}\t{}",
+                                "parked_skip:{miss}\t{}",
                                 crate::chat::tail_shape(&s.absorbed, &turn.input)
                             ),
                             &s.session_id,
                         );
-                        Ok(FindResult::CancelParked(i))
+                        (miss, 4)
                     }
-                };
+                }
             }
         } else {
             match continuation(&s.absorbed, &s.reply_call_ids, &s.reply_text, &turn.input) {
@@ -1073,6 +1076,40 @@ fn find(live: &[LiveSession], turn: &PreparedTurn) -> Result<FindResult, &'stati
                 ),
             }
         };
+        if s.parked.is_some() {
+            let diverge = s
+                .absorbed
+                .iter()
+                .zip(turn.input.iter())
+                .position(|(a, b)| a != b);
+            let keys = diverge
+                .and_then(|at| {
+                    let (a, b) = (s.absorbed[at].as_object()?, turn.input[at].as_object()?);
+                    Some(
+                        a.keys()
+                            .chain(b.keys())
+                            .filter(|k| a.get(*k) != b.get(*k))
+                            .cloned()
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                            .join("+"),
+                    )
+                })
+                .unwrap_or_default();
+            let kind = diverge
+                .map(|at| crate::chat::item_kind(&s.absorbed[at]).to_string())
+                .unwrap_or_default();
+            crate::chat::pool_event(
+                &format!(
+                    "parked_miss:{miss}\tabsorbed={} input={} diverge={diverge:?} kind={kind} keys={keys}\t{}",
+                    s.absorbed.len(),
+                    turn.input.len(),
+                    crate::chat::tail_shape(&s.absorbed, &turn.input)
+                ),
+                &s.session_id,
+            );
+        }
         if d > depth {
             depth = d;
             reason = miss;
@@ -1128,7 +1165,6 @@ pub fn take(
 ) -> (Option<(LiveSession, String)>, &'static str) {
     let deadline = Instant::now() + KEEPALIVE_WINDOW;
     let mut dead = Vec::new();
-    let mut cancelled_parked = Vec::new();
     let result = {
         let mut pool = locked_pool();
         loop {
@@ -1138,10 +1174,6 @@ pub fn take(
                     let s = pool.live.remove(i);
                     pool.borrowed.push(Borrowed::of(&s));
                     break (Some((s, delta)), "reuse");
-                }
-                Ok(FindResult::CancelParked(i)) => {
-                    cancelled_parked.push(pool.live.remove(i));
-                    break (None, "parked_mismatch");
                 }
                 Err(reason) => reason,
             };
@@ -1161,13 +1193,6 @@ pub fn take(
     };
     for s in dead {
         s.abandon();
-    }
-    let had_cancelled_parked = !cancelled_parked.is_empty();
-    for s in cancelled_parked {
-        s.close();
-    }
-    if had_cancelled_parked {
-        POOL_CHANGED.notify_all();
     }
     result
 }
@@ -1759,14 +1784,17 @@ impl LiveSession {
             .ok_or_else(|| "session has no parked sidekick request".to_string())?
             .call_id
             .clone();
-        let (_, output, notices) = crate::chat::continuation_output(
+        let (output, notices) = match crate::chat::continuation_output(
             &self.absorbed,
             &self.reply_call_ids,
             &self.reply_text,
             &turn.input,
             &call_id,
-        )
-        .map_err(|_| "parked sidekick result did not match its host call".to_string())?;
+        ) {
+            Ok((_, output, notices)) => (output, notices),
+            Err(_) => crate::chat::parked_tail_output(&turn.input, &call_id)
+                .map_err(|_| "parked sidekick result did not match its host call".to_string())?,
+        };
         let (exit_code, mut output) = bash_result(&output);
         if !notices.is_empty() {
             output = format!("{output}\n\n{notices}");
