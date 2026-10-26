@@ -1273,3 +1273,16 @@ fn an_empty_stored_reply_is_not_replayed() {
     drop(pool);
     s.close();
 }
+
+#[test]
+fn content_refusals_are_told_apart_from_usage_limits() {
+    let refusal = "native request failed: Provider refusal: This request was refused by Anthropic's content policy.";
+    assert!(is_content_refusal(refusal));
+    assert!(!is_usage_limit(refusal));
+    assert!(is_content_refusal(
+        "Devin refused this request under its usage policy"
+    ));
+    assert!(!is_content_refusal(
+        "Devin usage limit reached: Your weekly usage quota has been exhausted."
+    ));
+}

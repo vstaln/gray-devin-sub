@@ -1239,6 +1239,13 @@ pub(crate) fn is_usage_limit(err: &str) -> bool {
         || e.contains("429")
 }
 
+/// Whether an upstream error is a content refusal of the transcript itself;
+/// unlike a usage limit, no amount of waiting clears it.
+pub(crate) fn is_content_refusal(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("content policy") || e.contains("provider refusal") || e.contains("usage policy")
+}
+
 /// Whether a `devin acp` stderr line is an upstream usage/rate-limit
 /// refusal — the signature `map_rpc_error` and `is_usage_limit` share,
 /// watched live by the stderr reader so a parked turn fails fast.
@@ -1344,7 +1351,14 @@ fn keepalive_sweep() {
                 KEEPALIVE_COOLDOWN.as_secs()
             );
         }
-        if failed.is_none() || !s.prompt_in_flight {
+        // A content refusal re-fires on every keepalive (the refused
+        // transcript is what gets replayed), so the session can never be
+        // warmed again: close it instead of pinging it until the idle cap.
+        let refused = failed.as_deref().is_some_and(is_content_refusal);
+        if refused {
+            crate::chat::pool_event("keepalive:closed:refusal", &s.session_id);
+        }
+        if !refused && (failed.is_none() || !s.prompt_in_flight) {
             give_back(s);
         } else {
             locked_pool()
