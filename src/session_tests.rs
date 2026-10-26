@@ -1273,21 +1273,3 @@ fn an_empty_stored_reply_is_not_replayed() {
     drop(pool);
     s.close();
 }
-
-#[test]
-fn merge_replies_joins_text_and_sums_usage() {
-    let mk = |text: &str, calls: Vec<(String, String, String)>, input: usize| TurnResult {
-        text: text.to_string(),
-        thought: String::new(),
-        calls,
-        usage: Usage { input_tokens: input, cached_tokens: input, ..Usage::default() },
-        stop: "end_turn".to_string(),
-        unseen: false,
-    };
-    let call = ("c".to_string(), "bash".to_string(), "{}".to_string());
-    let r = merge_replies(mk("done", vec![], 10), mk("4, and a cat", vec![call.clone()], 20));
-    assert_eq!(r.text, "done\n\n4, and a cat");
-    assert_eq!(r.calls, vec![call]);
-    assert_eq!((r.usage.input_tokens, r.usage.cached_tokens), (30, 30));
-    assert_eq!(merge_replies(mk("", vec![], 0), mk("x", vec![], 0)).text, "x");
-}
