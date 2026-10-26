@@ -94,6 +94,7 @@ const KEEPALIVE_SWEEP: Duration = Duration::from_secs(30);
 /// full sweep + settle window of slack: a slow or once-failed keepalive
 /// still re-warms inside the TTL instead of billing a cold turn.
 const KEEPALIVE_AFTER: Duration = Duration::from_secs(3 * 60);
+const KEEPALIVE_TOO_LATE: Duration = Duration::from_secs(4 * 60 + 40);
 /// Keep warming only while the user is plausibly mid-break. The tradeoff
 /// is arithmetic: each keepalive is a billed upstream prompt, and past
 /// ~30min idle the odds of a return in the next TTL window are too low
@@ -157,6 +158,7 @@ const DENY_SEARCH_RULE: &str = "web_search";
 const ASK_RULES: &[&str] = &["read", "edit", "grep", "glob", "exec"];
 
 const BATCH_QUIET: Duration = Duration::from_millis(250);
+const NUDGE_GAP: u32 = 4;
 const PARKED_TTL: Duration = Duration::from_secs(10 * 60);
 
 enum ParkKind {
@@ -204,7 +206,6 @@ pub(crate) enum AwaitPrompt {
 enum FindResult {
     Prompt(usize, String),
     Parked(usize, String),
-    CancelParked(usize),
 }
 
 /// Process-wide staging: one scratch cwd + generated user config shared by
@@ -387,6 +388,7 @@ pub struct LiveSession {
     stage_work: PathBuf,
     /// The exact `input` array of the last request this session answered.
     pub(crate) absorbed: Vec<Value>,
+    lead_deltas_since_nudge: u32,
     /// Call ids emitted in that answer, in order.
     reply_call_ids: Vec<String>,
     /// The (trimmed) text emitted in that answer.
@@ -1035,18 +1037,31 @@ fn find(live: &[LiveSession], turn: &PreparedTurn) -> Result<FindResult, &'stati
             ("system", 2)
         } else if let Some(parked) = &s.parked {
             if !turn.input.starts_with(&s.absorbed) {
+                if crate::chat::parked_tail_output(&turn.input, &parked.call_id).is_ok() {
+                    crate::chat::pool_event("parked_rebased", &s.session_id);
+                    return Ok(FindResult::Parked(i, String::new()));
+                }
                 ("prefix", 3)
             } else {
-                return match crate::chat::continuation_output(
+                match crate::chat::continuation_output(
                     &s.absorbed,
                     &s.reply_call_ids,
                     &s.reply_text,
                     &turn.input,
                     &parked.call_id,
                 ) {
-                    Ok((delta, _)) => Ok(FindResult::Parked(i, delta)),
-                    Err(_) => Ok(FindResult::CancelParked(i)),
-                };
+                    Ok((delta, _, _)) => return Ok(FindResult::Parked(i, delta)),
+                    Err(miss) => {
+                        crate::chat::pool_event(
+                            &format!(
+                                "parked_skip:{miss}\t{}",
+                                crate::chat::tail_shape(&s.absorbed, &turn.input)
+                            ),
+                            &s.session_id,
+                        );
+                        (miss, 4)
+                    }
+                }
             }
         } else {
             match continuation(&s.absorbed, &s.reply_call_ids, &s.reply_text, &turn.input) {
@@ -1061,6 +1076,40 @@ fn find(live: &[LiveSession], turn: &PreparedTurn) -> Result<FindResult, &'stati
                 ),
             }
         };
+        if s.parked.is_some() {
+            let diverge = s
+                .absorbed
+                .iter()
+                .zip(turn.input.iter())
+                .position(|(a, b)| a != b);
+            let keys = diverge
+                .and_then(|at| {
+                    let (a, b) = (s.absorbed[at].as_object()?, turn.input[at].as_object()?);
+                    Some(
+                        a.keys()
+                            .chain(b.keys())
+                            .filter(|k| a.get(*k) != b.get(*k))
+                            .cloned()
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                            .join("+"),
+                    )
+                })
+                .unwrap_or_default();
+            let kind = diverge
+                .map(|at| crate::chat::item_kind(&s.absorbed[at]).to_string())
+                .unwrap_or_default();
+            crate::chat::pool_event(
+                &format!(
+                    "parked_miss:{miss}\tabsorbed={} input={} diverge={diverge:?} kind={kind} keys={keys}\t{}",
+                    s.absorbed.len(),
+                    turn.input.len(),
+                    crate::chat::tail_shape(&s.absorbed, &turn.input)
+                ),
+                &s.session_id,
+            );
+        }
         if d > depth {
             depth = d;
             reason = miss;
@@ -1116,7 +1165,6 @@ pub fn take(
 ) -> (Option<(LiveSession, String)>, &'static str) {
     let deadline = Instant::now() + KEEPALIVE_WINDOW;
     let mut dead = Vec::new();
-    let mut cancelled_parked = Vec::new();
     let result = {
         let mut pool = locked_pool();
         loop {
@@ -1126,10 +1174,6 @@ pub fn take(
                     let s = pool.live.remove(i);
                     pool.borrowed.push(Borrowed::of(&s));
                     break (Some((s, delta)), "reuse");
-                }
-                Ok(FindResult::CancelParked(i)) => {
-                    cancelled_parked.push(pool.live.remove(i));
-                    break (None, "parked_mismatch");
                 }
                 Err(reason) => reason,
             };
@@ -1149,13 +1193,6 @@ pub fn take(
     };
     for s in dead {
         s.abandon();
-    }
-    let had_cancelled_parked = !cancelled_parked.is_empty();
-    for s in cancelled_parked {
-        s.close();
-    }
-    if had_cancelled_parked {
-        POOL_CHANGED.notify_all();
     }
     result
 }
@@ -1230,7 +1267,8 @@ fn clear_keepalive_pause() {
 /// children are the reaper's job, not the sweep's).
 fn keepalive_due(last_prompt_at: Option<Instant>, last_used: Instant, alive: bool) -> bool {
     alive
-        && last_prompt_at.is_some_and(|t| t.elapsed() > KEEPALIVE_AFTER)
+        && last_prompt_at
+            .is_some_and(|t| (KEEPALIVE_AFTER..KEEPALIVE_TOO_LATE).contains(&t.elapsed()))
         && last_used.elapsed() <= KEEPALIVE_IDLE_MAX
 }
 
@@ -1437,6 +1475,7 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         system: turn.system.clone(),
         stage_work: stage.work.clone(),
         absorbed: Vec::new(),
+        lead_deltas_since_nudge: NUDGE_GAP,
         reply_call_ids: Vec::new(),
         reply_text: String::new(),
         last_reply: None,
@@ -1700,6 +1739,39 @@ impl LiveSession {
         Ok(result)
     }
 
+    pub(crate) fn delegation_nudge(&mut self, turn: &PreparedTurn, delta: String) -> String {
+        if !self.native_model.starts_with("fusion-") {
+            return delta;
+        }
+        self.lead_deltas_since_nudge = self.lead_deltas_since_nudge.saturating_add(1);
+        let worked = turn
+            .input
+            .get(self.absorbed.len()..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|item| crate::chat::assistant_side(item))
+            .filter(|item| crate::chat::item_kind(item) == "function_call")
+            .filter(|item| {
+                !item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.starts_with("call_sk::"))
+            })
+            .filter_map(|item| item.get("arguments").and_then(Value::as_str))
+            .filter_map(|args| serde_json::from_str::<Value>(args).ok())
+            .filter_map(|args| {
+                args.get("command")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .any(|command| crate::chat::lead_did_work(&command));
+        if !worked || self.lead_deltas_since_nudge < NUDGE_GAP {
+            return delta;
+        }
+        self.lead_deltas_since_nudge = 0;
+        format!("{delta}\n\n{}", crate::chat::DELEGATION_NUDGE)
+    }
+
     pub(crate) fn resume_parked(
         &mut self,
         turn: &PreparedTurn,
@@ -1712,15 +1784,21 @@ impl LiveSession {
             .ok_or_else(|| "session has no parked sidekick request".to_string())?
             .call_id
             .clone();
-        let (_, output) = crate::chat::continuation_output(
+        let (output, notices) = match crate::chat::continuation_output(
             &self.absorbed,
             &self.reply_call_ids,
             &self.reply_text,
             &turn.input,
             &call_id,
-        )
-        .map_err(|_| "parked sidekick result did not match its host call".to_string())?;
-        let (exit_code, output) = bash_result(&output);
+        ) {
+            Ok((_, output, notices)) => (output, notices),
+            Err(_) => crate::chat::parked_tail_output(&turn.input, &call_id)
+                .map_err(|_| "parked sidekick result did not match its host call".to_string())?,
+        };
+        let (exit_code, mut output) = bash_result(&output);
+        if !notices.is_empty() {
+            output = format!("{output}\n\n{notices}");
+        }
         let parked = self
             .parked
             .take()
@@ -1736,21 +1814,20 @@ impl LiveSession {
                     json!({"exitCode": exit_code, "signal": null}),
                 )?;
             }
+            ParkKind::ReadTextFile | ParkKind::WriteTextFile if exit_code != 0 => {
+                let message = if output.is_empty() {
+                    format!("gray bash exited with status {exit_code}")
+                } else {
+                    output
+                };
+                self.send(&json!({"jsonrpc": "2.0", "id": parked.request_id,
+                    "error": {"code": -32000, "message": message}}))?;
+            }
             ParkKind::ReadTextFile => {
                 self.answer_request(&parked.request_id, json!({"content": output}))?;
             }
             ParkKind::WriteTextFile => {
-                if exit_code == 0 {
-                    self.answer_request(&parked.request_id, Value::Null)?;
-                } else {
-                    let message = if output.is_empty() {
-                        format!("gray bash exited with status {exit_code}")
-                    } else {
-                        output
-                    };
-                    self.send(&json!({"jsonrpc": "2.0", "id": parked.request_id,
-                        "error": {"code": -32000, "message": message}}))?;
-                }
+                self.answer_request(&parked.request_id, Value::Null)?;
             }
         }
         self.await_prompt_or_parked(parked.prompt_id, deadline, cancel)
@@ -2105,7 +2182,10 @@ impl LiveSession {
                 .map(String::as_str)
                 .unwrap_or("");
             let options = params.get("options").and_then(Value::as_array);
-            if matches!(inference, "exec" | "read" | "edit" | "write" | "multi_edit") {
+            if matches!(
+                inference,
+                "exec" | "read" | "edit" | "write" | "multi_edit" | "apply_patch"
+            ) {
                 if let Some(option_id) = options
                     .into_iter()
                     .flatten()
