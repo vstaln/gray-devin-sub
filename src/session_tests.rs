@@ -140,6 +140,7 @@ fn stub_session() -> LiveSession {
         parked: None,
         seen_update_kinds: std::collections::HashSet::new(),
         pending_perms: Vec::new(),
+        pending_lead: Vec::new(),
         batch_quiet: None,
         batch_flushed: false,
         guard: crate::guard::TurnGuard::default(),

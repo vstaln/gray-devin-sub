@@ -135,6 +135,14 @@ const CLIENT_GONE: &str = "client disconnected";
 /// classified as a plain 500 and the host retry-burned against the
 /// exhausted quota.
 const EMPTY_END_TURN: &str = "Devin usage limit reached: devin acp returned an empty end_turn with no output (silent rejection); session kept pooled";
+/// Sent once on the same warm session when a Fusion lead turn settles with
+/// no text and no call (seen right after a sidekick result): the host would
+/// otherwise get an empty response and retry on a cold child.
+const EMPTY_REPLY_NUDGE: &str = "[Harness note] Your previous reply reached the harness empty: no text and no gray_calls block, so nothing was delivered. Reply now: answer the user, or issue the next gray_calls block.";
+/// Heads the follow-up prompt that hands the lead what the user sent while
+/// its sidekick held the turn.
+const PENDING_LEAD_NOTE: &str =
+    "[Harness note] While your sidekick was working, the user sent the following. Address it now.";
 
 /// Deny list written into both the project config and the user config the
 /// child sees: every native capability Devin exposes outside `ASK_RULES`.
@@ -432,6 +440,9 @@ pub struct LiveSession {
     seen_calls: HashSet<String>,
     seen_update_kinds: HashSet<String>,
     pending_perms: Vec<Value>,
+    /// User input that reached a parked turn (typed or pasted mid-handoff):
+    /// delivered to the lead on this session once its prompt completes.
+    pending_lead: Vec<Value>,
     batch_quiet: Option<Instant>,
     batch_flushed: bool,
     guard: TurnGuard,
@@ -1050,7 +1061,7 @@ fn find(live: &[LiveSession], turn: &PreparedTurn) -> Result<FindResult, &'stati
                     &turn.input,
                     &parked.call_id,
                 ) {
-                    Ok((delta, _, _)) => return Ok(FindResult::Parked(i, delta)),
+                    Ok((delta, ..)) => return Ok(FindResult::Parked(i, delta)),
                     Err(miss) => {
                         crate::chat::pool_event(
                             &format!(
@@ -1497,6 +1508,7 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         parked: None,
         seen_update_kinds: HashSet::new(),
         pending_perms: Vec::new(),
+        pending_lead: Vec::new(),
         batch_quiet: None,
         batch_flushed: false,
         guard: TurnGuard::default(),
@@ -1671,6 +1683,16 @@ impl LiveSession {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<AwaitPrompt, String> {
+        self.settle_prompt(id, deadline, cancel, false)
+    }
+
+    fn settle_prompt(
+        &mut self,
+        id: u64,
+        deadline: Instant,
+        cancel: &AtomicBool,
+        nudged: bool,
+    ) -> Result<AwaitPrompt, String> {
         let (result, unseen) = match self.prompt_result(id, deadline, cancel)? {
             PromptWait::Settled(result, unseen) => (result, unseen),
             PromptWait::Parked => return Ok(AwaitPrompt::Parked(self.park_result()?)),
@@ -1706,6 +1728,19 @@ impl LiveSession {
             return Err(self.limit_detail(EMPTY_END_TURN.to_string()));
         }
         let mut r = self.finish(stop_reason);
+        if !nudged
+            && !unseen
+            && !self.keepalive_prompt
+            && self.guard.cut().is_none()
+            && self.native_model.starts_with("fusion-")
+            && r.text.is_empty()
+            && r.calls.is_empty()
+        {
+            crate::chat::pool_event("empty_reply_nudge", &self.session_id);
+            let names = self.names.clone();
+            let next = self.send_prompt(EMPTY_REPLY_NUDGE, &[], &names)?;
+            return self.settle_prompt(next, deadline, cancel, true);
+        }
         r.unseen = unseen;
         Ok(AwaitPrompt::Complete(r))
     }
@@ -1784,20 +1819,31 @@ impl LiveSession {
             .ok_or_else(|| "session has no parked sidekick request".to_string())?
             .call_id
             .clone();
-        let (output, notices) = match crate::chat::continuation_output(
+        let (output, notices, pending) = match crate::chat::continuation_output(
             &self.absorbed,
             &self.reply_call_ids,
             &self.reply_text,
             &turn.input,
             &call_id,
         ) {
-            Ok((_, output, notices)) => (output, notices),
+            Ok((_, output, notices, pending)) => (output, notices, pending),
             Err(_) => crate::chat::parked_tail_output(&turn.input, &call_id)
                 .map_err(|_| "parked sidekick result did not match its host call".to_string())?,
         };
         let (exit_code, mut output) = bash_result(&output);
         if !notices.is_empty() {
             output = format!("{output}\n\n{notices}");
+        }
+        if !pending.is_empty() {
+            crate::chat::pool_event(
+                &format!("parked_pending:{}", pending.len()),
+                &self.session_id,
+            );
+            output = format!(
+                "{output}\n\n[Harness note] The user sent {} message(s) to the lead while this ran; they will reach the lead when its turn completes. Finish your task normally.",
+                pending.len()
+            );
+            self.pending_lead.extend(pending);
         }
         let parked = self
             .parked
@@ -1830,7 +1876,38 @@ impl LiveSession {
                 self.answer_request(&parked.request_id, Value::Null)?;
             }
         }
-        self.await_prompt_or_parked(parked.prompt_id, deadline, cancel)
+        let first = self.await_prompt_or_parked(parked.prompt_id, deadline, cancel)?;
+        self.deliver_pending_lead(first, deadline, cancel)
+    }
+
+    /// Once the lead's prompt completes, hand it the user input held while
+    /// its sidekick worked, as one follow-up prompt on this same warm
+    /// session; the two replies merge into the one the host sees.
+    fn deliver_pending_lead(
+        &mut self,
+        first: AwaitPrompt,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<AwaitPrompt, String> {
+        let AwaitPrompt::Complete(first) = first else {
+            return Ok(first);
+        };
+        if self.pending_lead.is_empty() {
+            return Ok(AwaitPrompt::Complete(first));
+        }
+        let pending = std::mem::take(&mut self.pending_lead);
+        let text = format!(
+            "{PENDING_LEAD_NOTE}\n\n{}",
+            crate::chat::render_items(&pending)
+        );
+        let images = crate::chat::images_of(&pending);
+        crate::chat::pool_event("parked_pending_delivered", &self.session_id);
+        let names = self.names.clone();
+        let id = self.send_prompt(&text, &images, &names)?;
+        Ok(match self.await_prompt_or_parked(id, deadline, cancel)? {
+            AwaitPrompt::Complete(r) => AwaitPrompt::Complete(merge_replies(first, r)),
+            AwaitPrompt::Parked(r) => AwaitPrompt::Parked(merge_replies(first, r)),
+        })
     }
 
     /// Record what this session just answered so the next request can be
@@ -2253,7 +2330,7 @@ impl LiveSession {
             return Ok(RequestDisposition::Continue);
         };
         self.parked = Some(Parked {
-            call_id: format!("call_{sidekick_id}"),
+            call_id: format!("call_{sidekick_id}_{}", rand_hex(4)),
             request_id,
             prompt_id,
             command,
@@ -2778,3 +2855,23 @@ fn redact(s: &str) -> String {
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+/// Fold an earlier reply into the follow-up that continued it: texts and
+/// thoughts join, usage adds up, the follow-up's calls and stop stand.
+fn merge_replies(first: TurnResult, mut next: TurnResult) -> TurnResult {
+    let join = |a: String, b: &str| match (a.trim().is_empty(), b.trim().is_empty()) {
+        (true, _) => b.to_string(),
+        (_, true) => a,
+        _ => format!("{a}\n\n{b}"),
+    };
+    next.text = join(first.text, &next.text);
+    next.thought = join(first.thought, &next.thought);
+    let (a, b) = (&first.usage, &mut next.usage);
+    b.input_tokens += a.input_tokens;
+    b.output_tokens += a.output_tokens;
+    b.cached_tokens += a.cached_tokens;
+    b.cache_write_tokens += a.cache_write_tokens;
+    b.reasoning_tokens += a.reasoning_tokens;
+    next.unseen |= first.unseen;
+    next
+}
