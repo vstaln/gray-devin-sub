@@ -135,6 +135,10 @@ const CLIENT_GONE: &str = "client disconnected";
 /// classified as a plain 500 and the host retry-burned against the
 /// exhausted quota.
 const EMPTY_END_TURN: &str = "Devin usage limit reached: devin acp returned an empty end_turn with no output (silent rejection); session kept pooled";
+/// Sent once on the same warm session when a Fusion lead turn settles with
+/// no text and no call (seen right after a sidekick result): the host would
+/// otherwise get an empty response and retry on a cold child.
+const EMPTY_REPLY_NUDGE: &str = "[Harness note] Your previous reply reached the harness empty: no text and no gray_calls block, so nothing was delivered. Reply now: answer the user, or issue the next gray_calls block.";
 
 /// Deny list written into both the project config and the user config the
 /// child sees: every native capability Devin exposes outside `ASK_RULES`.
@@ -1671,6 +1675,16 @@ impl LiveSession {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<AwaitPrompt, String> {
+        self.settle_prompt(id, deadline, cancel, false)
+    }
+
+    fn settle_prompt(
+        &mut self,
+        id: u64,
+        deadline: Instant,
+        cancel: &AtomicBool,
+        nudged: bool,
+    ) -> Result<AwaitPrompt, String> {
         let (result, unseen) = match self.prompt_result(id, deadline, cancel)? {
             PromptWait::Settled(result, unseen) => (result, unseen),
             PromptWait::Parked => return Ok(AwaitPrompt::Parked(self.park_result()?)),
@@ -1706,6 +1720,19 @@ impl LiveSession {
             return Err(self.limit_detail(EMPTY_END_TURN.to_string()));
         }
         let mut r = self.finish(stop_reason);
+        if !nudged
+            && !unseen
+            && !self.keepalive_prompt
+            && self.guard.cut().is_none()
+            && self.native_model.starts_with("fusion-")
+            && r.text.is_empty()
+            && r.calls.is_empty()
+        {
+            crate::chat::pool_event("empty_reply_nudge", &self.session_id);
+            let names = self.names.clone();
+            let next = self.send_prompt(EMPTY_REPLY_NUDGE, &[], &names)?;
+            return self.settle_prompt(next, deadline, cancel, true);
+        }
         r.unseen = unseen;
         Ok(AwaitPrompt::Complete(r))
     }
@@ -2253,7 +2280,7 @@ impl LiveSession {
             return Ok(RequestDisposition::Continue);
         };
         self.parked = Some(Parked {
-            call_id: format!("call_{sidekick_id}"),
+            call_id: format!("call_{sidekick_id}_{}", rand_hex(4)),
             request_id,
             prompt_id,
             command,
