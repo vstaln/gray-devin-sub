@@ -831,3 +831,76 @@ fn funnel_parse_closes_an_array_left_open_before_the_fence() {
     let args: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
     assert_eq!(args["command"], "ls");
 }
+
+fn parked_input(trailing: Vec<Value>, output_id: &str) -> Vec<Value> {
+    let mut input = absorbed();
+    input.extend(echo("on it", "call_1"));
+    input.push(json!({"type": "function_call_output", "call_id": output_id, "output": "done"}));
+    input.extend(trailing);
+    input
+}
+
+fn image_msg() -> Value {
+    json!({"role": "user", "content": [
+        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]})
+}
+
+fn notice() -> Value {
+    json!({"role": "user", "content": "[Background task notification]\nBackground job x finished"})
+}
+
+fn parked_cont(input: &[Value]) -> Result<(String, String, String, Vec<Value>), &'static str> {
+    continuation_output(&absorbed(), &["call_1".to_string()], "on it", input, "call_1")
+}
+
+#[test]
+fn parked_continuation_holds_typed_text_for_lead() {
+    let input = parked_input(vec![json!({"role": "user", "content": "what's 2+2?"})], "call_1");
+    let (_, output, notices, pending) = parked_cont(&input).expect("typed text must not miss");
+    assert_eq!(output, "done");
+    assert!(notices.is_empty());
+    assert_eq!(pending.len(), 1);
+    let (out, n, p) = parked_tail_output(&input, "call_1").expect("tail form too");
+    assert_eq!((out.as_str(), n.as_str(), p.len()), ("done", "", 1));
+}
+
+#[test]
+fn parked_continuation_holds_image_message_for_lead() {
+    let input = parked_input(vec![image_msg()], "call_1");
+    let (_, _, _, pending) = parked_cont(&input).expect("image message must not miss");
+    assert_eq!(images_of(&pending).len(), 1);
+    let (_, _, p) = parked_tail_output(&input, "call_1").unwrap();
+    assert_eq!(images_of(&p).len(), 1);
+}
+
+#[test]
+fn parked_continuation_splits_notices_from_lead_input() {
+    let input = parked_input(
+        vec![notice(), json!({"role": "user", "content": "hi"}), image_msg()],
+        "call_1",
+    );
+    let (_, _, notices, pending) = parked_cont(&input).unwrap();
+    assert!(notices.starts_with("[Background task notification]"), "{notices}");
+    assert_eq!(pending.len(), 2);
+    let (_, n, p) = parked_tail_output(&input, "call_1").unwrap();
+    assert_eq!(n, notices);
+    assert_eq!(p, pending);
+}
+
+#[test]
+fn parked_continuation_still_rejects_assistant_items() {
+    let input = parked_input(vec![json!({"role": "assistant", "content": "sneaky"})], "call_1");
+    assert!(parked_cont(&input).is_err());
+    assert_eq!(parked_tail_output(&input, "call_1").unwrap_err(), "parked_tail");
+}
+
+#[test]
+fn parked_continuation_rejects_wrong_call_id() {
+    let mut input = absorbed();
+    input.extend(echo("on it", "call_1"));
+    input.push(json!({"type": "function_call_output", "call_id": "call_1", "output": "done"}));
+    input.push(json!({"role": "user", "content": "hi"}));
+    let wrong = continuation_output(&absorbed(), &["call_1".to_string()], "on it", &input, "call_2");
+    assert_eq!(wrong.unwrap_err(), "parked_tail");
+    assert_eq!(parked_tail_output(&input, "call_2").unwrap_err(), "parked_tail");
+}

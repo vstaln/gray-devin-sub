@@ -246,7 +246,7 @@ fn calls_block(calls: &[&Value]) -> String {
 }
 
 /// Render a Responses `input` array to transcript text.
-fn render_items(items: &[Value]) -> String {
+pub(crate) fn render_items(items: &[Value]) -> String {
     let mut records: Vec<String> = Vec::new();
     let mut open_assistant = false;
     let mut i = 0;
@@ -1240,7 +1240,7 @@ pub(crate) fn continuation_output(
     reply_text: &str,
     input: &[Value],
     expected_call_id: &str,
-) -> Result<(String, String, String), &'static str> {
+) -> Result<(String, String, String, Vec<Value>), &'static str> {
     let (delta, tail) = continuation_parts(absorbed, reply_call_ids, reply_text, input)?;
     let results = tail
         .iter()
@@ -1254,25 +1254,20 @@ pub(crate) fn continuation_output(
     {
         return Err("parked_tail");
     }
-    let notices = parked_notices(notices)?;
+    let (notices, pending) = parked_trailing(notices)?;
     let output = parked_output(results);
-    Ok((delta, output, notices))
+    Ok((delta, output, notices, pending))
 }
 
 pub(crate) fn parked_tail_output(
     input: &[Value],
     expected_call_id: &str,
-) -> Result<(String, String), &'static str> {
+) -> Result<(String, String, Vec<Value>), &'static str> {
     let mut cursor = input.len();
-    let mut notices = Vec::new();
-    while cursor > 0 {
-        let Some(notice) = parked_notice(&input[cursor - 1]) else {
-            break;
-        };
-        notices.push(notice);
+    while cursor > 0 && user_message(&input[cursor - 1]) {
         cursor -= 1;
     }
-    notices.reverse();
+    let (notices, pending) = parked_trailing(&input[cursor..])?;
 
     let output_end = cursor;
     while cursor > 0 && item_kind(&input[cursor - 1]) == "function_call_output" {
@@ -1298,7 +1293,7 @@ pub(crate) fn parked_tail_output(
         return Err("parked_tail");
     }
 
-    Ok((parked_output(outputs), notices.join("\n\n")))
+    Ok((parked_output(outputs), notices, pending))
 }
 
 fn parked_notice(item: &Value) -> Option<String> {
@@ -1310,12 +1305,29 @@ fn parked_notice(item: &Value) -> Option<String> {
         })
 }
 
-fn parked_notices(notices: &[Value]) -> Result<String, &'static str> {
-    notices
-        .iter()
-        .map(|item| parked_notice(item).ok_or("parked_tail"))
-        .collect::<Result<Vec<_>, _>>()
-        .map(|notices| notices.join("\n\n"))
+fn user_message(item: &Value) -> bool {
+    item_kind(item) == "message" && item.get("role").and_then(Value::as_str) == Some("user")
+}
+
+/// Split the user messages after a parked call's outputs into background
+/// notices (folded into the sidekick's result) and lead input: text typed
+/// mid-handoff, a pasted image, or the image message that follows an image
+/// tool result. Lead input is held for the lead instead of failing the
+/// match, which froze the parked session and re-billed every later turn on
+/// a fresh child. Anything that isn't a user message still fails.
+fn parked_trailing(items: &[Value]) -> Result<(String, Vec<Value>), &'static str> {
+    let mut notices = Vec::new();
+    let mut pending = Vec::new();
+    for item in items {
+        if let Some(notice) = parked_notice(item) {
+            notices.push(notice);
+        } else if user_message(item) {
+            pending.push(item.clone());
+        } else {
+            return Err("parked_tail");
+        }
+    }
+    Ok((notices.join("\n\n"), pending))
 }
 
 fn parked_output(results: &[Value]) -> String {
