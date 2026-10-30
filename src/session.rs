@@ -125,6 +125,13 @@ const KEEPALIVE_TEXT: &str = "[automated cache refresh, not from the user: reply
 const CANCEL_POLL: Duration = Duration::from_secs(1);
 /// Internal error when the relay client went away mid-turn.
 const CLIENT_GONE: &str = "client disconnected";
+/// An in-flight prompt with no wire traffic this long is a dead upstream
+/// stream: `devin acp` sits in `await_turn_completion` forever after its
+/// chat stream closes empty (observed: 135s+ silence until the user hit
+/// Esc). Failing it surfaces an error the host retries, not a silent hang.
+/// ponytail: one fixed window; per-model if a model thinks silently longer.
+const PROMPT_SILENCE: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 120 });
+const PROMPT_STALLED: &str = "Devin stream stalled: no output for 120s";
 /// A real prompt settling `end_turn` with zero output is the silent
 /// usage-limit rejection ACP agents can return instead of an error (the
 /// turn "succeeds" with an empty reply the host can't tell from a real
@@ -2551,6 +2558,7 @@ impl LiveSession {
         cancel: &AtomicBool,
     ) -> Result<WireEvent, String> {
         let until = (Instant::now() + window).min(deadline);
+        let mut heard = Instant::now();
         loop {
             if cancel.load(Ordering::Relaxed) {
                 return Err(CLIENT_GONE.to_string());
@@ -2564,6 +2572,7 @@ impl LiveSession {
             });
             match self.rx.recv_timeout(left.min(wait)) {
                 Ok(line) => {
+                    heard = Instant::now();
                     self.limit_polls = 0;
                     if line.get("method").is_some() && line.get("id").is_some() {
                         if matches!(self.on_request(&line)?, RequestDisposition::Parked) {
@@ -2587,6 +2596,13 @@ impl LiveSession {
                         if self.limit_polls >= 2 {
                             return Err(self.limit_error());
                         }
+                    }
+                    // A running sidekick tool is legitimately quiet.
+                    if self.prompt_in_flight
+                        && self.active_sidekick.is_none()
+                        && heard.elapsed() >= PROMPT_SILENCE
+                    {
+                        return Err(PROMPT_STALLED.to_string());
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
