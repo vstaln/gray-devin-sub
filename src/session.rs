@@ -125,6 +125,13 @@ const KEEPALIVE_TEXT: &str = "[automated cache refresh, not from the user: reply
 const CANCEL_POLL: Duration = Duration::from_secs(1);
 /// Internal error when the relay client went away mid-turn.
 const CLIENT_GONE: &str = "client disconnected";
+/// An in-flight prompt with no wire traffic this long is a dead upstream
+/// stream: `devin acp` sits in `await_turn_completion` forever after its
+/// chat stream closes empty (observed: 135s+ silence until the user hit
+/// Esc). Failing it surfaces an error the host retries, not a silent hang.
+/// ponytail: one fixed window; per-model if a model thinks silently longer.
+const PROMPT_SILENCE: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 120 });
+const PROMPT_STALLED: &str = "Devin stream stalled: no output for 120s";
 /// A real prompt settling `end_turn` with zero output is the silent
 /// usage-limit rejection ACP agents can return instead of an error (the
 /// turn "succeeds" with an empty reply the host can't tell from a real
@@ -1239,6 +1246,13 @@ pub(crate) fn is_usage_limit(err: &str) -> bool {
         || e.contains("429")
 }
 
+/// Whether an upstream error is a content refusal of the transcript itself;
+/// unlike a usage limit, no amount of waiting clears it.
+pub(crate) fn is_content_refusal(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("content policy") || e.contains("provider refusal") || e.contains("usage policy")
+}
+
 /// Whether a `devin acp` stderr line is an upstream usage/rate-limit
 /// refusal — the signature `map_rpc_error` and `is_usage_limit` share,
 /// watched live by the stderr reader so a parked turn fails fast.
@@ -1344,7 +1358,14 @@ fn keepalive_sweep() {
                 KEEPALIVE_COOLDOWN.as_secs()
             );
         }
-        if failed.is_none() || !s.prompt_in_flight {
+        // A content refusal re-fires on every keepalive (the refused
+        // transcript is what gets replayed), so the session can never be
+        // warmed again: close it instead of pinging it until the idle cap.
+        let refused = failed.as_deref().is_some_and(is_content_refusal);
+        if refused {
+            crate::chat::pool_event("keepalive:closed:refusal", &s.session_id);
+        }
+        if !refused && (failed.is_none() || !s.prompt_in_flight) {
             give_back(s);
         } else {
             locked_pool()
@@ -2537,6 +2558,7 @@ impl LiveSession {
         cancel: &AtomicBool,
     ) -> Result<WireEvent, String> {
         let until = (Instant::now() + window).min(deadline);
+        let mut heard = Instant::now();
         loop {
             if cancel.load(Ordering::Relaxed) {
                 return Err(CLIENT_GONE.to_string());
@@ -2550,6 +2572,7 @@ impl LiveSession {
             });
             match self.rx.recv_timeout(left.min(wait)) {
                 Ok(line) => {
+                    heard = Instant::now();
                     self.limit_polls = 0;
                     if line.get("method").is_some() && line.get("id").is_some() {
                         if matches!(self.on_request(&line)?, RequestDisposition::Parked) {
@@ -2573,6 +2596,13 @@ impl LiveSession {
                         if self.limit_polls >= 2 {
                             return Err(self.limit_error());
                         }
+                    }
+                    // A running sidekick tool is legitimately quiet.
+                    if self.prompt_in_flight
+                        && self.active_sidekick.is_none()
+                        && heard.elapsed() >= PROMPT_SILENCE
+                    {
+                        return Err(PROMPT_STALLED.to_string());
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {

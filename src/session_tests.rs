@@ -1273,3 +1273,42 @@ fn an_empty_stored_reply_is_not_replayed() {
     drop(pool);
     s.close();
 }
+
+#[test]
+fn content_refusals_are_told_apart_from_usage_limits() {
+    let refusal = "native request failed: Provider refusal: This request was refused by Anthropic's content policy.";
+    assert!(is_content_refusal(refusal));
+    assert!(!is_usage_limit(refusal));
+    assert!(is_content_refusal(
+        "Devin refused this request under its usage policy"
+    ));
+    assert!(!is_content_refusal(
+        "Devin usage limit reached: Your weekly usage quota has been exhausted."
+    ));
+}
+
+/// The hang being fixed: `devin acp` went silent mid-prompt and the relay
+/// waited the whole 600s turn budget with nothing on screen. Silence past
+/// `PROMPT_SILENCE` now fails the turn — unless a sidekick tool is running.
+#[test]
+fn a_silent_prompt_fails_instead_of_hanging() {
+    let (mut s, _tx) = wired_session();
+    s.prompt_in_flight = true;
+    let far = Instant::now() + Duration::from_secs(60);
+    let never = AtomicBool::new(false);
+    let started = Instant::now();
+    let e = s
+        .recv_response(Duration::from_secs(60), far, &never)
+        .err()
+        .unwrap();
+    assert_eq!(e, PROMPT_STALLED);
+    assert!(started.elapsed() < Duration::from_secs(10));
+
+    s.active_sidekick = Some("sk::1".to_string());
+    let e = s
+        .recv_response(Duration::from_secs(4), far, &never)
+        .err()
+        .unwrap();
+    assert_eq!(e, "Devin request timed out");
+    let _ = s.child.kill();
+}
