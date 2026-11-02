@@ -817,6 +817,31 @@ fn a_prompt_settling_in_the_grace_window_is_still_delivered() {
     let _ = s.child.wait();
 }
 
+/// The empty-reply bug: a wait that failed (here a limit trip) sends
+/// `session/cancel`, and the prompt settles `cancelled` in the grace
+/// window. That settle is the abort, not an answer — it must keep the
+/// failure, never reach the host as an empty "completed" reply.
+#[test]
+fn a_cancel_won_settle_keeps_the_failure() {
+    let (mut s, tx) = wired_session();
+    let id = s.send_prompt("[User]\nhi", &[], &[]).expect("send_prompt");
+    s.limit_flag.store(true, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(2500));
+        let _ = tx.send(json!({"jsonrpc": "2.0", "id": id,
+            "result": {"stopReason": "cancelled"}}));
+    });
+    let never = AtomicBool::new(false);
+    let e = s
+        .await_prompt(id, Instant::now() + Duration::from_secs(30), &never)
+        .err()
+        .expect("a cancelled settle is not a reply");
+    assert!(is_usage_limit(&e), "{e}");
+    assert!(!s.prompt_in_flight, "the prompt settled — still poolable");
+    let _ = s.child.kill();
+    let _ = s.child.wait();
+}
+
 /// A refusal is a settled prompt: the session state is known, so the
 /// failure leaves the session poolable for the host's retry.
 #[test]
@@ -1214,6 +1239,8 @@ fn limit_line_matches_only_the_refusal_signature() {
         "POST /v1/turns -> 429 Too Many Requests",
         "daily quota exhausted, retrying in 240s",
         "upstream rate limit exceeded",
+        "status 429: slow down",
+        "2026-11-02T12:56:51.741091Z  WARN chisel_core::translator: ACP: agent error (ResourceExhausted): Your weekly usage quota has been exhausted.",
     ] {
         assert!(limit_line(line), "{line}");
     }
@@ -1221,6 +1248,14 @@ fn limit_line_matches_only_the_refusal_signature() {
         "session/load ok",
         "prompt settled end_turn",
         "permission request id=9",
+        // devin acp's tracing log on stderr: 429 inside timestamps and
+        // timings tripped the limit flag mid-prompt (2026-11-02).
+        "2026-11-02T13:10:57.429113Z  INFO connect_post: close time.busy=729µs time.idle=1.78s",
+        "2026-11-02T13:10:55.112429Z  INFO chisel_agent::session_db: Saved 1 message nodes",
+        "2026-11-02T09:24:22.890638Z  INFO session_db: close time.busy=429µs time.idle=27.8µs",
+        "2026-11-02T04:44:16.286874Z  INFO chisel_server::acp: close time.busy=429ms time.idle=13.7s",
+        "trace 7f3a429bc0 db_bytes=14294290 node_429",
+        "2026-11-01T10:58:02.323855Z  INFO extend{head=StoredNodeId(434) from=Some(StoredNodeId(429))}: close",
     ] {
         assert!(!limit_line(line), "{line}");
     }

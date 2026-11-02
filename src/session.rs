@@ -1243,7 +1243,21 @@ pub(crate) fn is_usage_limit(err: &str) -> bool {
     e.contains("rate limit")
         || e.contains("usage limit")
         || e.contains("usage-limit")
-        || e.contains("429")
+        || has_status(&e, "429")
+}
+
+/// Whether `text` carries HTTP status `code` as a standalone number.
+/// `devin acp` writes its whole tracing log to stderr, and a bare
+/// substring match hits timestamps and timings (`13:10:57.429113Z`,
+/// `time.busy=429µs`) on ~0.5% of lines — enough to fail a healthy
+/// prompt as rate-limited every few turns. A status code is never glued
+/// to a digit, letter, `.` or `_`.
+pub(crate) fn has_status(text: &str, code: &str) -> bool {
+    let glued = |c: char| c.is_alphanumeric() || matches!(c, '.' | '_');
+    text.match_indices(code).any(|(at, m)| {
+        !text[..at].chars().next_back().is_some_and(glued)
+            && !text[at + m.len()..].chars().next().is_some_and(glued)
+    })
 }
 
 /// Whether an upstream error is a content refusal of the transcript itself;
@@ -1261,7 +1275,11 @@ fn limit_line(line: &str) -> bool {
     e.contains("rate limit")
         || e.contains("usage limit")
         || e.contains("quota")
-        || e.contains("429")
+        // A status code only counts off the chatty levels: INFO lines
+        // carry counters and ids (`StoredNodeId(429)`), refusals log at
+        // WARN/ERROR.
+        || (!e.contains(" info ") && !e.contains(" debug ") && !e.contains(" trace ")
+            && has_status(&e, "429"))
 }
 
 /// When keepalives resume after a usage-limit failure (`None` = not paused).
@@ -2697,6 +2715,17 @@ impl LiveSession {
                                 if let Some(err) = line.get("error") {
                                     return Err(map_rpc_error(err, &self.stderr_tail));
                                 }
+                                // Our cancel won: the settle is the abort,
+                                // not an answer. Delivering it would hand
+                                // the host an empty "completed" reply and
+                                // bury `e` (a limit, a stall) — the host
+                                // then fails on "empty responses" instead.
+                                // Only a vanished client takes the echo.
+                                let cancelled =
+                                    line.pointer("/result/stopReason") == Some(&json!("cancelled"));
+                                if cancelled && e != CLIENT_GONE {
+                                    return Err(e);
+                                }
                                 return Ok(PromptWait::Settled(
                                     line.get("result").cloned().unwrap_or(Value::Null),
                                     e == CLIENT_GONE,
@@ -2844,7 +2873,7 @@ fn map_rpc_error(err: &Value, stderr: &Arc<Mutex<VecDeque<String>>>) -> String {
     if low.contains("quota") || low.contains("reached free model rate limit") {
         return format!("Devin usage limit reached: {detail}");
     }
-    if low.contains("429") || low.contains("rate limit") {
+    if has_status(&low, "429") || low.contains("rate limit") {
         return format!("Devin rate limited: {detail}");
     }
     if low.contains("not logged in") || low.contains("authenticate") || low.contains("unauthorized")
