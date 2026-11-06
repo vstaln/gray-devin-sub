@@ -436,6 +436,9 @@ pub struct LiveSession {
     /// error) comes off the wire, which is what makes a failed turn's
     /// session poolable: its upstream state is then known.
     pub(crate) prompt_in_flight: bool,
+    /// Longest gap between wire messages while this prompt was in flight
+    /// (sidekick time excluded); logged on settle to size PROMPT_SILENCE.
+    pub(crate) prompt_quiet_max: Duration,
     // Per-prompt state, reset in `send_prompt`.
     text: String,
     /// A non-message `session/update` arrived since the last message chunk:
@@ -1538,6 +1541,7 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         last_prompt_at: None,
         keepalive_turns: 0,
         prompt_in_flight: false,
+        prompt_quiet_max: Duration::ZERO,
         text: String::new(),
         thought: String::new(),
         text_boundary: false,
@@ -1705,6 +1709,7 @@ impl LiveSession {
         )?;
         self.current_prompt_id = Some(id);
         self.prompt_in_flight = true;
+        self.prompt_quiet_max = Duration::ZERO;
         Ok(id)
     }
 
@@ -2622,6 +2627,9 @@ impl LiveSession {
             });
             match self.rx.recv_timeout(left.min(wait)) {
                 Ok(line) => {
+                    if self.prompt_in_flight && self.active_sidekick.is_none() {
+                        self.prompt_quiet_max = self.prompt_quiet_max.max(heard.elapsed());
+                    }
                     heard = Instant::now();
                     self.limit_polls = 0;
                     if line.get("method").is_some() && line.get("id").is_some() {
@@ -2652,6 +2660,7 @@ impl LiveSession {
                         && self.active_sidekick.is_none()
                         && heard.elapsed() >= PROMPT_SILENCE
                     {
+                        crate::chat::pool_event("prompt_stalled", &self.session_id);
                         return Err(PROMPT_STALLED.to_string());
                     }
                 }
@@ -2775,6 +2784,10 @@ impl LiveSession {
                 self.prompt_in_flight = false;
                 self.current_prompt_id = None;
                 self.last_prompt_at = Some(Instant::now());
+                crate::chat::pool_event(
+                    &format!("prompt_quiet max_ms={}", self.prompt_quiet_max.as_millis()),
+                    &self.session_id,
+                );
                 if let Some(err) = line.get("error") {
                     return Err(map_rpc_error(err, &self.stderr_tail));
                 }

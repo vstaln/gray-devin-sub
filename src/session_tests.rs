@@ -126,6 +126,7 @@ fn stub_session() -> LiveSession {
         last_prompt_at: None,
         keepalive_turns: 0,
         prompt_in_flight: false,
+        prompt_quiet_max: Duration::ZERO,
         text: String::new(),
         text_boundary: false,
         thought: String::new(),
