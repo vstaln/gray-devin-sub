@@ -333,7 +333,10 @@ fn take_waits_for_a_checked_out_session() {
     let started = Instant::now();
     let (claimed, reason) = take(&other, &never);
     assert!(claimed.is_none());
-    assert_eq!(reason, "no_session");
+    // The miss reason names the nearest pooled session, and parallel
+    // tests share the pool (often "model"), so only "it did not wait
+    // for the other conversation's session" is asserted.
+    assert_ne!(reason, "keepalive_busy");
     assert!(started.elapsed() < Duration::from_millis(250));
 
     // Same conversation, still checked out: the request waits for
@@ -1370,4 +1373,28 @@ fn native_noop_is_dropped_and_real_calls_still_redirect() {
     );
     s.on_notification(&call("d", "true && ls"));
     assert_eq!(s.redirected.len(), 1);
+}
+
+/// A stall is only resent when nothing of the prompt reached the host:
+/// any text, thought, tool call or dropped no-op means the retry could
+/// repeat something already seen, so the turn fails as before.
+#[test]
+fn only_a_stall_with_no_output_counts_as_clean() {
+    let (mut s, _tx) = wired_session();
+    assert!(s.produced_nothing());
+    s.text.push_str("partial");
+    assert!(!s.produced_nothing());
+    s.text.clear();
+    s.thought.push_str("hmm");
+    assert!(!s.produced_nothing());
+    s.thought.clear();
+    s.seen_calls.insert("call-1".into());
+    assert!(!s.produced_nothing());
+    s.seen_calls.clear();
+    s.batch_flushed = true;
+    assert!(!s.produced_nothing());
+    s.batch_flushed = false;
+    s.noop_call = true;
+    assert!(!s.produced_nothing());
+    let _ = s.child.kill();
 }

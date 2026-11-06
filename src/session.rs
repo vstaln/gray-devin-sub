@@ -131,7 +131,7 @@ const CLIENT_GONE: &str = "client disconnected";
 /// Esc). Failing it surfaces an error the host retries, not a silent hang.
 /// ponytail: one fixed window; per-model if a model thinks silently longer.
 const PROMPT_SILENCE: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 120 });
-const PROMPT_STALLED: &str = "Devin stream stalled: no output for 120s";
+pub(crate) const PROMPT_STALLED: &str = "Devin stream stalled: no output for 120s";
 /// A real prompt settling `end_turn` with zero output is the silent
 /// usage-limit rejection ACP agents can return instead of an error (the
 /// turn "succeeds" with an empty reply the host can't tell from a real
@@ -2672,6 +2672,19 @@ impl LiveSession {
                 self.flush_batch();
             }
         }
+    }
+
+    /// Nothing of the in-flight prompt reached us: no text, thought, tool
+    /// call, permission request or flushed batch. Sending it again can't
+    /// repeat any effect the host saw.
+    pub(crate) fn produced_nothing(&self) -> bool {
+        self.text.is_empty()
+            && self.thought.is_empty()
+            && self.redirected.is_empty()
+            && self.seen_calls.is_empty()
+            && self.pending_perms.is_empty()
+            && !self.batch_flushed
+            && !self.noop_call
     }
 
     /// The error a limit-flagged in-flight prompt fails with: the

@@ -29,7 +29,7 @@
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -1541,11 +1541,36 @@ pub fn run_turn(
     cancel: &Arc<AtomicBool>,
     timeout: Duration,
 ) -> Result<TurnResult, String> {
-    let r = run_turn_inner(turn, cancel, timeout);
+    let started = Instant::now();
+    let mut r = run_turn_inner(turn, cancel, timeout);
+    // A prompt that stalled before producing anything is sent once more:
+    // the reuse path abandoned its child but kept the upstream session, so
+    // the retry reloads it (`session/load`) instead of re-billing; a
+    // stalled fresh session respawns. Either way the host never sees it.
+    if matches!(&r, Err(e) if e == STALL_RETRY) {
+        pool_event("stall_retry", "-");
+        let left = timeout.saturating_sub(started.elapsed());
+        r = if cancel.load(Ordering::SeqCst) || left.is_zero() {
+            Err(session::PROMPT_STALLED.to_string())
+        } else {
+            run_turn_inner(turn, cancel, left)
+        };
+        if matches!(&r, Err(e) if e == STALL_RETRY) {
+            r = Err(session::PROMPT_STALLED.to_string());
+        }
+    }
     // Account-scoped failures bench the serving account (a success
     // clears a stale bench); request-scoped ones leave it alone.
     crate::accounts::observe(turn.account.as_ref(), &r);
     r
+}
+
+/// `run_turn_inner`'s signal that a prompt stalled before producing
+/// anything; `run_turn` retries once and never returns it.
+const STALL_RETRY: &str = "devin-sub:stall_retry";
+
+fn stalled_clean(s: &session::LiveSession, e: &str) -> bool {
+    e == session::PROMPT_STALLED && s.produced_nothing() && !s.is_parked()
 }
 
 fn run_turn_inner(
@@ -1678,6 +1703,11 @@ fn run_turn_inner(
                             s.close();
                             reason = "rewarm_dead";
                             spawn_fresh(reason)?
+                        } else if s.prompt_in_flight && stalled_clean(&s, &e) {
+                            // Keep the upstream session (and its record)
+                            // so the retry can `session/load` it.
+                            s.abandon();
+                            return Err(STALL_RETRY.into());
                         } else if s.prompt_in_flight {
                             // The prompt may still be live upstream
                             // (dead wire, unsettled cancel): the
@@ -1746,7 +1776,11 @@ fn run_turn_inner(
         Err(e) => {
             trace_turn(&mode, &s.session_id, chars, None, Some(&e), None);
             if s.prompt_in_flight {
+                let retry = stalled_clean(&s, &e);
                 s.close();
+                if retry {
+                    return Err(STALL_RETRY.into());
+                }
             } else {
                 // The failed prompt settled upstream: record the input as
                 // absorbed with no reply on record — an identical retry
