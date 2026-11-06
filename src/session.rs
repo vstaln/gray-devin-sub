@@ -73,7 +73,7 @@ use serde_json::{Value, json};
 
 use crate::chat::{
     CUT_NOTE, PreparedTurn, TurnResult, Usage, batch_cut_note, blocked_call, continuation,
-    parse_calls_block, rand_hex, redirect_call, salvage_calls, usage_from,
+    is_noop_call, parse_calls_block, rand_hex, redirect_call, salvage_calls, usage_from,
 };
 use crate::guard::{TurnGuard, marker_name, strip_reasoning};
 use crate::setup;
@@ -146,6 +146,9 @@ const EMPTY_END_TURN: &str = "Devin usage limit reached: devin acp returned an e
 /// no text and no call (seen right after a sidekick result): the host would
 /// otherwise get an empty response and retry on a cold child.
 const EMPTY_REPLY_NUDGE: &str = "[Harness note] Your previous reply reached the harness empty: no text and no gray_calls block, so nothing was delivered. Reply now: answer the user, or issue the next gray_calls block.";
+/// Sent once when a prompt's only native call was a no-op (`true`, `:`,
+/// empty) that got dropped: ask for a real gray_calls block or a plain answer.
+const NOOP_CALL_NUDGE: &str = "[Harness note] Your native no-op call (`true`, `:` or an empty command) was dropped; nothing ran. Native calls cannot reach harness tools. If you meant to call a harness tool, end this reply with a gray_calls block; otherwise finish your answer in plain text with no tool call.";
 /// Heads the follow-up prompt that hands the lead what the user sent while
 /// its sidekick held the turn.
 const PENDING_LEAD_NOTE: &str =
@@ -442,6 +445,8 @@ pub struct LiveSession {
     thought: String,
     /// Native tool_call notifications redirected onto bash (name, args-json).
     redirected: Vec<(String, String)>,
+    /// A native no-op this prompt was dropped instead of redirected.
+    noop_call: bool,
     dropped_siblings: usize,
     prior_dropped: usize,
     seen_calls: HashSet<String>,
@@ -1537,6 +1542,7 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         thought: String::new(),
         text_boundary: false,
         redirected: Vec::new(),
+        noop_call: false,
         dropped_siblings: 0,
         prior_dropped: 0,
         seen_calls: HashSet::new(),
@@ -1676,6 +1682,7 @@ impl LiveSession {
         self.text_boundary = false;
         self.thought.clear();
         self.redirected.clear();
+        self.noop_call = false;
         self.dropped_siblings = 0;
         self.seen_calls.clear();
         self.sidekick_calls.clear();
@@ -1763,10 +1770,31 @@ impl LiveSession {
             && self.text.trim().is_empty()
             && self.thought.trim().is_empty()
             && self.redirected.is_empty()
+            && !self.noop_call
         {
             return Err(self.limit_detail(EMPTY_END_TURN.to_string()));
         }
         let mut r = self.finish(stop_reason);
+        // Models on the native tool path reach for `exec true` when they
+        // want a harness tool the native surface can't express. Running it
+        // burns a round and teaches nothing, so ask once for the real thing.
+        if !nudged && !unseen && !self.keepalive_prompt && self.noop_call && r.calls.is_empty() {
+            crate::chat::pool_event("noop_call_nudge", &self.session_id);
+            let said = std::mem::take(&mut r.text);
+            let names = self.names.clone();
+            let next = self.send_prompt(NOOP_CALL_NUDGE, &[], &names)?;
+            return Ok(match self.settle_prompt(next, deadline, cancel, true)? {
+                AwaitPrompt::Complete(mut r) => {
+                    r.text = [said, r.text]
+                        .into_iter()
+                        .filter(|t| !t.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    AwaitPrompt::Complete(r)
+                }
+                parked => parked,
+            });
+        }
         if !nudged
             && !unseen
             && !self.keepalive_prompt
@@ -2473,7 +2501,11 @@ impl LiveSession {
                         Some(call) => call,
                         None => blocked_call(update, &self.names),
                     };
-                    self.redirected.push(call);
+                    if is_noop_call(&call) {
+                        self.noop_call = true;
+                    } else {
+                        self.redirected.push(call);
+                    }
                     self.batch_quiet = Some(Instant::now() + BATCH_QUIET);
                 }
             }

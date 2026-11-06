@@ -130,6 +130,7 @@ fn stub_session() -> LiveSession {
         text_boundary: false,
         thought: String::new(),
         redirected: Vec::new(),
+        noop_call: false,
         dropped_siblings: 0,
         prior_dropped: 0,
         seen_calls: std::collections::HashSet::new(),
@@ -1346,4 +1347,26 @@ fn a_silent_prompt_fails_instead_of_hanging() {
         .unwrap();
     assert_eq!(e, "Devin request timed out");
     let _ = s.child.kill();
+}
+
+#[test]
+fn native_noop_is_dropped_and_real_calls_still_redirect() {
+    let mut s = stub_session();
+    s.names = vec!["bash".to_string()];
+    let call = |id: &str, cmd: &str| {
+        json!({"method": "session/update", "params": {"update": {
+            "sessionUpdate": "tool_call", "toolCallId": id, "kind": "execute",
+            "rawInput": {"command": cmd}}}})
+    };
+    for (id, cmd) in [("a", "true"), ("b", " : "), ("c", "")] {
+        s.on_notification(&call(id, cmd));
+    }
+    assert!(s.noop_call);
+    assert!(s.redirected.is_empty());
+    assert!(
+        s.batch_quiet.is_some(),
+        "a dropped no-op must still cancel upstream"
+    );
+    s.on_notification(&call("d", "true && ls"));
+    assert_eq!(s.redirected.len(), 1);
 }

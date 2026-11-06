@@ -1050,6 +1050,17 @@ fn write_redirect(input: &Value) -> Option<String> {
     )
 }
 
+/// A redirected `bash` call that can't do anything: `true`, `:` or nothing.
+pub(crate) fn is_noop_call(call: &(String, String)) -> bool {
+    call.0 == "bash"
+        && serde_json::from_str::<Value>(&call.1).is_ok_and(|args| {
+            matches!(
+                args["command"].as_str().map(str::trim),
+                Some("" | "true" | ":")
+            )
+        })
+}
+
 /// The call a native `tool_call` becomes when [`redirect_call`] can't map
 /// it: when `bash` is on the surface it lands on an echo that explains
 /// itself — "X is a disabled built-in tool — nothing ran" — so the turn
