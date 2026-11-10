@@ -125,6 +125,7 @@ const KEEPALIVE_TEXT: &str = "[automated cache refresh, not from the user: reply
 const CANCEL_POLL: Duration = Duration::from_secs(1);
 /// Internal error when the relay client went away mid-turn.
 const CLIENT_GONE: &str = "client disconnected";
+pub(crate) const MODEL_UNAVAILABLE: &str = "Devin account cannot run model";
 /// An in-flight prompt with no wire traffic this long is a dead upstream
 /// stream: `devin acp` sits in `await_turn_completion` forever after its
 /// chat stream closes empty (observed: 135s+ silence until the user hit
@@ -238,24 +239,11 @@ enum FindResult {
 struct AcpStage {
     work: std::path::PathBuf,
     cfg: std::path::PathBuf,
+    deny_search: bool,
     _tmp: Option<tempfile::TempDir>,
 }
 
 static STAGE: [OnceLock<AcpStage>; 2] = [OnceLock::new(), OnceLock::new()];
-
-/// Child config for every non-Fusion model: native subagents disabled.
-const PLAIN_CONFIG: &str = "config.json";
-/// Child config for `fusion-*` models: the sidekick needs native subagents.
-const FUSION_CONFIG: &str = "config-fusion.json";
-
-/// The staged `--config` file a child on `native_model` runs with.
-pub(crate) fn config_file(native_model: &str) -> &'static str {
-    if native_model.starts_with("fusion-") {
-        FUSION_CONFIG
-    } else {
-        PLAIN_CONFIG
-    }
-}
 
 impl AcpStage {
     fn make(deny_search: bool) -> Result<Self, String> {
@@ -301,39 +289,10 @@ impl AcpStage {
                 .as_bytes(),
         )
         .map_err(|e| format!("staging config: {e}"))?;
-        // User config: no MCP servers, rules, skills, auto-update
-        // or notifications — but credentials still load. Two variants
-        // share this stage (same cwd, so the same cached prefix per
-        // model): native subagents are OFF for plain models — a
-        // `run_subagent` child runs inside this ACP session, its tool
-        // calls leak into the parent's funnel as redirects and every
-        // permission it needs is cancelled, so it can never do work
-        // (observed: four QA subagents all blocked, then the model
-        // rewrote the user's own ~/.config/devin allowlist trying to
-        // unblock them). Fusion keeps them: its sidekick IS a native
-        // persistent subagent.
-        for (file, subagents) in [(PLAIN_CONFIG, false), (FUSION_CONFIG, true)] {
-            write_atomic(
-                &cfg.join(file),
-                json!({
-                    "version": 1,
-                    "subagents_enabled": subagents,
-                    "auto_update": false,
-                    "notify": "never",
-                    "read_config_from": {
-                        "agents_standard": false, "cursor": false, "windsurf": false,
-                        "claude": false, "copilot": false, "opencode": false, "zed": false,
-                    },
-                    "permissions": {"deny": deny, "allow": [], "ask": ASK_RULES},
-                })
-                .to_string()
-                .as_bytes(),
-            )
-            .map_err(|e| format!("staging config: {e}"))?;
-        }
         Ok(Self {
             work,
             cfg,
+            deny_search,
             _tmp: tmp,
         })
     }
@@ -363,6 +322,85 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     done
+}
+
+fn runtime_config(stage: &AcpStage, turn: &PreparedTurn) -> Result<PathBuf, String> {
+    let mut deny: Vec<&str> = DENY_RULES.to_vec();
+    if stage.deny_search {
+        deny.push(DENY_SEARCH_RULE);
+    }
+    let home = turn.account.as_ref().map(|a| a.home.as_path());
+    let context = crate::catalog::entries_in(home)
+        .ok()
+        .and_then(|entries| {
+            entries
+                .into_iter()
+                .find(|e| e.id == turn.native_model)
+                .and_then(|e| e.context)
+        })
+        .unwrap_or(262_144);
+    let safe: String = turn
+        .native_model
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = stage.cfg.join(format!("runtime-{safe}.json"));
+    write_atomic(
+        &path,
+        json!({
+            "version": 1,
+            "subagents_enabled": turn.native_model.starts_with("fusion-"),
+            "auto_update": false,
+            "notify": "never",
+            "agent": {"compaction_threshold_tokens": context.saturating_sub(12_000)},
+            "read_config_from": {
+                "agents_standard": false, "cursor": false, "windsurf": false,
+                "claude": false, "copilot": false, "opencode": false, "zed": false,
+                "cloud": false,
+            },
+            "permissions": {"deny": deny, "allow": [], "ask": ASK_RULES},
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .map_err(|e| format!("staging config: {e}"))?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn xdg_config_farm(cfg: &Path) -> Option<PathBuf> {
+    let real = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    if !real.is_dir() {
+        return None;
+    }
+    let real = std::fs::canonicalize(&real).unwrap_or(real);
+    let farm = cfg.join("xdg-config");
+    std::fs::create_dir_all(&farm).ok()?;
+    if let Ok(entries) = std::fs::read_dir(&real) {
+        for entry in entries.flatten() {
+            if entry.file_name() == "devin" {
+                continue;
+            }
+            let link = farm.join(entry.file_name());
+            if std::fs::symlink_metadata(&link).is_err() {
+                let _ = std::os::unix::fs::symlink(entry.path(), &link);
+            }
+        }
+    }
+    Some(farm)
+}
+
+#[cfg(not(unix))]
+fn xdg_config_farm(_: &Path) -> Option<PathBuf> {
+    None
 }
 
 /// The stage for this surface variant — pooled children group by whether
@@ -1449,30 +1487,31 @@ pub fn spawn(
 /// an empty replay state; no ACP traffic yet (`handshake` or `load` next).
 fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, String> {
     let binary = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
-    let mut child = Command::new(&binary)
-        .args([
-            "--config",
-            &stage
-                .cfg
-                .join(config_file(&turn.native_model))
-                .to_string_lossy(),
-            "acp",
-            "--model",
-            &turn.native_model,
-        ])
-        .current_dir(&stage.work)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .envs(setup::child_env_for(
-            turn.account.as_ref().map(|a| a.home.as_path()),
-        ))
-        // A turn must never pop a browser out of a stale login.
-        .env("BROWSER", "/bin/true")
-        .env("DISPLAY", "")
-        .env("WAYLAND_DISPLAY", "")
-        .spawn()
-        .map_err(|_| setup::INSTALL_HINT.to_string())?;
+    let config = runtime_config(stage, turn)?;
+    let xdg = xdg_config_farm(&stage.cfg);
+    let mut cmd = Command::new(&binary);
+    cmd.args([
+        "--config",
+        &config.to_string_lossy(),
+        "acp",
+        "--model",
+        &turn.native_model,
+    ])
+    .current_dir(&stage.work)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .envs(setup::child_env_for(
+        turn.account.as_ref().map(|a| a.home.as_path()),
+    ))
+    // A turn must never pop a browser out of a stale login.
+    .env("BROWSER", "/bin/true")
+    .env("DISPLAY", "")
+    .env("WAYLAND_DISPLAY", "");
+    if let Some(farm) = xdg {
+        cmd.env("XDG_CONFIG_HOME", farm);
+    }
+    let mut child = cmd.spawn().map_err(|_| setup::INSTALL_HINT.to_string())?;
 
     // stderr → last ~20 lines, redacted, for error detail only.
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -1581,6 +1620,47 @@ impl LiveSession {
             "terminal": fusion})
     }
 
+    fn check_model(&self, result: &Value) -> Result<(), String> {
+        if self.native_model.starts_with("fusion-") {
+            return Ok(());
+        }
+        let model_opt = result
+            .get("configOptions")
+            .and_then(Value::as_array)
+            .and_then(|opts| {
+                opts.iter()
+                    .find(|o| o.get("id").and_then(Value::as_str) == Some("model"))
+            });
+        let Some(model_opt) = model_opt else {
+            return Ok(());
+        };
+        let values: Vec<&str> = model_opt
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|opts| {
+                opts.iter()
+                    .filter_map(|o| o.get("value").and_then(Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if values.is_empty() {
+            return Ok(());
+        }
+        let requested = self.native_model.as_str();
+        if values.contains(&requested) || values.iter().any(|v| v.starts_with(requested)) {
+            return Ok(());
+        }
+        let current = model_opt
+            .get("currentValue")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        Err(format!(
+            "{} '{requested}' — it resolved to '{current}'. Selectable on this account: {}.",
+            MODEL_UNAVAILABLE,
+            values.join(", ")
+        ))
+    }
+
     /// initialize → session/new; leaves the session ready for prompts.
     fn handshake(
         &mut self,
@@ -1604,6 +1684,7 @@ impl LiveSession {
             deadline,
             cancel,
         )?;
+        self.check_model(&new)?;
         self.session_id = new
             .get("sessionId")
             .and_then(Value::as_str)
@@ -1640,7 +1721,8 @@ impl LiveSession {
             cancel,
         );
         self.loading = false;
-        loaded?;
+        let loaded = loaded?;
+        self.check_model(&loaded)?;
         self.session_id = session_id.to_string();
         Ok(())
     }

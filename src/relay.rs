@@ -347,6 +347,8 @@ fn run_turn(
 fn failure_kind(detail: &str) -> (u16, &'static str, &'static str) {
     if crate::session::is_usage_limit(detail) {
         (429, "rate_limit_error", "rate_limit_exceeded")
+    } else if detail.contains(crate::session::MODEL_UNAVAILABLE) {
+        (400, "invalid_request_error", "invalid_request_error")
     } else {
         (500, "server_error", "server_error")
     }
