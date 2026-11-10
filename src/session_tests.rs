@@ -5,14 +5,24 @@ use serde_json::json;
 fn web_search_is_denied_only_off_the_advertised_surface() {
     // deny_search=true: the child config kills native web_search — the
     // model gets Devin's own denial, not a funnel-made native__ name.
+    let turn = crate::chat::PreparedTurn {
+        system: String::new(),
+        content_line: String::new(),
+        input: vec![],
+        names: vec![],
+        native_model: "swe-2-flash-medium".to_string(),
+        gray_session: String::new(),
+        account: None,
+    };
     let stage = AcpStage::make(true).unwrap();
     let proj: Value = serde_json::from_str(
         &std::fs::read_to_string(stage.work.join(".devin/config.json")).unwrap(),
     )
     .unwrap();
-    let user: Value =
-        serde_json::from_str(&std::fs::read_to_string(stage.cfg.join("config.json")).unwrap())
-            .unwrap();
+    let user: Value = serde_json::from_str(
+        &std::fs::read_to_string(runtime_config(&stage, &turn).unwrap()).unwrap(),
+    )
+    .unwrap();
     let deny = proj["permissions"]["deny"].as_array().unwrap();
     assert!(deny.iter().any(|r| r == "web_search"));
     let deny = user["permissions"]["deny"].as_array().unwrap();
@@ -25,7 +35,13 @@ fn web_search_is_denied_only_off_the_advertised_surface() {
         &std::fs::read_to_string(stage.work.join(".devin/config.json")).unwrap(),
     )
     .unwrap();
+    let user: Value = serde_json::from_str(
+        &std::fs::read_to_string(runtime_config(&stage, &turn).unwrap()).unwrap(),
+    )
+    .unwrap();
     let deny = proj["permissions"]["deny"].as_array().unwrap();
+    assert!(!deny.iter().any(|r| r == "web_search"));
+    let deny = user["permissions"]["deny"].as_array().unwrap();
     assert!(!deny.iter().any(|r| r == "web_search"));
     let ask = proj["permissions"]["ask"].as_array().unwrap();
     assert!(ask.iter().any(|r| r == "exec"));
