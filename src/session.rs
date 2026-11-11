@@ -1405,9 +1405,9 @@ fn keepalive_sweep() {
         // Only a prompt left in flight closes the child.
         let failed = s.keepalive().err();
         if let Some(e) = failed.as_deref()
-            && let Some(ttl) = crate::accounts::classify(e)
+            && let Some(bench) = crate::accounts::classify(e)
         {
-            crate::accounts::cool(&s.account, ttl, e);
+            crate::accounts::cool(&s.account, bench, e);
         }
         if let Some(e) = failed.as_deref().filter(|e| is_usage_limit(e)) {
             *KEEPALIVE_PAUSED_UNTIL

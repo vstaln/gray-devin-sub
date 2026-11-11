@@ -1881,10 +1881,13 @@ fn append_pool_log(line: &str) {
     };
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("pool.log");
-    if std::fs::metadata(&path).is_ok_and(|m| m.len() > POOL_LOG_MAX) {
-        let _ = std::fs::rename(&path, dir.join("pool.log.1"));
-    }
-    append_private(&path, &format!("pid={}\t{line}", std::process::id()));
+    let entry = format!("pid={}\t{line}", std::process::id());
+    let _ = crate::accounts::with_lock(&path, || {
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > POOL_LOG_MAX) {
+            let _ = std::fs::rename(&path, dir.join("pool.log.1"));
+        }
+        append_private(&path, &entry);
+    });
 }
 
 /// Append to a 0600 file, creating it.
