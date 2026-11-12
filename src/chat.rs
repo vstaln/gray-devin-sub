@@ -1668,7 +1668,7 @@ fn run_turn_inner(
                             delta.chars().count(),
                             Some(&r),
                             None,
-                            None,
+                            Some(&s.usage_trail),
                         );
                         session::give_back(s);
                         return Ok(r);

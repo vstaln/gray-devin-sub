@@ -502,6 +502,8 @@ pub struct LiveSession {
     prior_cut: bool,
     /// Last `usage_update` snapshot for the in-flight prompt.
     usage: Usage,
+    /// Every usage report for the in-flight prompt as `in/cached`, logged on a cold reuse.
+    pub(crate) usage_trail: String,
     names: Vec<String>,
     sidekick_calls: HashMap<String, String>,
     active_sidekick: Option<String>,
@@ -1602,6 +1604,7 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         guard: TurnGuard::default(),
         prior_cut: false,
         usage: Usage::default(),
+        usage_trail: String::new(),
         names: turn.names.clone(),
         keepalive_prompt: false,
         loading: false,
@@ -1781,6 +1784,7 @@ impl LiveSession {
         self.limit_flag.store(false, Ordering::SeqCst);
         self.guard = TurnGuard::default();
         self.usage = Usage::default();
+        self.usage_trail.clear();
         self.names = names.to_vec();
         self.keepalive_prompt = text == KEEPALIVE_TEXT;
         let mut prompt = vec![json!({"type": "text", "text": text})];
@@ -1836,6 +1840,7 @@ impl LiveSession {
         // `result.usage` wins when present and non-zero; a cancelled turn
         // carries none, so the last usage_update snapshot stands in.
         if let Some(u) = result.get("usage").and_then(usage_from) {
+            self.usage_trail += &format!("r{}/{} ", u.input_tokens, u.cached_tokens);
             self.usage = u;
         }
         let stop_reason = result
@@ -2614,6 +2619,7 @@ impl LiveSession {
                 // Keep the LAST snapshot: a later update carries the final
                 // counters for this prompt.
                 if let Some(u) = usage_from(update) {
+                    self.usage_trail += &format!("{}/{} ", u.input_tokens, u.cached_tokens);
                     self.usage = u;
                 }
             }
