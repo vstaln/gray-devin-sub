@@ -1131,7 +1131,16 @@ fn cmd_usage(args: &[String], json: bool) -> Result<String, String> {
                 let tx = tx.clone();
                 std::thread::spawn(move || {
                     let outcome = match probe {
-                        Target::Ambient => crate::usage::handle_in(None),
+                        Target::Ambient => crate::usage::handle_in(None).map(|mut card| {
+                            let (_, out) = crate::setup::auth_status_output_in(None);
+                            if let Some(email) = out
+                                .as_deref()
+                                .and_then(|o| crate::status::field(o, "Email"))
+                            {
+                                card["email"] = serde_json::json!(email);
+                            }
+                            card
+                        }),
                         Target::Home(home) => crate::usage::handle_in(Some(home.as_path())),
                     }
                     .map_err(|e| e.to_string());
