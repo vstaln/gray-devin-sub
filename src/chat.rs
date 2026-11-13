@@ -392,7 +392,18 @@ const SUBAGENT_HINT_PREFIXES: [&str; 2] = [
     "Subagents are managed through Bash: ",
 ];
 
+const HARNESS_BLOCK_PREFIXES: [&str; 2] = ["comms: ", "Skills: "];
+
+fn is_harness_block(text: &str) -> bool {
+    text.strip_prefix("[Context update]\n")
+        .and_then(|body| body.lines().next())
+        .is_some_and(|first| HARNESS_BLOCK_PREFIXES.iter().any(|p| first.starts_with(p)))
+}
+
 fn strip_subagent_hint_text(text: &str) -> Option<String> {
+    if is_harness_block(text) {
+        return None;
+    }
     if !text
         .lines()
         .any(|line| SUBAGENT_HINT_PREFIXES.iter().any(|p| line.starts_with(p)))
