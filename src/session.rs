@@ -88,20 +88,19 @@ const REWARM_MAX: usize = 8;
 pub const IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 /// How often the keepalive sweep checks pooled sessions for stale
 /// upstream contact.
-const KEEPALIVE_SWEEP: Duration = Duration::from_secs(30);
+const KEEPALIVE_SWEEP: Duration = Duration::from_secs(15);
 /// Fire a keepalive once the last `session/prompt` this session settled
-/// is this old — under Devin's ~5min per-session prompt cache TTL with a
-/// full sweep + settle window of slack: a slow or once-failed keepalive
-/// still re-warms inside the TTL instead of billing a cold turn.
-const KEEPALIVE_AFTER: Duration = Duration::from_secs(3 * 60);
-const KEEPALIVE_TOO_LATE: Duration = Duration::from_secs(4 * 60 + 40);
+/// is this old — Devin's prefix cache measured warm 85% at 60-80s idle,
+/// 44% at 80-120s and 7% past 120s, so the sweep must land before ~80s.
+const KEEPALIVE_AFTER: Duration = Duration::from_secs(55);
+const KEEPALIVE_TOO_LATE: Duration = Duration::from_secs(100);
 /// Keep warming only while the user is plausibly mid-break. The tradeoff
 /// is arithmetic: each keepalive is a billed upstream prompt, and past
-/// ~30min idle the odds of a return in the next TTL window are too low
-/// to keep paying them (pi uses the same horizon). `IDLE_TTL` still
+/// ~10min idle the keepalives (one cache read per minute) outcost the
+/// single cold prefill they would save. `IDLE_TTL` still
 /// governs the pool: a session past this cap stays pooled and a return
 /// turn just re-warms on contact.
-const KEEPALIVE_IDLE_MAX: Duration = Duration::from_secs(30 * 60);
+const KEEPALIVE_IDLE_MAX: Duration = Duration::from_secs(10 * 60);
 /// How long after its last upstream prompt a persisted session of a dead
 /// sidecar is still worth reattaching. Past the ~5min cache TTL a
 /// `session/load` cold-prefills like `session/new`, but it still sends

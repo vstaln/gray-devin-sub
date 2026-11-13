@@ -87,10 +87,10 @@ pub fn provider() -> ProviderDecl {
                 tool_choice: Some("auto".to_string()),
                 parallel_tool_calls: Some(true),
                 text_verbosity: Some("low".to_string()),
-                // Devin's per-ACP-session prompt cache runs ~5min
+                // Devin's per-ACP-session prompt cache runs ~90s
                 // (measured; see session.rs) — tell the host's warmth
                 // timer and cold-cache notices the real lifetime.
-                cache_ttl_secs: Some(300),
+                cache_ttl_secs: Some(90),
             },
             headers: vec![ProviderHeaderDecl {
                 name: "session-id".to_string(),
