@@ -65,6 +65,24 @@ fn latest_cache_for(home: Option<&std::path::Path>) -> Option<(PathBuf, u64)> {
     best
 }
 
+enum CacheState {
+    Fresh(PathBuf),
+    Stale(PathBuf),
+    Missing,
+}
+
+fn cache_state(home: Option<&std::path::Path>) -> CacheState {
+    match latest_cache_for(home) {
+        None => CacheState::Missing,
+        Some((path, mtime))
+            if crate::setup::unix_secs().saturating_sub(mtime) <= REFRESH_AFTER.as_secs() =>
+        {
+            CacheState::Fresh(path)
+        }
+        Some((path, _)) => CacheState::Stale(path),
+    }
+}
+
 /// `provider/usage` entry point.
 pub fn handle() -> Result<Value, ProviderRpcError> {
     handle_in(None)
@@ -74,18 +92,17 @@ pub fn handle() -> Result<Value, ProviderRpcError> {
 /// `XDG_CACHE_HOME` (`<home>/cache`) decides which `user_status` cache
 /// this reads and which login the refresh probes.
 pub fn handle_in(home: Option<&std::path::Path>) -> Result<Value, ProviderRpcError> {
-    let Some((_, mtime)) = latest_cache_for(home) else {
-        return Err(ProviderRpcError::Unavailable(
-            "no Devin CLI user-status cache; run `devin auth status` once".into(),
-        ));
-    };
-    if crate::setup::unix_secs().saturating_sub(mtime) > REFRESH_AFTER.as_secs() {
-        refresh(home);
-    }
-    let Some((path, _)) = latest_cache_for(home) else {
-        return Err(ProviderRpcError::Unavailable(
-            "user-status cache vanished".into(),
-        ));
+    let path = match cache_state(home) {
+        CacheState::Fresh(path) => path,
+        CacheState::Stale(path) => {
+            refresh(home);
+            latest_cache_for(home).map_or(path, |(p, _)| p)
+        }
+        CacheState::Missing => {
+            return Err(ProviderRpcError::Unavailable(
+                "no Devin CLI user-status cache; run `devin auth status` once".into(),
+            ));
+        }
     };
     let payload = read_payload(&path)
         .ok_or_else(|| ProviderRpcError::Unavailable("unreadable user-status cache".into()))?;

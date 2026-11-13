@@ -48,7 +48,7 @@ struct Response {
 fn cli_help() -> String {
     "devin-sub — Devin subscription provider for gray\n\
      usage: devin-sub manifest | sidecar | models | tools [all|bash|+name|-name|name …] | account <verb>\n\
-     account: add <label> [home] [-- login-args] · list · use <label> · remove <label> · status\n\
+     account: add [--home DIR] <label> [-- login-args] · list · use <label> · remove <label> · status · usage [<label>] · --json\n\
      slash:  /devin · /devin tools … · /devin account … · /fusion"
         .to_string()
 }
@@ -315,7 +315,7 @@ fn chat_turn(params: Value) -> Result<Value, ProviderRpcError> {
     // Pick the serving account now: fill_first over the configured
     // pool, `None` on the legacy single-login path. The relay mint parks
     // the choice — the admitted POST spawns `devin` under this home.
-    let account = match accounts::select() {
+    let account = match accounts::pick() {
         Ok(a) => a,
         Err(e) => return Err(ProviderRpcError::Unavailable(e)),
     };

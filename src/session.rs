@@ -88,20 +88,19 @@ const REWARM_MAX: usize = 8;
 pub const IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 /// How often the keepalive sweep checks pooled sessions for stale
 /// upstream contact.
-const KEEPALIVE_SWEEP: Duration = Duration::from_secs(30);
+const KEEPALIVE_SWEEP: Duration = Duration::from_secs(15);
 /// Fire a keepalive once the last `session/prompt` this session settled
-/// is this old — under Devin's ~5min per-session prompt cache TTL with a
-/// full sweep + settle window of slack: a slow or once-failed keepalive
-/// still re-warms inside the TTL instead of billing a cold turn.
-const KEEPALIVE_AFTER: Duration = Duration::from_secs(3 * 60);
-const KEEPALIVE_TOO_LATE: Duration = Duration::from_secs(4 * 60 + 40);
+/// is this old — Devin's prefix cache measured warm 85% at 60-80s idle,
+/// 44% at 80-120s and 7% past 120s, so the sweep must land before ~80s.
+const KEEPALIVE_AFTER: Duration = Duration::from_secs(55);
+const KEEPALIVE_TOO_LATE: Duration = Duration::from_secs(100);
 /// Keep warming only while the user is plausibly mid-break. The tradeoff
 /// is arithmetic: each keepalive is a billed upstream prompt, and past
-/// ~30min idle the odds of a return in the next TTL window are too low
-/// to keep paying them (pi uses the same horizon). `IDLE_TTL` still
+/// ~10min idle the keepalives (one cache read per minute) outcost the
+/// single cold prefill they would save. `IDLE_TTL` still
 /// governs the pool: a session past this cap stays pooled and a return
 /// turn just re-warms on contact.
-const KEEPALIVE_IDLE_MAX: Duration = Duration::from_secs(30 * 60);
+const KEEPALIVE_IDLE_MAX: Duration = Duration::from_secs(10 * 60);
 /// How long after its last upstream prompt a persisted session of a dead
 /// sidecar is still worth reattaching. Past the ~5min cache TTL a
 /// `session/load` cold-prefills like `session/new`, but it still sends
@@ -502,6 +501,8 @@ pub struct LiveSession {
     prior_cut: bool,
     /// Last `usage_update` snapshot for the in-flight prompt.
     usage: Usage,
+    /// Every usage report for the in-flight prompt as `in/cached`, logged on a cold reuse.
+    pub(crate) usage_trail: String,
     names: Vec<String>,
     sidekick_calls: HashMap<String, String>,
     active_sidekick: Option<String>,
@@ -1405,9 +1406,9 @@ fn keepalive_sweep() {
         // Only a prompt left in flight closes the child.
         let failed = s.keepalive().err();
         if let Some(e) = failed.as_deref()
-            && let Some(ttl) = crate::accounts::classify(e)
+            && let Some(bench) = crate::accounts::classify(e)
         {
-            crate::accounts::cool(&s.account, ttl, e);
+            crate::accounts::cool(&s.account, bench, e);
         }
         if let Some(e) = failed.as_deref().filter(|e| is_usage_limit(e)) {
             *KEEPALIVE_PAUSED_UNTIL
@@ -1602,6 +1603,7 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         guard: TurnGuard::default(),
         prior_cut: false,
         usage: Usage::default(),
+        usage_trail: String::new(),
         names: turn.names.clone(),
         keepalive_prompt: false,
         loading: false,
@@ -1781,6 +1783,7 @@ impl LiveSession {
         self.limit_flag.store(false, Ordering::SeqCst);
         self.guard = TurnGuard::default();
         self.usage = Usage::default();
+        self.usage_trail.clear();
         self.names = names.to_vec();
         self.keepalive_prompt = text == KEEPALIVE_TEXT;
         let mut prompt = vec![json!({"type": "text", "text": text})];
@@ -1836,6 +1839,7 @@ impl LiveSession {
         // `result.usage` wins when present and non-zero; a cancelled turn
         // carries none, so the last usage_update snapshot stands in.
         if let Some(u) = result.get("usage").and_then(usage_from) {
+            self.usage_trail += &format!("r{}/{} ", u.input_tokens, u.cached_tokens);
             self.usage = u;
         }
         let stop_reason = result
@@ -2614,6 +2618,7 @@ impl LiveSession {
                 // Keep the LAST snapshot: a later update carries the final
                 // counters for this prompt.
                 if let Some(u) = usage_from(update) {
+                    self.usage_trail += &format!("{}/{} ", u.input_tokens, u.cached_tokens);
                     self.usage = u;
                 }
             }
