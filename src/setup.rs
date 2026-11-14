@@ -142,7 +142,7 @@ pub fn child_env() -> Vec<(String, String)> {
 /// [`child_env`] pointed at an account's credential home: the account's
 /// `home` replaces `XDG_DATA_HOME` (so `devin` reads
 /// `<home>/devin/credentials.toml`) and `<home>/cache` replaces
-/// `XDG_CACHE_HOME` (so the CLI's `user_status` cache can't mix
+/// `XDG_CACHE_HOME` (so per-account CLI caches can't mix across
 /// accounts). `None` inherits everything — the single-account path.
 pub fn child_env_for(home: Option<&std::path::Path>) -> Vec<(String, String)> {
     let mut vars: Vec<(String, String)> = std::env::vars()
