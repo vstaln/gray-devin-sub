@@ -70,13 +70,45 @@ fn file_path() -> Option<PathBuf> {
 }
 
 fn load() -> State {
+    read_pool().unwrap_or_default()
+}
+
+fn read_pool() -> Result<State, String> {
     let Some(path) = file_path() else {
-        return State::default();
+        return Ok(State::default());
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return State::default();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(State::default()),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
-    serde_json::from_str(&text).unwrap_or_default()
+    serde_json::from_str(&text).map_err(|e| quarantine(&path, &e))
+}
+
+fn quarantine(path: &std::path::Path, err: &serde_json::Error) -> String {
+    let moved = PathBuf::from(format!(
+        "{}.corrupt-{}",
+        path.display(),
+        crate::setup::unix_secs()
+    ));
+    match std::fs::rename(path, &moved) {
+        Ok(()) => {
+            eprintln!(
+                "devin-sub: account pool {} was corrupt ({err}); moved to {}",
+                path.display(),
+                moved.display()
+            );
+            format!(
+                "devin account pool file was corrupt; moved to {}",
+                moved.display()
+            )
+        }
+        Err(e) => format!(
+            "{} is unreadable ({err}); could not move it aside to {}: {e}",
+            path.display(),
+            moved.display()
+        ),
+    }
 }
 
 fn save(state: &State) -> Result<(), String> {
@@ -115,7 +147,7 @@ pub fn configured() -> Vec<Account> {
 /// own default home. `Err` when accounts exist but every one is benched:
 /// the message carries the earliest ready time (9router's 503 analog).
 pub fn select() -> Result<Option<Account>, String> {
-    let accounts = configured();
+    let accounts = read_pool()?.accounts;
     if accounts.is_empty() {
         return Ok(None);
     }

@@ -1613,6 +1613,13 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
     Ok(s)
 }
 
+fn warn_model_unverified() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!("devin: no model option in session/new result; model not verified");
+    });
+}
+
 impl LiveSession {
     fn client_capabilities(&self) -> Value {
         let fusion = self.native_model.starts_with("fusion-");
@@ -1621,9 +1628,6 @@ impl LiveSession {
     }
 
     fn check_model(&self, result: &Value) -> Result<(), String> {
-        if self.native_model.starts_with("fusion-") {
-            return Ok(());
-        }
         let model_opt = result
             .get("configOptions")
             .and_then(Value::as_array)
@@ -1632,6 +1636,7 @@ impl LiveSession {
                     .find(|o| o.get("id").and_then(Value::as_str) == Some("model"))
             });
         let Some(model_opt) = model_opt else {
+            warn_model_unverified();
             return Ok(());
         };
         let values: Vec<&str> = model_opt
@@ -1644,16 +1649,17 @@ impl LiveSession {
             })
             .unwrap_or_default();
         if values.is_empty() {
+            warn_model_unverified();
             return Ok(());
         }
         let requested = self.native_model.as_str();
-        if values.contains(&requested) || values.iter().any(|v| v.starts_with(requested)) {
-            return Ok(());
-        }
         let current = model_opt
             .get("currentValue")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+        if current == requested || values.contains(&requested) {
+            return Ok(());
+        }
         Err(format!(
             "{} '{requested}' — it resolved to '{current}'. Selectable on this account: {}.",
             MODEL_UNAVAILABLE,
