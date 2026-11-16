@@ -53,8 +53,8 @@ fn fusion_command_opens_the_model_picker() {
         .iter()
         .filter_map(|c| c.as_str())
         .collect();
-    assert_eq!(cmds, ["/devin", "/fusion"]);
-    let r = run_command("/fusion", &[]).expect("claimed");
+    assert_eq!(cmds, ["/devin"]);
+    let r = run_command("/devin", &["fusion".to_string()]).expect("claimed");
     assert_eq!(r["model_picker"], "fusion");
     // Hosts without `model_picker` support print the fallback text.
     assert!(r["text"].as_str().unwrap().contains("/model"));

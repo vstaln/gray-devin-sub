@@ -127,11 +127,11 @@ fn legacy_family_ids_resolve_by_effort() {
     assert_eq!(resolve_native(&rows, "swe-2", Some("max")), "swe-2-max");
     assert_eq!(resolve_native(&rows, "swe-2", Some("high")), "swe-2-high");
     // An unoffered tier clamps to the closest declared one; none asked
-    // → the routable header slug.
+    // → the medium tier.
     assert_eq!(resolve_native(&rows, "swe-2", Some("low")), "swe-2-high");
     assert_eq!(
         resolve_native(&rows, "claude-opus-5-5", None),
-        "claude-opus-5.5"
+        "claude-opus-5-5-medium"
     );
     // Real ids — variant picks — pass through whatever the effort says.
     assert_eq!(
@@ -159,11 +159,12 @@ fn unoffered_effort_clamps_to_closest_tier() {
         "swe-2-high"
     );
     assert_eq!(resolve_native(&rows, "swe-2", Some("off")), "swe-2-high");
-    // Exact tiers still win; none asked still falls back to the slug.
+    // Exact tiers still win; none asked with no medium offered falls to
+    // the first non-fast tier.
     assert_eq!(resolve_native(&rows, "swe-2", Some("max")), "swe-2-max");
-    assert_eq!(resolve_native(&rows, "swe-2", None), "swe-2");
-    // A tier word outside EFFORT_ORDER can't be placed → header slug.
-    assert_eq!(resolve_native(&rows, "swe-2", Some("turbo")), "swe-2");
+    assert_eq!(resolve_native(&rows, "swe-2", None), "swe-2-high");
+    // A tier word outside EFFORT_ORDER can't be placed → default tier.
+    assert_eq!(resolve_native(&rows, "swe-2", Some("turbo")), "swe-2-high");
 }
 
 #[test]

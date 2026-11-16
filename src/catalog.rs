@@ -483,7 +483,14 @@ pub fn resolve_native(entries: &[ModelEntry], model: &str, effort: Option<&str>)
             return m.id.clone();
         }
     }
-    group.slug().unwrap_or(model).to_string()
+    group
+        .members
+        .iter()
+        .filter(|(_, _, fast)| !fast)
+        .find(|(_, e, _)| e.as_deref() == Some("medium"))
+        .or_else(|| group.members.iter().find(|(_, _, fast)| !fast))
+        .map(|(m, _, _)| m.id.clone())
+        .unwrap_or_else(|| group.slug().unwrap_or(model).to_string())
 }
 
 /// The non-fast member whose declared effort is nearest `want` in
