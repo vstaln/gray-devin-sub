@@ -21,6 +21,50 @@ pub const INSTALL_HINT: &str = "`devin` not found on PATH. Install the Devin CLI
 pub const LOGIN_HINT: &str =
     "Devin CLI is installed but not logged in. Run `devin auth login`, then retry.";
 
+/// This sidecar can itself be installed as the `devin` command
+/// (GRAY_DEVIN_SUB_COMMAND pointing at a copy of us). Then `devin models
+/// list` re-enters the sidecar, which resolves `devin` again and spawns
+/// again: an unbounded fork bomb. Recognise that by comparing the resolved
+/// path against our own executable.
+fn is_self(resolved: &str) -> bool {
+    let Ok(me) = std::env::current_exe() else {
+        return false;
+    };
+    let Ok(resolved) = std::fs::canonicalize(resolved) else {
+        return false;
+    };
+    match std::fs::canonicalize(&me) {
+        Ok(me) => me == resolved,
+        Err(_) => false,
+    }
+}
+
+/// Depth backstop for the case where the copy cannot be recognised as us
+/// (different inode, e.g. a bind mount or a container path). Each nesting
+/// increments GRAY_DEVIN_SUB_DEPTH in the child env; past this many levels
+/// nothing sane is happening and we refuse instead of forking again.
+const MAX_DEPTH: u32 = 3;
+
+fn current_depth() -> u32 {
+    std::env::var("GRAY_DEVIN_SUB_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+fn at_depth_cap() -> bool {
+    current_depth() >= MAX_DEPTH
+}
+
+fn refuse(resolved: &str) -> Option<String> {
+    eprintln!(
+        "gray-devin-sub: refusing to use `{resolved}` as the devin CLI: it is this \
+         sidecar re-entering itself (nested {MAX_DEPTH}+ deep), which would fork \
+         without bound. Point GRAY_DEVIN_SUB_COMMAND at the real Devin CLI."
+    );
+    None
+}
+
 pub fn unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -109,19 +153,30 @@ fn env_override() -> Option<String> {
 
 /// Resolve the `devin` binary: explicit override, then PATH.
 pub fn resolve_command() -> Option<String> {
-    if let Some(v) = env_override() {
-        return Some(v);
-    }
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        for name in ["devin", "devin.exe", "devin.cmd"] {
-            let p: PathBuf = dir.join(name);
-            if p.is_file() {
-                return Some(p.to_string_lossy().into_owned());
+    let chosen = match env_override() {
+        Some(v) => v,
+        None => {
+            let path = std::env::var_os("PATH")?;
+            let mut found = None;
+            for dir in std::env::split_paths(&path) {
+                for name in ["devin", "devin.exe", "devin.cmd"] {
+                    let p: PathBuf = dir.join(name);
+                    if p.is_file() {
+                        found = Some(p.to_string_lossy().into_owned());
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
             }
+            found?
         }
+    };
+    if is_self(&chosen) || at_depth_cap() {
+        return refuse(&chosen);
     }
-    None
+    Some(chosen)
 }
 
 /// Env keys that would override the turn's model, permission posture or
@@ -156,6 +211,13 @@ pub fn child_env_for(home: Option<&std::path::Path>) -> Vec<(String, String)> {
             h.join("cache").to_string_lossy().into_owned(),
         ));
     }
+    // Depth marker: incremented for every child so a copy that cannot be
+    // recognised as us (different inode) still hits MAX_DEPTH and stops.
+    vars.retain(|(k, _)| k != "GRAY_DEVIN_SUB_DEPTH");
+    vars.push((
+        "GRAY_DEVIN_SUB_DEPTH".into(),
+        (current_depth() + 1).to_string(),
+    ));
     vars
 }
 
