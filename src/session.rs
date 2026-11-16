@@ -1648,9 +1648,6 @@ impl LiveSession {
     }
 
     fn check_model(&self, result: &Value) -> Result<(), String> {
-        if self.native_model.starts_with("fusion-") {
-            return Ok(());
-        }
         let model_opt = result
             .get("configOptions")
             .and_then(Value::as_array)
@@ -1674,13 +1671,16 @@ impl LiveSession {
             return Ok(());
         }
         let requested = self.native_model.as_str();
-        if values.contains(&requested) || values.iter().any(|v| v.starts_with(requested)) {
-            return Ok(());
-        }
         let current = model_opt
             .get("currentValue")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+        if current == requested
+            || values.contains(&requested)
+            || values.iter().any(|v| v.starts_with(requested))
+        {
+            return Ok(());
+        }
         Err(format!(
             "{} '{requested}' — it resolved to '{current}'. Selectable on this account: {}.",
             MODEL_UNAVAILABLE,
