@@ -88,20 +88,22 @@ const REWARM_MAX: usize = 8;
 pub const IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 /// How often the keepalive sweep checks pooled sessions for stale
 /// upstream contact.
-const KEEPALIVE_SWEEP: Duration = Duration::from_secs(30);
+const KEEPALIVE_SWEEP: Duration = Duration::from_secs(3);
 /// Fire a keepalive once the last `session/prompt` this session settled
-/// is this old — under Devin's ~5min per-session prompt cache TTL with a
-/// full sweep + settle window of slack: a slow or once-failed keepalive
-/// still re-warms inside the TTL instead of billing a cold turn.
-const KEEPALIVE_AFTER: Duration = Duration::from_secs(3 * 60);
-const KEEPALIVE_TOO_LATE: Duration = Duration::from_secs(4 * 60 + 40);
+/// is this old — a repeat prompt reads the prefix back only while it is
+/// all but immediate (99% at 2s, 96% at 6s, nothing at 9s on), so the
+/// refresh has to land inside ~6s and is dropped the first time it reads
+/// less than half the prefix back: a missed refresh is a second full
+/// prefill, not a saving.
+const KEEPALIVE_AFTER: Duration = Duration::from_secs(6);
+const KEEPALIVE_TOO_LATE: Duration = Duration::from_secs(25);
 /// Keep warming only while the user is plausibly mid-break. The tradeoff
 /// is arithmetic: each keepalive is a billed upstream prompt, and past
-/// ~30min idle the odds of a return in the next TTL window are too low
-/// to keep paying them (pi uses the same horizon). `IDLE_TTL` still
+/// ~2min idle the keepalives (one 12s-refreshed cache read per minute)
+/// outcost the single cold prefill they would save. `IDLE_TTL` still
 /// governs the pool: a session past this cap stays pooled and a return
 /// turn just re-warms on contact.
-const KEEPALIVE_IDLE_MAX: Duration = Duration::from_secs(30 * 60);
+const KEEPALIVE_IDLE_MAX: Duration = Duration::from_secs(2 * 60);
 /// How long after its last upstream prompt a persisted session of a dead
 /// sidecar is still worth reattaching. Past the ~5min cache TTL a
 /// `session/load` cold-prefills like `session/new`, but it still sends
@@ -467,6 +469,8 @@ pub struct LiveSession {
     /// trace only — never into `absorbed`, the reply echo, or host usage
     /// accounting.
     keepalive_turns: u32,
+    /// The last keepalive read less than half the prefix back.
+    warm_missed: bool,
     /// A `session/prompt` whose terminal response never arrived: the
     /// upstream turn may still be live, so the session can't be pooled —
     /// a new prompt would interleave with it and late chunks would fold
@@ -502,6 +506,8 @@ pub struct LiveSession {
     prior_cut: bool,
     /// Last `usage_update` snapshot for the in-flight prompt.
     usage: Usage,
+    /// Every usage report for the in-flight prompt as `in/cached`, logged on a cold reuse.
+    pub(crate) usage_trail: String,
     names: Vec<String>,
     sidekick_calls: HashMap<String, String>,
     active_sidekick: Option<String>,
@@ -1374,15 +1380,28 @@ fn take_keepalive() -> Option<LiveSession> {
     }
     let pool = POOL.get()?;
     let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
-    let i = pool.live.iter_mut().position(|s| {
-        s.parked.is_none()
-            && keepalive_due(
+    let mut best: Option<(usize, Option<Instant>)> = None;
+    for (i, s) in pool.live.iter_mut().enumerate() {
+        if s.parked.is_some()
+            || s.warm_missed
+            || !keepalive_due(
                 s.last_prompt_at,
                 s.last_used,
                 matches!(s.child.try_wait(), Ok(None)),
             )
-            && !crate::accounts::is_cooled(&s.account)
-    })?;
+            || crate::accounts::is_cooled(&s.account)
+        {
+            continue;
+        }
+        let fresher = match best {
+            None => true,
+            Some((_, at)) => s.last_prompt_at > at,
+        };
+        if fresher {
+            best = Some((i, s.last_prompt_at));
+        }
+    }
+    let i = best?.0;
     let s = pool.live.remove(i);
     pool.warming.push(Warming {
         session_id: s.session_id.clone(),
@@ -1393,51 +1412,57 @@ fn take_keepalive() -> Option<LiveSession> {
     Some(s)
 }
 
-/// Warm every due session, one at a time. A failure
-/// that leaves a prompt in flight closes the session — it is never
-/// pooled in a state the next turn can't trust. Either way it stops
-/// being listed as warming.
+/// Warm every due session, each on its own thread.
 fn keepalive_sweep() {
-    while let Some(mut s) = take_keepalive() {
-        // A failed keepalive whose prompt still settled (RPC error) costs
-        // the session nothing — real-turn matching state is untouched —
-        // so it goes back to the pool like a settled real-turn failure.
-        // Only a prompt left in flight closes the child.
-        let failed = s.keepalive().err();
-        if let Some(e) = failed.as_deref()
-            && let Some(ttl) = crate::accounts::classify(e)
-        {
-            crate::accounts::cool(&s.account, ttl, e);
-        }
-        if let Some(e) = failed.as_deref().filter(|e| is_usage_limit(e)) {
-            *KEEPALIVE_PAUSED_UNTIL
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + KEEPALIVE_COOLDOWN);
-            crate::chat::pool_event(
-                &format!("keepalive:paused:{}m", KEEPALIVE_COOLDOWN.as_secs() / 60),
-                &s.session_id,
-            );
-            eprintln!(
-                "devin-sub: keepalives paused {}s after usage limit: {e}",
-                KEEPALIVE_COOLDOWN.as_secs()
-            );
-        }
-        // A content refusal re-fires on every keepalive (the refused
-        // transcript is what gets replayed), so the session can never be
-        // warmed again: close it instead of pinging it until the idle cap.
-        let refused = failed.as_deref().is_some_and(is_content_refusal);
-        if refused {
-            crate::chat::pool_event("keepalive:closed:refusal", &s.session_id);
-        }
-        if !refused && (failed.is_none() || !s.prompt_in_flight) {
-            give_back(s);
-        } else {
-            locked_pool()
-                .warming
-                .retain(|w| w.session_id != s.session_id);
-            POOL_CHANGED.notify_all();
-            s.close();
-        }
+    while let Some(s) = take_keepalive() {
+        std::thread::spawn(move || warm_session(s));
+    }
+}
+
+/// Warm one session out of the pool, concurrent with every other
+/// session's refresh so a slow child cannot push the rest past their
+/// cache life the way one serial sweep did. A failure that leaves a
+/// prompt in flight closes the session — it is never pooled in a state
+/// the next turn can't trust. Either way it stops being listed as warming.
+fn warm_session(mut s: LiveSession) {
+    // A failed keepalive whose prompt still settled (RPC error) costs
+    // the session nothing — real-turn matching state is untouched —
+    // so it goes back to the pool like a settled real-turn failure.
+    // Only a prompt left in flight closes the child.
+    let failed = s.keepalive().err();
+    if let Some(e) = failed.as_deref()
+        && let Some(bench) = crate::accounts::classify(e)
+    {
+        crate::accounts::cool(&s.account, bench, e);
+    }
+    if let Some(e) = failed.as_deref().filter(|e| is_usage_limit(e)) {
+        *KEEPALIVE_PAUSED_UNTIL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + KEEPALIVE_COOLDOWN);
+        crate::chat::pool_event(
+            &format!("keepalive:paused:{}m", KEEPALIVE_COOLDOWN.as_secs() / 60),
+            &s.session_id,
+        );
+        eprintln!(
+            "devin-sub: keepalives paused {}s after usage limit: {e}",
+            KEEPALIVE_COOLDOWN.as_secs()
+        );
+    }
+    // A content refusal re-fires on every keepalive (the refused
+    // transcript is what gets replayed), so the session can never be
+    // warmed again: close it instead of pinging it until the idle cap.
+    let refused = failed.as_deref().is_some_and(is_content_refusal);
+    if refused {
+        crate::chat::pool_event("keepalive:closed:refusal", &s.session_id);
+    }
+    if !refused && (failed.is_none() || !s.prompt_in_flight) {
+        give_back(s);
+    } else {
+        locked_pool()
+            .warming
+            .retain(|w| w.session_id != s.session_id);
+        POOL_CHANGED.notify_all();
+        s.close();
     }
 }
 
@@ -1579,6 +1604,7 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         last_used: Instant::now(),
         last_prompt_at: None,
         keepalive_turns: 0,
+        warm_missed: false,
         prompt_in_flight: false,
         prompt_quiet_max: Duration::ZERO,
         text: String::new(),
@@ -1602,6 +1628,7 @@ fn spawn_child(turn: &PreparedTurn, stage: &AcpStage) -> Result<LiveSession, Str
         guard: TurnGuard::default(),
         prior_cut: false,
         usage: Usage::default(),
+        usage_trail: String::new(),
         names: turn.names.clone(),
         keepalive_prompt: false,
         loading: false,
@@ -1657,7 +1684,10 @@ impl LiveSession {
             .get("currentValue")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        if current == requested || values.contains(&requested) {
+        if current == requested
+            || values.contains(&requested)
+            || values.iter().any(|v| v.starts_with(requested))
+        {
             return Ok(());
         }
         Err(format!(
@@ -1787,6 +1817,7 @@ impl LiveSession {
         self.limit_flag.store(false, Ordering::SeqCst);
         self.guard = TurnGuard::default();
         self.usage = Usage::default();
+        self.usage_trail.clear();
         self.names = names.to_vec();
         self.keepalive_prompt = text == KEEPALIVE_TEXT;
         let mut prompt = vec![json!({"type": "text", "text": text})];
@@ -1842,6 +1873,7 @@ impl LiveSession {
         // `result.usage` wins when present and non-zero; a cancelled turn
         // carries none, so the last usage_update snapshot stands in.
         if let Some(u) = result.get("usage").and_then(usage_from) {
+            self.usage_trail += &format!("r{}/{} ", u.input_tokens, u.cached_tokens);
             self.usage = u;
         }
         let stop_reason = result
@@ -2088,6 +2120,7 @@ impl LiveSession {
             self.record_seen_reply(r);
         }
         self.last_reply = Some(r.clone());
+        self.warm_missed = false;
         let now = Instant::now();
         self.last_used = now;
         self.last_prompt_at = Some(now);
@@ -2143,6 +2176,13 @@ impl LiveSession {
     /// a session whose prompt never settled, the same rule as a failed
     /// real turn.
     fn keepalive(&mut self) -> Result<(), String> {
+        if self.warm_missed
+            || self
+                .last_prompt_at
+                .is_some_and(|t| t.elapsed() >= KEEPALIVE_TOO_LATE)
+        {
+            return Ok(());
+        }
         let never = AtomicBool::new(false);
         let deadline = Instant::now() + KEEPALIVE_WINDOW;
         let next = self.keepalive_turns + 1;
@@ -2151,6 +2191,8 @@ impl LiveSession {
             .and_then(|id| self.await_prompt(id, deadline, &never))
         {
             Ok(r) => {
+                self.warm_missed = r.usage.input_tokens >= 8192
+                    && r.usage.cached_tokens * 2 < r.usage.input_tokens;
                 self.absorb_keepalive();
                 crate::chat::trace_turn(
                     &format!("keepalive:{next}"),
@@ -2620,6 +2662,7 @@ impl LiveSession {
                 // Keep the LAST snapshot: a later update carries the final
                 // counters for this prompt.
                 if let Some(u) = usage_from(update) {
+                    self.usage_trail += &format!("{}/{} ", u.input_tokens, u.cached_tokens);
                     self.usage = u;
                 }
             }

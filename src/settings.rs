@@ -120,7 +120,7 @@ const USAGE: &str = "\
   /devin tools +name    also allow one tool, e.g. /devin tools +discord_send
   /devin tools -name    remove one
 Same from a shell: `gray devin-sub tools …`.
-/devin account — multi-login pool: add · list · use · remove · status
+/devin account — multi-login pool: add · list · use · remove · status · usage
   (`account add` runs `devin auth login` — a shell, not the REPL).";
 
 fn status_line(policy: &ToolPolicy) -> String {

@@ -392,7 +392,18 @@ const SUBAGENT_HINT_PREFIXES: [&str; 2] = [
     "Subagents are managed through Bash: ",
 ];
 
+const HARNESS_BLOCK_PREFIXES: [&str; 2] = ["comms: ", "Skills: "];
+
+fn is_harness_block(text: &str) -> bool {
+    text.strip_prefix("[Context update]\n")
+        .and_then(|body| body.lines().next())
+        .is_some_and(|first| HARNESS_BLOCK_PREFIXES.iter().any(|p| first.starts_with(p)))
+}
+
 fn strip_subagent_hint_text(text: &str) -> Option<String> {
+    if is_harness_block(text) {
+        return None;
+    }
     if !text
         .lines()
         .any(|line| SUBAGENT_HINT_PREFIXES.iter().any(|p| line.starts_with(p)))
@@ -1668,7 +1679,7 @@ fn run_turn_inner(
                             delta.chars().count(),
                             Some(&r),
                             None,
-                            None,
+                            Some(&s.usage_trail),
                         );
                         session::give_back(s);
                         return Ok(r);
@@ -1881,10 +1892,13 @@ fn append_pool_log(line: &str) {
     };
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("pool.log");
-    if std::fs::metadata(&path).is_ok_and(|m| m.len() > POOL_LOG_MAX) {
-        let _ = std::fs::rename(&path, dir.join("pool.log.1"));
-    }
-    append_private(&path, &format!("pid={}\t{line}", std::process::id()));
+    let entry = format!("pid={}\t{line}", std::process::id());
+    let _ = crate::accounts::with_lock(&path, || {
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > POOL_LOG_MAX) {
+            let _ = std::fs::rename(&path, dir.join("pool.log.1"));
+        }
+        append_private(&path, &entry);
+    });
 }
 
 /// Append to a 0600 file, creating it.

@@ -164,6 +164,7 @@ fn stub_session() -> LiveSession {
         guard: crate::guard::TurnGuard::default(),
         prior_cut: false,
         usage: Usage::default(),
+        usage_trail: String::new(),
         names: Vec::new(),
         keepalive_prompt: false,
         loading: false,
