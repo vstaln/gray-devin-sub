@@ -130,6 +130,7 @@ fn stub_session() -> LiveSession {
         current_prompt_id: None,
         session_id: "s-test".to_string(),
         native_model: "model".to_string(),
+        warm_missed: false,
         system: "sys".to_string(),
         stage_work: std::path::PathBuf::new(),
         account: String::new(),
