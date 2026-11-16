@@ -9,7 +9,8 @@ pub const PLUGIN_NAME: &str = "devin-sub";
 pub const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROVIDER_ID: &str = "devin-subscription";
 pub const AUTH_METHOD_ID: &str = "devin-login";
-/// Opens the host's `/model` picker focused on the folded Fusion row.
+/// Opens the host's `/model` picker focused on the folded Fusion row,
+/// under `/devin` so the Fusion plugin owns the bare `/fusion`.
 pub const FUSION_COMMAND: &str = "/fusion";
 /// The operator command: `/devin tools …` owns the funnel allowlist.
 pub const DEVIN_COMMAND: &str = "/devin";
@@ -22,7 +23,7 @@ pub fn manifest() -> gray_plugin::Manifest {
         name: PLUGIN_NAME.to_string(),
         version: PLUGIN_VERSION.to_string(),
         tools: Vec::new(),
-        commands: vec![DEVIN_COMMAND.to_string(), FUSION_COMMAND.to_string()],
+        commands: vec![DEVIN_COMMAND.to_string()],
         hooks: Vec::new(),
         protocol: Some("1.2".to_string()),
         subcommands: Vec::new(),
@@ -44,10 +45,10 @@ pub fn manifest() -> gray_plugin::Manifest {
 /// Devin's rows, i.e. "switch to Devin" — while `/devin tools …` owns the
 /// funnel allowlist (see [`crate::settings`]), answered as `{"text": …}`.
 pub fn run_command(name: &str, argv: &[String]) -> Option<serde_json::Value> {
-    if name == FUSION_COMMAND {
+    if name == DEVIN_COMMAND && argv.first().map(String::as_str) == Some("fusion") {
         return Some(serde_json::json!({
             "model_picker": crate::models::FUSION_ID,
-            "text": "Open /model and pick Fusion (this gray is too old for /fusion)",
+            "text": "Open /model and pick Fusion (this gray is too old for /devin fusion)",
         }));
     }
     if name == DEVIN_COMMAND {
