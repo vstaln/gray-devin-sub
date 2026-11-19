@@ -88,21 +88,15 @@ const REWARM_MAX: usize = 8;
 pub const IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 /// How often the keepalive sweep checks pooled sessions for stale
 /// upstream contact.
-const KEEPALIVE_SWEEP: Duration = Duration::from_secs(3);
+const KEEPALIVE_SWEEP: Duration = Duration::from_secs(1);
 /// Fire a keepalive once the last `session/prompt` this session settled
 /// is this old — a repeat prompt reads the prefix back only while it is
 /// all but immediate (99% at 2s, 96% at 6s, nothing at 9s on), so the
 /// refresh has to land inside ~6s and is dropped the first time it reads
 /// less than half the prefix back: a missed refresh is a second full
 /// prefill, not a saving.
-const KEEPALIVE_AFTER: Duration = Duration::from_secs(6);
-const KEEPALIVE_TOO_LATE: Duration = Duration::from_secs(25);
-/// Keep warming only while the user is plausibly mid-break. The tradeoff
-/// is arithmetic: each keepalive is a billed upstream prompt, and past
-/// ~2min idle the keepalives (one 12s-refreshed cache read per minute)
-/// outcost the single cold prefill they would save. `IDLE_TTL` still
-/// governs the pool: a session past this cap stays pooled and a return
-/// turn just re-warms on contact.
+const KEEPALIVE_AFTER: Duration = Duration::from_secs(4);
+const KEEPALIVE_TOO_LATE: Duration = Duration::from_secs(7);
 const KEEPALIVE_IDLE_MAX: Duration = Duration::from_secs(2 * 60);
 /// How long after its last upstream prompt a persisted session of a dead
 /// sidecar is still worth reattaching. Past the ~5min cache TTL a
@@ -2191,8 +2185,9 @@ impl LiveSession {
             .and_then(|id| self.await_prompt(id, deadline, &never))
         {
             Ok(r) => {
-                self.warm_missed = r.usage.input_tokens >= 8192
-                    && r.usage.cached_tokens * 2 < r.usage.input_tokens;
+                self.warm_missed = r.usage.input_tokens == 0
+                    || (r.usage.input_tokens >= 8192
+                        && r.usage.cached_tokens < r.usage.input_tokens.div_ceil(2));
                 self.absorb_keepalive();
                 crate::chat::trace_turn(
                     &format!("keepalive:{next}"),

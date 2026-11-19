@@ -35,6 +35,8 @@ const KEEPALIVE: Duration = Duration::from_secs(15);
 /// How often a waiting relay checks whether the client hung up.
 const PEER_POLL: Duration = Duration::from_millis(250);
 
+const ISOLATED_HEADER: &str = "x-gray-isolated";
+
 /// The client closed its end (gray interrupted the turn). Non-blocking
 /// peek: EOF or a hard error means gone; no data yet means still there.
 fn client_gone(s: &std::net::TcpStream) -> bool {
@@ -176,6 +178,7 @@ fn handle_conn(
     let mut len = 0usize;
     let mut auth = String::new();
     let mut session_id = String::new();
+    let mut isolated = false;
     for line in lines {
         let line = line.trim_end();
         if line.is_empty() {
@@ -190,6 +193,8 @@ fn handle_conn(
             auth = v.trim().to_string();
         } else if name.eq_ignore_ascii_case("session-id") {
             session_id = v.trim().to_string();
+        } else if name.eq_ignore_ascii_case(ISOLATED_HEADER) {
+            isolated = v.trim() == "1";
         }
     }
     let header_end = head
@@ -244,7 +249,14 @@ fn handle_conn(
         let cancel = cancel.clone();
         let account = account.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(run_turn(&model, &session_id, &body, &cancel, account));
+            let _ = tx.send(run_turn(
+                &model,
+                &session_id,
+                &body,
+                &cancel,
+                account,
+                isolated,
+            ));
         });
     }
     match wait_turn(&rx, s, &cancel, HEADER_GRACE) {
@@ -322,6 +334,7 @@ fn run_turn(
     raw: &[u8],
     cancel: &Arc<AtomicBool>,
     account: Option<crate::accounts::Account>,
+    isolated: bool,
 ) -> Result<Vec<u8>, String> {
     let body: Value = serde_json::from_slice(raw)
         .map_err(|e| format!("relay body is not JSON ({} bytes): {e}", raw.len()))?;
@@ -336,7 +349,7 @@ fn run_turn(
     turn.account = account;
     // A pooled session when this history continues one, else a fresh
     // spawn — either way native makes exactly one upstream request.
-    let result = crate::chat::run_turn(&turn, cancel, Duration::from_secs(600))?;
+    let result = crate::chat::run_turn(&turn, cancel, Duration::from_secs(600), isolated)?;
     crate::chat::fold_result(&result)
 }
 
