@@ -1211,6 +1211,15 @@ pub(crate) fn sidekick_write_command(
     )
 }
 
+fn side_call(isolated: bool, input: &[Value]) -> bool {
+    isolated
+        && !input.iter().any(|i| {
+            matches!(item_kind(i), "function_call" | "function_call_output")
+                || (item_kind(i) == "message"
+                    && i.get("role").and_then(Value::as_str) == Some("assistant"))
+        })
+}
+
 /// An input item the assistant side produced: the replayed echo of a
 /// session's own answer (assistant message, its calls, reasoning carriers).
 pub(crate) fn assistant_side(item: &Value) -> bool {
@@ -1551,9 +1560,11 @@ pub fn run_turn(
     turn: &PreparedTurn,
     cancel: &Arc<AtomicBool>,
     timeout: Duration,
+    isolated: bool,
 ) -> Result<TurnResult, String> {
     let started = Instant::now();
-    let mut r = run_turn_inner(turn, cancel, timeout);
+    let side = side_call(isolated, &turn.input);
+    let mut r = run_turn_inner(turn, cancel, timeout, side);
     // A prompt that stalled before producing anything is sent once more:
     // the reuse path abandoned its child but kept the upstream session, so
     // the retry reloads it (`session/load`) instead of re-billing; a
@@ -1564,7 +1575,7 @@ pub fn run_turn(
         r = if cancel.load(Ordering::SeqCst) || left.is_zero() {
             Err(session::PROMPT_STALLED.to_string())
         } else {
-            run_turn_inner(turn, cancel, left)
+            run_turn_inner(turn, cancel, left, side)
         };
         if matches!(&r, Err(e) if e == STALL_RETRY) {
             r = Err(session::PROMPT_STALLED.to_string());
@@ -1588,6 +1599,7 @@ fn run_turn_inner(
     turn: &PreparedTurn,
     cancel: &Arc<AtomicBool>,
     timeout: Duration,
+    side: bool,
 ) -> Result<TurnResult, String> {
     let deadline = Instant::now() + timeout;
     let prompt_text = if turn.system.is_empty() {
@@ -1596,15 +1608,19 @@ fn run_turn_inner(
         format!("{}\n\n{}", turn.system, turn.content_line)
     };
     let chars = prompt_text.chars().count();
-    if let Some(r) = session::replay(turn) {
+    if !side && let Some(r) = session::replay(turn) {
         trace_turn("replay", "-", chars, Some(&r), None, None);
         return Ok(r);
     }
-    let (mut claimed, mut reason) = session::take(turn, cancel);
+    let (mut claimed, mut reason) = if side {
+        (None, "side")
+    } else {
+        session::take(turn, cancel)
+    };
     // Nothing live continues this turn: an orphaned session of a dead
     // sidecar (a gray restart) may, loaded instead of re-billed.
     let mut mode = "reuse";
-    if claimed.is_none() && !matches!(reason, "keepalive_busy" | "parked_mismatch") {
+    if !side && claimed.is_none() && !matches!(reason, "keepalive_busy" | "parked_mismatch") {
         claimed = session::reattach(turn, deadline, cancel);
         if claimed.is_some() {
             mode = "reload";
@@ -1764,11 +1780,18 @@ fn run_turn_inner(
             return Err(e);
         }
     };
+    let release = |s: session::LiveSession| {
+        if side {
+            s.close();
+        } else {
+            session::give_back(s);
+        }
+    };
     match s.await_prompt_or_parked(id, deadline, cancel) {
         Ok(session::AwaitPrompt::Complete(r)) => {
             s.absorb(turn, &r);
             trace_turn(&mode, &s.session_id, chars, Some(&r), None, None);
-            session::give_back(s);
+            release(s);
             Ok(r)
         }
         Ok(session::AwaitPrompt::Parked(r)) => {
@@ -1781,7 +1804,7 @@ fn run_turn_inner(
                 None,
                 None,
             );
-            session::give_back(s);
+            release(s);
             Ok(r)
         }
         Err(e) => {
@@ -1800,7 +1823,7 @@ fn run_turn_inner(
                 // only its new tail, and no other conversation can claim
                 // a child already holding this transcript.
                 s.absorb_failed(turn);
-                session::give_back(s);
+                release(s);
             }
             Err(e)
         }
