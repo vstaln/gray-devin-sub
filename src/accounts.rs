@@ -1151,6 +1151,11 @@ fn usage_text(entry: &Value) -> String {
 }
 
 fn cmd_usage(args: &[String], json: bool) -> Result<String, String> {
+    let args: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--fresh")
+        .cloned()
+        .collect();
     let want = args.first().map(String::as_str);
     let targets = usage_targets(&load().accounts, want);
     let labels: Vec<Option<String>> = targets.iter().map(|(l, _)| l.clone()).collect();
